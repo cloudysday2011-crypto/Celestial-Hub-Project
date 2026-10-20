@@ -186,6 +186,7 @@ local DUELS_WEAPON_KEYWORDS = {
 	"kunai", "katana", "crossbow"
 }
 
+do
 -- Spider (RoyStanford) uses six-player servers. The PlaceId is a corroborating
 -- signal, not the only detector: live map/UI/item evidence is also examined.
 local SPIDER_KNOWN_PLACE_IDS = {[5118969548] = true}
@@ -331,8 +332,11 @@ local function IsSpiderGame()
 	return false
 end
 
+_G.Celestial.IsSpiderGame = IsSpiderGame
+end
+
 local function ScanGameMode()
-	if IsSpiderGame() then return "SPIDER" end
+	if _G.Celestial.IsSpiderGame and _G.Celestial.IsSpiderGame() then return "SPIDER" end
 	local scoreMM2 = 0
 	local scoreDuels = 0
 
@@ -3764,6 +3768,7 @@ local function FindDroppedGun()
 	return nil
 end
 
+do
 -- ====================================================================
 -- SPIDER ESP (integrated into the shared role scanner)
 -- ====================================================================
@@ -4261,6 +4266,18 @@ local function SpiderUpdateESP(activePlayers, now)
 end
 
 _G.Celestial.SpiderESPCleanup = SpiderStop
+_G.Celestial.SpiderESPAPI = {
+    IsActive = function() return SpiderESPActive end,
+    Start = SpiderStart,
+    Stop = SpiderStop,
+    Update = SpiderUpdateESP,
+    ClearPlayer = function(player)
+        SpiderCachedPlayerRoles[player] = nil
+        SpiderRoleCache[player] = nil
+    end
+}
+
+end
 
 _G.Celestial.Highlights = _G.Celestial.Highlights or {}
 local lastRoleScan = 0
@@ -4292,25 +4309,26 @@ _G.Celestial.ConnectionRoleScanner =
 					if hl then pcall(function() hl:Destroy() end) end
 					PowerDetectionCache[plr] = nil
 					DuelsMatchState.TeamByPlayer[plr] = nil
-					SpiderCachedPlayerRoles[plr] = nil
-					SpiderRoleCache[plr] = nil
+					if _G.Celestial.SpiderESPAPI then _G.Celestial.SpiderESPAPI.ClearPlayer(plr) end
 					_G.Celestial.Highlights[plr] = nil
 				end
 			end
 			if _G.Celestial.GameMode == "SPIDER" then
 				if not State.ESPEnabled then
-					if SpiderESPActive then SpiderStop() end
+					if _G.Celestial.SpiderESPAPI and _G.Celestial.SpiderESPAPI.IsActive() then _G.Celestial.SpiderESPAPI.Stop() end
 					for _, hl in pairs(_G.Celestial.Highlights) do
 						if hl then pcall(function() hl.Enabled = false; hl.Adornee = nil end) end
 					end
 					if _G.Celestial.SelfHighlight then pcall(function() _G.Celestial.SelfHighlight.Enabled = false end) end
 					return
 				end
-				if not SpiderESPActive then SpiderStart() end
-				SpiderUpdateESP(activePlayers, now)
+				if not (_G.Celestial.SpiderESPAPI and _G.Celestial.SpiderESPAPI.IsActive()) then
+					if _G.Celestial.SpiderESPAPI then _G.Celestial.SpiderESPAPI.Start() end
+				end
+				if _G.Celestial.SpiderESPAPI then _G.Celestial.SpiderESPAPI.Update(activePlayers, now) end
 				return
-			elseif SpiderESPActive then
-				SpiderStop()
+			elseif _G.Celestial.SpiderESPAPI and _G.Celestial.SpiderESPAPI.IsActive() then
+				_G.Celestial.SpiderESPAPI.Stop()
 			end
 			if #activePlayers <= 1 then
 				State.MurdererName = ""
