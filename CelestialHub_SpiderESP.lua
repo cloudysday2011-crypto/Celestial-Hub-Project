@@ -3896,7 +3896,7 @@ end
 
 local function SpiderGetPlayerRole(player, now)
 	local cached = SpiderCachedPlayerRoles[player]
-	if cached and now - cached.At < 0.45 then return cached.Role end
+	if cached and now - cached.At < 1.0 then return cached.Role end
 	local role = SpiderRoleFromContainer(player)
 	-- Some games expose only the local player's current role through a HUD text.
 	if not role and player == LocalPlayer then
@@ -3974,7 +3974,7 @@ end
 local function SpiderModelInventoryHasUsername(model)
 	if not model then return false end
 	local cached = SpiderModelUsernameCache[model]
-	if cached and tick() - cached.At < 2.0 then return cached.HasUsername == true end
+	if cached and tick() - cached.At < 5.0 then return cached.HasUsername == true end
 	local function finish(result)
 		SpiderModelUsernameCache[model] = {At = tick(), HasUsername = result == true}
 		return result == true
@@ -4124,6 +4124,7 @@ local function SpiderClearItemVisual(target)
 	local visual = SpiderItemVisuals[target]
 	if visual then
 		if visual.Highlight then pcall(function() visual.Highlight:Destroy() end) end
+		if visual.Edge then pcall(function() visual.Edge:Destroy() end) end
 		if visual.Label then pcall(function() visual.Label:Destroy() end) end
 		SpiderItemVisuals[target] = nil
 	end
@@ -4160,7 +4161,7 @@ local function SpiderEnsureItemVisual(target, kind)
 		hl.Name = "CHSpiderItemESP_" .. kind
 		hl.FillColor = SPIDER_ITEM_COLORS[kind]
 		hl.OutlineColor = SPIDER_ITEM_COLORS[kind]
-		hl.FillTransparency = 0.62
+		hl.FillTransparency = 0.48
 		hl.OutlineTransparency = 0
 		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 		hl.Parent = folder
@@ -4178,6 +4179,29 @@ local function SpiderEnsureItemVisual(target, kind)
 	visual.Highlight.Adornee = highlightAdornee
 	visual.Highlight.FillColor = SPIDER_ITEM_COLORS[kind]
 	visual.Highlight.OutlineColor = SPIDER_ITEM_COLORS[kind]
+
+	-- SelectionBox supplies a stronger, screen-visible edge for small distant items.
+	-- It is attached only to BaseParts; Models keep their full Highlight silhouette.
+	local edgePart = highlightAdornee
+	if edgePart and edgePart:IsA("BasePart") then
+		if not visual.Edge or not visual.Edge.Parent then
+			local edge = Instance.new("SelectionBox")
+			edge.Name = "CHSpiderItemEdge_" .. kind
+			edge.LineThickness = 0.08
+			edge.SurfaceTransparency = 1
+			edge.Color3 = SPIDER_ITEM_COLORS[kind]
+			edge.Adornee = edgePart
+			edge.Parent = folder
+			visual.Edge = edge
+		else
+			visual.Edge.Adornee = edgePart
+			visual.Edge.Color3 = SPIDER_ITEM_COLORS[kind]
+			if visual.Edge.Parent ~= folder then visual.Edge.Parent = folder end
+		end
+	elseif visual.Edge then
+		pcall(function() visual.Edge:Destroy() end)
+		visual.Edge = nil
+	end
 	return visual
 end
 
@@ -4242,13 +4266,30 @@ local function SpiderStart()
 	SpiderNPCModels = {}
 	SpiderRoleCache = {}
 	SpiderCachedPlayerRoles = {}
+	-- Process the existing world in small batches instead of doing thousands of
+	-- registrations and NPC ancestry checks in one frame when a round starts.
 	local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
 	if ok and descendants then
-		for index, obj in ipairs(descendants) do
-			if index > 22000 then break end
-			SpiderRegisterWorldItem(obj)
-			if obj:IsA("Model") then SpiderConsiderNPC(obj) end
+		local scanLimit = math.min(#descendants, 22000)
+		local index = 1
+		local function scanBatch()
+			if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
+			local batchEnd = math.min(index + 249, scanLimit)
+			while index <= batchEnd do
+				local obj = descendants[index]
+				if obj and obj.Parent then
+					SpiderRegisterWorldItem(obj)
+					-- Only candidate Models need NPC classification. Checking every
+					-- descendant's ancestor chain multiplied the work dramatically.
+					if obj:IsA("Model") then SpiderConsiderNPC(obj) end
+				end
+				index = index + 1
+			end
+			if index <= scanLimit then
+				task.defer(scanBatch)
+			end
 		end
+		task.defer(scanBatch)
 	end
 	SpiderKeepConnection(Workspace.DescendantAdded:Connect(function(obj)
 		if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
@@ -4272,7 +4313,7 @@ end
 
 local function SpiderUpdateESP(activePlayers, now)
 	if not State.ESPEnabled or _G.Celestial.GameMode ~= "SPIDER" then return end
-	if now - SpiderLastRoleRefresh >= 0.4 then
+	if now - SpiderLastRoleRefresh >= 0.75 then
 		SpiderLastRoleRefresh = now
 		local explicitSpiderPlayers = {}
 		for _, player in ipairs(activePlayers) do
