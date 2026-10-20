@@ -243,6 +243,16 @@ local function SpiderClassifyItemName(name)
 	return nil
 end
 
+-- Share Spider configuration/helpers with the separately scoped ESP implementation.
+-- The detector and ESP intentionally use separate `do` scopes to avoid Luau local limits.
+_G.Celestial.SpiderShared = {
+	NormalizeName = SpiderNormalizeName,
+	ClassifyItemName = SpiderClassifyItemName,
+	ItemColors = SPIDER_ITEM_COLORS,
+	ItemDisplayNames = SPIDER_ITEM_DISPLAY_NAMES,
+	RoleColors = SPIDER_ROLE_COLORS
+}
+
 local SpiderDetectionCache = {At = 0, Evidence = nil}
 local function ScanSpiderEvidence(forceRefresh)
 	local now = tick()
@@ -3772,6 +3782,13 @@ do
 -- ====================================================================
 -- SPIDER ESP (integrated into the shared role scanner)
 -- ====================================================================
+
+local SpiderShared = _G.Celestial.SpiderShared or {}
+local SpiderNormalizeName = SpiderShared.NormalizeName
+local SpiderClassifyItemName = SpiderShared.ClassifyItemName
+local SPIDER_ITEM_COLORS = SpiderShared.ItemColors or {}
+local SPIDER_ITEM_DISPLAY_NAMES = SpiderShared.ItemDisplayNames or {}
+local SPIDER_ROLE_COLORS = SpiderShared.RoleColors or {}
 
 local SpiderESPActive = false
 local SpiderESPConnections = {}
