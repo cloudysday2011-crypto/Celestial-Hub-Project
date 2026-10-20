@@ -3829,11 +3829,21 @@ end
 
 local function SpiderRoleFromContainer(container)
 	if not container then return nil end
-	local team
-	pcall(function() team = container.Team end)
-	if team then
-		local fromTeam = SpiderClassifyRoleText(team.Name)
-		if fromTeam then return fromTeam end
+
+	local sources = {container}
+	if container:IsA("Player") then
+		local team
+		pcall(function() team = container.Team end)
+		if team then
+			local fromTeam = SpiderClassifyRoleText(team.Name)
+			if fromTeam then return fromTeam end
+		end
+		-- Player:GetDescendants() does not include Character or Backpack, so inspect
+		-- both explicitly; Spider's role values are often stored there.
+		local character = container.Character
+		if character then table.insert(sources, character) end
+		local backpack = container:FindFirstChildOfClass("Backpack") or container:FindFirstChild("Backpack")
+		if backpack then table.insert(sources, backpack) end
 	end
 
 	local function inspectAttributes(object)
@@ -3841,42 +3851,42 @@ local function SpiderRoleFromContainer(container)
 		if not ok or type(attributes) ~= "table" then return nil end
 		for key, value in pairs(attributes) do
 			local keyNorm = SpiderNormalizeName(key)
+			local keyLooksRoleRelated = keyNorm:find("role", 1, true) or keyNorm:find("team", 1, true)
+				or keyNorm:find("side", 1, true) or keyNorm:find("class", 1, true)
+				or keyNorm:find("faction", 1, true) or keyNorm:find("type", 1, true)
 			if type(value) == "boolean" and value then
 				if keyNorm:find("spider", 1, true) or keyNorm:find("infected", 1, true) then return "SPIDER" end
 				if keyNorm:find("human", 1, true) or keyNorm:find("survivor", 1, true) then return "HUMAN" end
 			end
 			if type(value) == "string" or typeof(value) == "Instance" then
-				local keyLooksRoleRelated = keyNorm:find("role", 1, true) or keyNorm:find("team", 1, true)
-					or keyNorm:find("side", 1, true) or keyNorm:find("class", 1, true)
-					or keyNorm:find("faction", 1, true) or keyNorm:find("type", 1, true)
-					local role = SpiderClassifyRoleText(typeof(value) == "Instance" and value.Name or value)
+				local text = typeof(value) == "Instance" and value.Name or value
+				local role = SpiderClassifyRoleText(text)
 				if role and (keyLooksRoleRelated or role == "SPIDER" or role == "HUMAN") then return role end
 			end
 		end
 		return nil
 	end
 
-	local direct = inspectAttributes(container)
-	if direct then return direct end
-	if container:IsA("Player") and container.Character then
-		direct = inspectAttributes(container.Character)
+	for _, source in ipairs(sources) do
+		local direct = inspectAttributes(source)
 		if direct then return direct end
-	end
-
-	local ok, descendants = pcall(function() return container:GetDescendants() end)
-	if ok and descendants then
-		for index, child in ipairs(descendants) do
-			if index > 500 then break end
-			if child:IsA("ValueBase") then
+		local ok, descendants = pcall(function() return source:GetDescendants() end)
+		if ok and descendants then
+			for index, child in ipairs(descendants) do
+				if index > 500 then break end
 				local childName = SpiderNormalizeName(child.Name)
-				local role = SpiderClassifyRoleText(child.Value)
-				local keyLooksRoleRelated = childName:find("role", 1, true) or childName:find("team", 1, true)
-					or childName:find("side", 1, true) or childName:find("class", 1, true)
-					or childName:find("faction", 1, true) or childName:find("type", 1, true)
-				if role and (keyLooksRoleRelated or role == "SPIDER" or role == "HUMAN") then return role end
-				if child:IsA("BoolValue") and child.Value then
-					if childName:find("spider", 1, true) or childName:find("infected", 1, true) then return "SPIDER" end
-					if childName:find("human", 1, true) or childName:find("survivor", 1, true) then return "HUMAN" end
+				if child:IsA("ValueBase") then
+					local value = child.Value
+					if typeof(value) == "Instance" then value = value.Name end
+					local role = SpiderClassifyRoleText(value)
+					local keyLooksRoleRelated = childName:find("role", 1, true) or childName:find("team", 1, true)
+						or childName:find("side", 1, true) or childName:find("class", 1, true)
+						or childName:find("faction", 1, true) or childName:find("type", 1, true)
+					if role and (keyLooksRoleRelated or role == "SPIDER" or role == "HUMAN") then return role end
+					if child:IsA("BoolValue") and child.Value then
+						if childName:find("spider", 1, true) or childName:find("infected", 1, true) then return "SPIDER" end
+						if childName:find("human", 1, true) or childName:find("survivor", 1, true) then return "HUMAN" end
+					end
 				end
 			end
 		end
@@ -3921,16 +3931,141 @@ local function SpiderModelRoot(model)
 	return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
+local SpiderUsernameValidationCache = {}
+local SpiderModelUsernameCache = {}
+
+local function SpiderUsernameExists(value)
+	local username = tostring(value or ""):gsub("^@", ""):match("^%s*(.-)%s*$")
+	if #username < 3 or #username > 20 or not username:match("^[%w_]+$") then return false end
+	local normalized = string.lower(username)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if string.lower(player.Name) == normalized then return true end
+	end
+	-- Ignore common rig/item identifiers; otherwise an item called "Handle" could
+	-- accidentally match an unrelated Roblox account and tint a bot pink.
+	local commonNonUsernames = {
+		handle = true, inventory = true, backpack = true, playerinventory = true,
+		spiderinventory = true, username = true, owner = true, ownername = true,
+		playername = true, controller = true, controllername = true, humanoid = true,
+		humanoidrootpart = true, head = true, torso = true, part = true,
+		model = true, tool = true, folder = true, script = true, localscript = true,
+		spider = true, spiderbot = true, infected = true, human = true, survivor = true
+	}
+	if commonNonUsernames[normalized] or (SpiderClassifyItemName and SpiderClassifyItemName(username)) then return false end
+	local cached = SpiderUsernameValidationCache[normalized]
+	if cached then
+		if cached.Pending then return false end
+		if tick() - (cached.At or 0) < 600 then return cached.Valid == true end
+	end
+	SpiderUsernameValidationCache[normalized] = {Pending = true, Valid = false, At = tick()}
+	task.spawn(function()
+		local ok, userId = pcall(function()
+			return Players:GetUserIdFromNameAsync(username)
+		end)
+		SpiderUsernameValidationCache[normalized] = {
+			Pending = false,
+			Valid = ok and tonumber(userId) ~= nil and tonumber(userId) > 0,
+			At = tick()
+		}
+	end)
+	return false
+end
+
+local function SpiderModelInventoryHasUsername(model)
+	if not model then return false end
+	local cached = SpiderModelUsernameCache[model]
+	if cached and tick() - cached.At < 2.0 then return cached.HasUsername == true end
+	local function finish(result)
+		SpiderModelUsernameCache[model] = {At = tick(), HasUsername = result == true}
+		return result == true
+	end
+	local ok, descendants = pcall(function() return model:GetDescendants() end)
+	if not ok or not descendants then return finish(false) end
+	local inventoryRoots = {}
+	for index, child in ipairs(descendants) do
+		if index > 600 then break end
+		local normalized = SpiderNormalizeName(child.Name)
+		if normalized == "inventory" or normalized == "backpack" or normalized == "playerinventory"
+			or normalized == "spiderinventory" then
+			table.insert(inventoryRoots, child)
+		end
+	end
+
+	local checked = {}
+	local usernameChecks = 0
+	local function checkUsername(candidate)
+		if typeof(candidate) == "Instance" then candidate = candidate.Name end
+		if type(candidate) ~= "string" then return false end
+		local normalized = string.lower(candidate:gsub("^@", ""):match("^%s*(.-)%s*$"))
+		if normalized == "" or checked[normalized] then return false end
+		checked[normalized] = true
+		-- Bound async account lookups per scan to protect performance/rate limits.
+		if usernameChecks >= 8 then return false end
+		usernameChecks = usernameChecks + 1
+		return SpiderUsernameExists(candidate)
+	end
+
+	-- Prefer explicit owner/user/controller fields anywhere on the rig.
+	for index, child in ipairs(descendants) do
+		if index > 600 then break end
+		local childName = SpiderNormalizeName(child.Name)
+		local looksLikeOwnerField = childName:find("username", 1, true) or childName == "owner"
+			or childName == "ownername" or childName == "playername" or childName == "controller"
+			or childName == "controllername" or childName == "useridname"
+		if looksLikeOwnerField then
+			if child:IsA("ValueBase") and checkUsername(child.Value) then return finish(true) end
+		end
+		if child:IsA("StringValue") or child:IsA("ObjectValue") then
+			local parent = child.Parent
+			local inInventory = false
+			while parent and parent ~= model do
+				local parentName = SpiderNormalizeName(parent.Name)
+				if parentName == "inventory" or parentName == "backpack" or parentName == "playerinventory"
+					or parentName == "spiderinventory" then
+					inInventory = true; break
+				end
+				parent = parent.Parent
+			end
+			if inInventory then
+				if child:IsA("StringValue") and checkUsername(child.Value) then return finish(true) end
+				if child:IsA("ObjectValue") and child.Value and child.Value:IsA("Player")
+					and checkUsername(child.Value.Name) then return finish(true) end
+			end
+		end
+	end
+
+	-- Some game versions store usernames as StringValue names directly inside Inventory.
+	for _, root in ipairs(inventoryRoots) do
+		local rootOK, items = pcall(function() return root:GetDescendants() end)
+		if rootOK and items then
+			for index, item in ipairs(items) do
+				if index > 120 then break end
+				if item:IsA("StringValue") or item:IsA("ObjectValue") then
+					if checkUsername(item.Name) then return finish(true) end
+					if item:IsA("StringValue") and checkUsername(item.Value) then return finish(true) end
+					if item:IsA("ObjectValue") and item.Value and item.Value:IsA("Player")
+						and checkUsername(item.Value.Name) then return finish(true) end
+				end
+			end
+		end
+	end
+	return finish(false)
+end
+
 local function SpiderIsRelevantNPCModel(model)
 	if not model or not model:IsA("Model") or not model:IsDescendantOf(Workspace) then return false end
 	if SpiderIsPlayerCharacterDescendant(model) then return false end
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local root = SpiderModelRoot(model)
-	if not humanoid or not root then return false end
+	if not root then return false end
 	local nameNorm = SpiderNormalizeName(model.Name)
 	local hasSpiderName = nameNorm:find("spider", 1, true) or nameNorm:find("infected", 1, true)
 	local explicitRole = SpiderRoleFromContainer(model)
-	return explicitRole == "SPIDER" or hasSpiderName == true
+	if explicitRole == "SPIDER" or hasSpiderName then return true end
+	-- Some versions give the spider a generic rig name, so let a verified account
+	-- username in its own inventory act as a fallback identifier.
+	local inventory = model:FindFirstChild("Inventory", true) or model:FindFirstChild("Backpack", true)
+		or model:FindFirstChild("PlayerInventory", true) or model:FindFirstChild("SpiderInventory", true)
+	return inventory ~= nil and SpiderModelInventoryHasUsername(model)
 end
 
 local function SpiderConsiderNPC(instance)
@@ -3944,25 +4079,24 @@ local function SpiderConsiderNPC(instance)
 end
 
 local function SpiderFindBotCandidate()
-	local topModel, topRank, topCount = nil, 0, 0
+	local topModel, topRank = nil, 0
 	for model in pairs(SpiderNPCModels) do
 		if not model or not model.Parent or not model:IsDescendantOf(Workspace)
 			or SpiderIsPlayerCharacterDescendant(model) then
 			SpiderNPCModels[model] = nil
 		else
-			local humanoid = model:FindFirstChildOfClass("Humanoid")
 			local root = SpiderModelRoot(model)
-			if humanoid and root then
+			if root then
 				local explicitRole = SpiderRoleFromContainer(model)
 				local nameNorm = SpiderNormalizeName(model.Name)
 				local nameSignal = nameNorm:find("spider", 1, true) or nameNorm:find("infected", 1, true)
-				local rank = explicitRole == "SPIDER" and 3 or (nameSignal and 2 or 0)
-				if rank > topRank then topModel, topRank, topCount = model, rank, 1
-				elseif rank > 0 and rank == topRank then topCount = topCount + 1 end
+				local usernameSignal = SpiderModelInventoryHasUsername(model)
+				local rank = explicitRole == "SPIDER" and 3 or (nameSignal and 2 or (usernameSignal and 1 or 0))
+				if rank > topRank then topModel, topRank = model, rank end
 			end
 		end
 	end
-	if topRank > 0 and topCount == 1 then return topModel end
+	if topRank > 0 then return topModel end
 	return nil
 end
 
@@ -4030,29 +4164,7 @@ local function SpiderEnsureItemVisual(target, kind)
 		hl.OutlineTransparency = 0
 		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 		hl.Parent = folder
-
-		local gui = Instance.new("BillboardGui")
-		gui.Name = "CHSpiderItemLabel_" .. kind
-		gui.Size = UDim2.new(0, 132, 0, 24)
-		gui.StudsOffset = Vector3.new(0, 2.1, 0)
-		gui.AlwaysOnTop = true
-		gui.MaxDistance = 1500
-		gui.Enabled = true
-		gui.Parent = folder
-		local label = Instance.new("TextLabel")
-		label.Name = "ItemName"
-		label.Size = UDim2.new(1, 0, 1, 0)
-		label.BackgroundTransparency = 1
-		label.BorderSizePixel = 0
-		label.Font = Enum.Font.GothamBold
-		label.TextSize = 13
-		label.Text = SPIDER_ITEM_DISPLAY_NAMES[kind] or kind
-		label.TextColor3 = (kind == "Crowbar" or kind == "Wrench")
-			and Color3.fromRGB(255, 255, 255) or SPIDER_ITEM_COLORS[kind]
-		label.TextStrokeColor3 = Color3.fromRGB(15, 15, 15)
-		label.TextStrokeTransparency = 0.1
-		label.Parent = gui
-		visual = {Highlight = hl, Label = gui, Text = label, Kind = kind}
+		visual = {Highlight = hl, Kind = kind}
 		SpiderItemVisuals[target] = visual
 	end
 
@@ -4060,15 +4172,12 @@ local function SpiderEnsureItemVisual(target, kind)
 		SpiderClearItemVisual(target)
 		return SpiderEnsureItemVisual(target, kind)
 	end
+	if visual.Label then pcall(function() visual.Label:Destroy() end); visual.Label = nil end
 	if visual.Highlight and visual.Highlight.Parent ~= folder then visual.Highlight.Parent = folder end
-	if visual.Label and visual.Label.Parent ~= folder then visual.Label.Parent = folder end
 	local highlightAdornee = target:IsA("Tool") and SpiderGetLabelAdornee(target) or target
 	visual.Highlight.Adornee = highlightAdornee
 	visual.Highlight.FillColor = SPIDER_ITEM_COLORS[kind]
 	visual.Highlight.OutlineColor = SPIDER_ITEM_COLORS[kind]
-	local labelAdornee = SpiderGetLabelAdornee(target)
-	if visual.Label then visual.Label.Adornee = labelAdornee end
-	if visual.Text then visual.Text.Text = SPIDER_ITEM_DISPLAY_NAMES[kind] or kind end
 	return visual
 end
 
@@ -4080,50 +4189,32 @@ local function SpiderClearBotVisual()
 	end
 end
 
-local function SpiderUpdateBotVisual(model)
+local function SpiderUpdateBotVisual(model, playerControlled)
 	if not model then SpiderClearBotVisual(); return end
 	local folder = _G.Celestial.ESPFolder
 	if not folder or not folder.Parent then return end
+	local roleColor = playerControlled and SPIDER_ROLE_COLORS.PLAYER_SPIDER or SPIDER_ROLE_COLORS.BOT_SPIDER
 	if not SpiderBotVisual or SpiderBotVisual.Model ~= model then
 		SpiderClearBotVisual()
 		local hl = Instance.new("Highlight")
 		hl.Name = "CHSpiderBotESP"
-		hl.FillColor = SPIDER_ROLE_COLORS.BOT_SPIDER
-		hl.OutlineColor = SPIDER_ROLE_COLORS.BOT_SPIDER
+		hl.FillColor = roleColor
+		hl.OutlineColor = roleColor
 		hl.FillTransparency = 0.5
 		hl.OutlineTransparency = 0
 		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 		hl.Adornee = model
 		hl.Parent = folder
-		local gui = Instance.new("BillboardGui")
-		gui.Name = "CHSpiderBotLabel"
-		gui.Size = UDim2.new(0, 120, 0, 24)
-		gui.StudsOffset = Vector3.new(0, 3, 0)
-		gui.AlwaysOnTop = true
-		gui.MaxDistance = 1500
-		gui.Parent = folder
-		local label = Instance.new("TextLabel")
-		label.Size = UDim2.new(1, 0, 1, 0)
-		label.BackgroundTransparency = 1
-		label.Font = Enum.Font.GothamBold
-		label.TextSize = 13
-		label.Text = "Spider (Bot)"
-		label.TextColor3 = SPIDER_ROLE_COLORS.BOT_SPIDER
-		label.TextStrokeColor3 = Color3.fromRGB(15, 15, 15)
-		label.TextStrokeTransparency = 0.1
-		label.Parent = gui
-		SpiderBotVisual = {Model = model, Highlight = hl, Label = gui}
+		SpiderBotVisual = {Model = model, Highlight = hl, RoleColor = roleColor}
 	end
 	if SpiderBotVisual.Highlight then
 		SpiderBotVisual.Highlight.Adornee = model
-		SpiderBotVisual.Highlight.FillColor = SPIDER_ROLE_COLORS.BOT_SPIDER
-		SpiderBotVisual.Highlight.OutlineColor = SPIDER_ROLE_COLORS.BOT_SPIDER
+		SpiderBotVisual.Highlight.FillColor = roleColor
+		SpiderBotVisual.Highlight.OutlineColor = roleColor
 		if SpiderBotVisual.Highlight.Parent ~= folder then SpiderBotVisual.Highlight.Parent = folder end
 	end
-	if SpiderBotVisual.Label then
-		SpiderBotVisual.Label.Adornee = SpiderGetLabelAdornee(model)
-		if SpiderBotVisual.Label.Parent ~= folder then SpiderBotVisual.Label.Parent = folder end
-	end
+	SpiderBotVisual.RoleColor = roleColor
+	if SpiderBotVisual.Label then pcall(function() SpiderBotVisual.Label:Destroy() end); SpiderBotVisual.Label = nil end
 end
 
 local function SpiderClearAllItemVisuals()
@@ -4138,6 +4229,7 @@ local function SpiderStop()
 	SpiderClearAllItemVisuals()
 	SpiderClearBotVisual()
 	SpiderNPCModels = {}
+	SpiderModelUsernameCache = {}
 	SpiderRoleCache = {}
 	SpiderCachedPlayerRoles = {}
 	SpiderLastRoleRefresh = 0
@@ -4170,6 +4262,7 @@ local function SpiderStart()
 	SpiderKeepConnection(Workspace.DescendantRemoving:Connect(function(obj)
 		if SpiderItemVisuals[obj] or SpiderWorldItems[obj] then SpiderClearItemVisual(obj) end
 		if SpiderNPCModels[obj] then SpiderNPCModels[obj] = nil end
+		SpiderModelUsernameCache[obj] = nil
 	end))
 	SpiderKeepConnection(Players.PlayerRemoving:Connect(function(player)
 		SpiderCachedPlayerRoles[player] = nil
@@ -4187,19 +4280,21 @@ local function SpiderUpdateESP(activePlayers, now)
 			SpiderRoleCache[player] = role
 			if role == "SPIDER" then table.insert(explicitSpiderPlayers, player) end
 		end
-		local spiderPlayer = #explicitSpiderPlayers == 1 and explicitSpiderPlayers[1] or nil
-		local botModel = nil
-		if not spiderPlayer then botModel = SpiderFindBotCandidate() end
-		local hasConfirmedSpider = spiderPlayer ~= nil or botModel ~= nil
+		local spiderPlayer = #explicitSpiderPlayers >= 1 and explicitSpiderPlayers[1] or nil
+		local botModel = SpiderFindBotCandidate()
+		local botHasUsername = botModel and SpiderModelInventoryHasUsername(botModel) or false
+		-- Do not make all player ESP disappear just because role metadata is missing.
+		-- Keep the uniquely identified spider pink and default unclassified players to human cyan.
 		for _, player in ipairs(activePlayers) do
 			local role = SpiderRoleCache[player]
-			if player == spiderPlayer then role = "SPIDER"
-			elseif role == "HUMAN" then role = "HUMAN"
-			elseif hasConfirmedSpider then role = "HUMAN"
-			else role = nil end
+			if player == spiderPlayer then
+				role = "SPIDER"
+			else
+				role = "HUMAN"
+			end
 			SpiderRoleCache[player] = role
 		end
-		SpiderUpdateBotVisual(botModel)
+		SpiderUpdateBotVisual(botModel, botHasUsername)
 	end
 
 	local folder = _G.Celestial.ESPFolder
