@@ -2940,7 +2940,9 @@ OTI.Connection = RunService.Heartbeat:Connect(function()
 	local now = tick()
 	if now - OTI.LastScan < OTI.ScanInterval then return end
 	OTI.LastScan = now
+	local otiT0 = tick()
 	pcall(OTI_Tick)
+	OTI.LastCostMs = (tick() - otiT0) * 1000     -- diagnostico: coste real (reloj de pared) del tick de OTI
 end)
 
 _G.Celestial.ConnectionOTI = OTI.Connection
@@ -5390,10 +5392,14 @@ local function HiResPush(now, dt, csMs)
 	local tgt = CoinEngine.CurrentTarget
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f cs=%.1fms ls=%.1fms coins=%d%s",
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
 		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, currentSpeed,
-		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, csMs or -1, lastLogMs, coinsCollectedTotal,
+		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, csMs or -1, lastLogMs,
+		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
+		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
+		coinsCollectedTotal,
 		hiTag and (" <" .. hiTag .. ">") or "")
+	if _G.Celestial.OTI then _G.Celestial.OTI.LastCostMs = 0 end   -- el coste de OTI solo aparece en el frame donde corrio
 	hiResCount = math.min(hiResCount + 1, HIRES_N)
 	hiTag = nil
 end
@@ -5424,6 +5430,10 @@ local function FlushLog(reason, forceOverwrite)
 		end
 	end
 	pcall(writefile, "CelestialFarmLog.txt", payload)
+	if forceOverwrite then
+		local okD, d = pcall(HiResDump)
+		if okD and d ~= "" then pcall(writefile, "CelestialFarmHiRes.txt", d) end
+	end
 end
 
 local function ResetDiagnosticLog()
@@ -5462,7 +5472,7 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
@@ -5474,13 +5484,14 @@ local function LogStep(now, dt, force)
 		tostring(noclipOn), tostring(IsInsideSolid(p)),
 		coinsCollectedTotal, tostring(roundActive), roundCollected,
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
-		tostring(batchPausing), math.max(0, pauseUntil - now), table.concat(pendingEvents, ","))
+		tostring(batchPausing), math.max(0, pauseUntil - now),
+		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
 	lastLogPos, lastLogAt = p, now
 	if force or now >= nextFlushAt then
-		nextFlushAt = now + 3
+		nextFlushAt = now + 12     -- antes 3 s: cada volcado periodico costaba ls=5-10 ms y coincidio con los mayores tirones
 		FlushLog(force and "forced" or "periodic")
 	end
 end
@@ -5929,15 +5940,19 @@ end
 local function SafeControllerStep(dt)
 	velApplied = false
 	if dt and dt > 0 then lastFrameDt = dt end
+	local cbNow = os.clock()
+	CoinEngine.LastCbGapMs = CoinEngine.LastCbAt and (cbNow - CoinEngine.LastCbAt) * 1000 or -1
+	CoinEngine.LastCbAt = cbNow
 	local csT0 = os.clock()
 	local ok = pcall(ControllerStep, dt)
 	local csMs = (os.clock() - csT0) * 1000     -- coste real de ControllerStep en este frame (diagnostico de tirones)
 	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
 	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt, csMs) end
 	if State.FarmEnabled then
-		local lsT0 = os.clock()
+		local lsT0, lwT0 = os.clock(), tick()
 		pcall(LogStep, os.clock(), dt, false)
 		lastLogMs = (os.clock() - lsT0) * 1000
+		CoinEngine.LastLogWallMs = (tick() - lwT0) * 1000   -- os.clock es tiempo de CPU: tick() captura bloqueos de E/S de writefile
 	end
 	if ok then
 		errorStreak = 0
