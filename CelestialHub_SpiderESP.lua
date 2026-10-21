@@ -22,6 +22,9 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 if not _G.Celestial then
 	_G.Celestial = {}
 end
+-- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
+_G.Celestial.HubLoaded = false
+_G.Celestial.HubLoadFailed = false
 
 if _G.Celestial.CrosshairCleanup then
 	pcall(_G.Celestial.CrosshairCleanup)
@@ -741,6 +744,60 @@ local function ShowScanningGui()
 
 	_G.Celestial.ScanGui = scanGui
 
+	task.spawn(function()
+		while scanGui.Parent do
+			task.wait(0.02)
+			image.Rotation = (image.Rotation + 5) % 360
+		end
+	end)
+	return scanGui
+end
+
+-- Uses the same visual loader as the normal Hub startup; only the text and GUI name differ.
+local function ShowKickLogLoadingGui()
+	local oldLoader = CoreGui:FindFirstChild("CelestialKickLogLoadingGui")
+	if oldLoader then pcall(function() oldLoader:Destroy() end) end
+
+	local scanGui = Instance.new("ScreenGui")
+	scanGui.Name = "CelestialKickLogLoadingGui"
+	scanGui.ResetOnSpawn = false
+	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	scanGui.IgnoreGuiInset = true
+	scanGui.Parent = CoreGui
+
+	local mainFrame = Instance.new("Frame")
+	mainFrame.Name = "ScanningFrame"
+	mainFrame.Size = UDim2.new(0, 300, 0, 192)
+	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	mainFrame.BackgroundTransparency = 0.25
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Parent = scanGui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 16)
+	corner.Parent = mainFrame
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "ScanImage"
+	image.Size = UDim2.new(0, 140, 0, 140)
+	image.Position = UDim2.new(0.5, -70, 0, 10)
+	image.BackgroundTransparency = 1
+	image.Image = "rbxassetid://91431616848054"
+	image.ScaleType = Enum.ScaleType.Fit
+	image.Parent = mainFrame
+
+	local text = Instance.new("TextLabel")
+	text.Name = "ScanText"
+	text.Size = UDim2.new(1, -20, 0, 25)
+	text.Position = UDim2.new(0, 10, 1, -32)
+	text.BackgroundTransparency = 1
+	text.Text = "Loading Kick Log..."
+	text.TextColor3 = Color3.fromRGB(255, 255, 255)
+	text.Font = Enum.Font.GothamBold
+	text.TextSize = 18
+	text.Parent = mainFrame
+
+	_G.Celestial.KickLogLoadingGui = scanGui
 	task.spawn(function()
 		while scanGui.Parent do
 			task.wait(0.02)
@@ -11123,6 +11180,10 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
 	if not successUI then
 		warn("Error al construir la UI de Celestial:", errorMsg)
+		_G.Celestial.HubLoadFailed = true
+	else
+		-- Set only after the Hub's UI-building pcall has completely finished.
+		_G.Celestial.HubLoaded = true
 	end
 
 	_G.Celestial.ScanCounter = 0
@@ -11161,6 +11222,19 @@ task.spawn(function()
 		return
 	end
 
+	-- Wait for normal CH loading and full Hub UI construction to finish before showing the log loader.
+	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
+		task.wait(0.1)
+	end
+	if _G.Celestial.HubLoadFailed then return end
+
+	local loadingGui = ShowKickLogLoadingGui()
+	task.wait(1.5)
+	if loadingGui then pcall(function() loadingGui:Destroy() end) end
+	if _G.Celestial.KickLogLoadingGui == loadingGui then
+		_G.Celestial.KickLogLoadingGui = nil
+	end
+
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 
@@ -11184,7 +11258,7 @@ task.spawn(function()
 	title.Size = UDim2.new(1, -20, 0, 32)
 	title.Position = UDim2.new(0, 10, 0, 8)
 	title.BackgroundTransparency = 1
-	title.Text = "Loading CelestialFarm.Logtxt..."
+	title.Text = "Kick Log"
 	title.TextColor3 = Color3.fromRGB(255, 255, 255)
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 16
@@ -11194,7 +11268,7 @@ task.spawn(function()
 	status.Size = UDim2.new(1, -20, 0, 22)
 	status.Position = UDim2.new(0, 10, 0, 42)
 	status.BackgroundTransparency = 1
-	status.Text = "Recovering the previous session log..."
+	status.Text = "Loading the previous kick diagnosis..."
 	status.TextColor3 = Color3.fromRGB(190, 190, 200)
 	status.Font = Enum.Font.Gotham
 	status.TextSize = 11
@@ -11202,8 +11276,8 @@ task.spawn(function()
 
 	task.wait(1.5)
 
-	title.Text = "CelestialFarm.Logtxt"
-	status.Text = "Previous-session log recovered."
+	title.Text = "Kick Log"
+	status.Text = "Previous kick diagnosis loaded."
 
 	local scroll = Instance.new("ScrollingFrame")
 	scroll.Name = "LogPreview"
