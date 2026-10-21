@@ -5350,7 +5350,7 @@ local function LogStep(now, dt, force)
 	local physicalVelocity = root.AssemblyLinearVelocity
 	local physicalSpeed = physicalVelocity.Magnitude
 	local line = string.format(
-		"t=%.2f pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d ev=%s",
+		"t=%.2f pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f ev=%s",
 		now, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
@@ -5360,7 +5360,9 @@ local function LogStep(now, dt, force)
 		hum and tostring(hum:GetState()) or "?",
 		hum and tostring(hum.PlatformStand) or "?",
 		tostring(noclipOn), tostring(IsInsideSolid(p)),
-		coinsCollectedTotal, tostring(roundActive), roundCollected, table.concat(pendingEvents, ","))
+		coinsCollectedTotal, tostring(roundActive), roundCollected,
+		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
+		tostring(batchPausing), math.max(0, pauseUntil - now), table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
