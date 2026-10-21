@@ -4179,46 +4179,23 @@ local function SpiderFindBotCandidate()
 end
 
 local function SpiderResolveWorldItem(instance)
-	-- Resolve to an actual pickup container. Descendant parts may be named
-	-- Handle/Part, so walk upward to a known Tool/Model alias, but never promote
-	-- an arbitrary BasePart or a Workspace/map ancestor into an item.
-	if not instance or instance == Workspace or not instance:IsDescendantOf(Workspace) then
-		return nil, nil
-	end
 	local node = instance
+	local partFallback, fallbackKind = nil, nil
 	while node and node ~= Workspace do
 		local kind = SpiderClassifyItemName(node.Name)
-		if kind and (node:IsA("Tool") or node:IsA("Model")) then
-			if not SpiderIsPlayerCharacterDescendant(node) then
-				return node, kind
-			end
-		end
-		-- Directly named loose parts are allowed only if they have a pickup-like
-		-- name, a physical parent container, and are not part of a player rig.
-		if kind and node:IsA("BasePart") and node == instance
-			and node.Parent and (node.Parent:IsA("Model") or node.Parent:IsA("Folder"))
-			and not SpiderIsPlayerCharacterDescendant(node) then
-			return node, kind
+		if kind then
+			if node:IsA("Tool") or node:IsA("Model") then return node, kind end
+			if node:IsA("BasePart") and not partFallback then partFallback, fallbackKind = node, kind end
 		end
 		node = node.Parent
 	end
+	if partFallback then return partFallback, fallbackKind end
 	return nil, nil
 end
 
 local function SpiderIsAvailableWorldItem(target)
-	if not target or not target.Parent or not target:IsDescendantOf(Workspace) then return false end
-	if SpiderIsPlayerCharacterDescendant(target) then return false end
-	-- Only pickup containers or explicitly named loose pickup parts are valid.
-	local kind = SpiderClassifyItemName(target.Name)
-	if not kind then return false end
-	if target:IsA("Tool") then return true end
-	if target:IsA("Model") then
-		return SpiderModelRoot(target) ~= nil
-	end
-	if target:IsA("BasePart") then
-		return target.Parent ~= Workspace and (target.Parent:IsA("Model") or target.Parent:IsA("Folder"))
-	end
-	return false
+	return target ~= nil and target.Parent ~= nil and target:IsDescendantOf(Workspace)
+		and not SpiderIsPlayerCharacterDescendant(target)
 end
 
 local function SpiderClearItemVisual(target)
@@ -4254,11 +4231,13 @@ local function SpiderRefreshRegisteredWorldItems()
 			SpiderClearItemVisual(target)
 		else
 			local currentTarget, currentKind = SpiderResolveWorldItem(target)
-			if not currentTarget or currentTarget ~= target or currentKind ~= kind then
-				SpiderClearItemVisual(target)
-				if currentTarget and currentKind then SpiderRegisterWorldItem(currentTarget) end
-			else
+			if currentTarget == target and currentKind == kind then
 				SpiderEnsureItemVisual(target, kind)
+			elseif currentTarget and currentKind then
+				SpiderClearItemVisual(target)
+				SpiderRegisterWorldItem(currentTarget)
+			else
+				SpiderClearItemVisual(target)
 			end
 		end
 	end
@@ -4506,43 +4485,27 @@ local function SpiderStart()
 		end))
 	end
 
-	-- Depth-first, bounded batches avoid allocating Workspace:GetDescendants() all at once.
-	-- A 22k cap preserves the original scanner's safety limit.
-	local initialChildren = Workspace:GetChildren()
-	task.spawn(function()
-		local stack = {}
-		for index = #initialChildren, 1, -1 do stack[#stack + 1] = initialChildren[index] end
-		local scanned = 0
-		while #stack > 0 and scanned < 22000 do
+	-- Recorrido de objetos probado en versiones anteriores, dividido en lotes de 250.
+	local scanOK, descendants = pcall(function() return Workspace:GetDescendants() end)
+	if scanOK and descendants then
+		local scanLimit = math.min(#descendants, 22000)
+		local index = 1
+		local function scanBatch()
 			if not SpiderESPActive or SpiderScanGeneration ~= scanGeneration
 				or _G.Celestial.GameMode ~= "SPIDER" then return end
-			local batchCount = 0
-			while #stack > 0 and batchCount < 160 and scanned < 22000 do
-				local obj = stack[#stack]
-				stack[#stack] = nil
+			local batchEnd = math.min(index + 249, scanLimit)
+			while index <= batchEnd do
+				local obj = descendants[index]
 				if obj and obj.Parent then
-					local normalized = SpiderNormalizeName(obj.Name)
-					if SpiderClassifyItemName(obj.Name) then SpiderRegisterWorldItem(obj)
-					else
-						local resolved, resolvedKind = SpiderResolveWorldItem(obj)
-						if resolved and resolvedKind then SpiderRegisterWorldItem(obj) end
-					end
-					if obj:IsA("Model") or normalized == "inventory" or normalized == "backpack"
-						or normalized == "playerinventory" or normalized == "spiderinventory"
-						or normalized:find("spider", 1, true) or normalized:find("infected", 1, true) then
-						SpiderConsiderNPC(obj)
-					end
-					local ok, children = pcall(function() return obj:GetChildren() end)
-					if ok and children then
-						for index = #children, 1, -1 do stack[#stack + 1] = children[index] end
-					end
+					SpiderRegisterWorldItem(obj)
+					if obj:IsA("Model") then SpiderConsiderNPC(obj) end
 				end
-				scanned = scanned + 1
-				batchCount = batchCount + 1
+				index = index + 1
 			end
-			task.wait()
+			if index <= scanLimit then task.defer(scanBatch) end
 		end
-	end)
+		task.defer(scanBatch)
+	end
 	-- Let the initial tree walk get a head start before deep role/inventory metadata scans.
 	SpiderLastRoleRefresh = tick() - 0.75
 	SpiderKeepConnection(Players.PlayerAdded:Connect(function(player)
@@ -4558,6 +4521,7 @@ local function SpiderStart()
 		if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
 		task.defer(function()
 			if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
+			SpiderRegisterWorldItem(obj)
 			local normalized = SpiderNormalizeName(obj.Name)
 			local resolvedItem, resolvedKind = SpiderResolveWorldItem(obj)
 			if resolvedItem and resolvedKind then
@@ -4604,7 +4568,7 @@ local function SpiderUpdateESP(activePlayers, now)
 	SpiderAdvanceRoleScan(activePlayers, now)
 	-- Player highlights/role metadata need no RenderStepped-rate refresh.
 	if now - SpiderLastVisualUpdate < 0.38 then
-		SpiderRefreshRegisteredWorldItems()
+		SpiderProcessDirtyItems(6)
 		return
 	end
 	SpiderLastVisualUpdate = now
@@ -4677,6 +4641,7 @@ local function SpiderUpdateESP(activePlayers, now)
 	-- Only new/changed items are processed. DescendantAdded/Removing handles lifecycle
 	-- updates, so rescanning every registered item 5 times per second was redundant.
 	SpiderRefreshRegisteredWorldItems()
+	SpiderProcessDirtyItems(18)
 end
 
 _G.Celestial.SpiderESPCleanup = SpiderStop
