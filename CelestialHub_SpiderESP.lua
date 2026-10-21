@@ -4902,6 +4902,9 @@ end)
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
 -- ====================================================================
 
+-- Todo el modulo va dentro de una funcion propia: el script principal ya esta cerca del
+-- limite de 200 variables locales por funcion, y asi el AutoFarm no consume ninguna.
+;(function()
 -- Limpieza de una ejecucion anterior (re-ejecucion del script)
 if _G.Celestial.CoinEngine and _G.Celestial.CoinEngine.Destroy then
 	pcall(_G.Celestial.CoinEngine.Destroy)
@@ -5281,6 +5284,7 @@ _G.Celestial.StopCoinEngine = function()
 	State.FarmEnabled = false
 	CoinEngine.Destroy()
 end
+end)()
 
 -- ====================================================================
 -- AIMBOT PRO + MURDER AIMBOT
