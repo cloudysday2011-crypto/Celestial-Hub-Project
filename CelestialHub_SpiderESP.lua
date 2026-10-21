@@ -5826,8 +5826,10 @@ local function ControllerStep(dt)
 		if IsInsideSolid(root.Position) then
 			solidOverlapSince = solidOverlapSince or now
 			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
-				StopFarmForSafety("sustained-solid-overlap")
-				return
+				-- Ya NO apaga el Auto-Farm (el sondeo daba falsos positivos, incluso con el personaje
+				-- quieto en el suelo). Solo se deja constancia en el log y se sigue farmeando.
+				LogEvent("solid-overlap-ignored")
+				solidOverlapSince = now   -- reinicia la ventana: como mucho 1 aviso cada 0.6 s
 			end
 		else
 			solidOverlapSince = nil
