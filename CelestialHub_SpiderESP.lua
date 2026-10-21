@@ -796,7 +796,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 40, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 75, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -4946,20 +4946,24 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 45,         -- tope duro de velocidad (studs/s); el slider nunca lo supera
-	RampTime = 0.4,            -- segundos para llegar de 0 a velocidad maxima (sin arranques bruscos)
-	MinCollectInterval = 0.12, -- pausa minima entre recogidas
-	MaxDistance = 200,         -- no volar hacia monedas lejanas (lobby / fuera del mapa)
-	MaxVerticalGap = 35,       -- ignora monedas a mucha mas altura/profundidad que el jugador
-	-- ===== EXTRA con Safe Mode =====
-	SafeMaxSpeed = 28,
-	SafeRampTime = 0.8,
-	SafeMinCollectInterval = 0.3,
-	SafeMaxDistance = 110,
-	SafeMaxVerticalGap = 15,
-	RestEvery = 10,            -- descanso cada N monedas
-	RestMin = 2.0,
-	RestMax = 4.0,
+	BaseMaxSpeed = 100,        -- el slider manda; ya NO se recorta la velocidad para ganar estabilidad
+	RampTime = 0.25,           -- aceleracion corta (sin arranques bruscos)
+	MinCollectInterval = 0.04,
+	MaxDistance = 300,
+	MaxVerticalGap = 60,
+	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
+	SafeMaxSpeed = 100,
+	SafeRampTime = 0.3,
+	SafeMinCollectInterval = 0.05,
+	SafeMaxDistance = 300,
+	SafeMaxVerticalGap = 60,
+	RestEvery = 45,            -- descanso corto, poco frecuente, y nunca dentro de una pared
+	RestMin = 0.4,
+	RestMax = 0.9,
+	SettleMin = 0.03,          -- espera minima al llegar a la moneda (el servidor ve tu posicion con retraso)
+	SettleMax = 0.15,
+	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
+	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 3.4,
 	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
@@ -4988,6 +4992,10 @@ local pauseUntil = 0
 local currentSpeed = 0
 local lastCollectAt = 0
 local coinsSinceRest = 0
+local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
+local noclipOn = false
+local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
+local cachedPingMs, nextPingAt = 80, 0
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
@@ -5096,6 +5104,7 @@ local function ResetPath()
 	noTargetUntil = 0
 	currentSpeed = 0
 	lastSetPos = nil
+	arriveTarget = nil
 end
 
 local function Activate()
@@ -5123,6 +5132,63 @@ local function Deactivate()
 	ResetPath()
 	lastRoot = nil
 	lastContainer = nil
+end
+
+-- ---------------------------------------------------------------
+-- NOCLIP SOLO MIENTRAS VUELA: antes el personaje chocaba con las paredes, y al escribir el CFrame
+-- dentro de la pared la fisica lo empujaba (posiciones inconsistentes = causa de "Invalid Position").
+-- Corre en Stepped (antes de la fisica) porque el Humanoid reescribe CanCollide en cada paso.
+-- ---------------------------------------------------------------
+
+local function RestoreCollisions()
+	for part, was in pairs(origCollide) do
+		if part and part.Parent then pcall(function() part.CanCollide = was end) end
+	end
+	table.clear(origCollide)
+	noclipOn = false
+end
+
+local function NoclipStep()
+	if CoinEngine.NoclipWanted and CoinEngine.Active and State.FarmEnabled then
+		local char = LocalPlayer.Character
+		if not char then return end
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") then
+				if origCollide[part] == nil then origCollide[part] = part.CanCollide end
+				part.CanCollide = false
+			end
+		end
+		noclipOn = true
+	elseif noclipOn then
+		RestoreCollisions()
+	end
+end
+
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+overlapParams.RespectCanCollide = true
+
+-- true si la posicion esta dentro de geometria solida (no descansar / quedarse quieto ahi)
+local function IsInsideSolid(pos)
+	local ignore = {}
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	overlapParams.FilterDescendantsInstances = ignore
+	local ok, parts = pcall(function() return Workspace:GetPartBoundsInRadius(pos, 1.6, overlapParams) end)
+	return ok and parts and #parts > 0
+end
+
+-- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera ese tiempo al llegar
+-- a la moneda y ANTES de recogerla: asi la recogida no se valida desde una posicion "vieja/lejana".
+local function GetSettleTime(now)
+	if now >= nextPingAt then
+		nextPingAt = now + 1
+		pcall(function()
+			cachedPingMs = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+	end
+	return math.clamp(cachedPingMs / 2000 + 0.02, CoinEngine.SettleMin, CoinEngine.SettleMax)
 end
 
 -- ---------------------------------------------------------------
@@ -5260,6 +5326,7 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
+	CoinEngine.NoclipWanted = false     -- se vuelve a pedir solo si este frame realmente vuela
 
 	-- Tirón de FPS / lag: NO "recuperar" el tiempo perdido moviendose de golpe (el servidor lo ve como salto).
 	if dt > Param(0.15, 0.1) then
@@ -5331,12 +5398,11 @@ local function ControllerStep(dt)
 
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
-	if safe then speed = speed * (1 + 0.12 * math.noise(now * 0.8, 7.3)) end   -- ligera variacion (+-6%), movimiento menos mecanico
 	dt = math.clamp(dt, 0, 0.05)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual
 	local budget = currentSpeed * dt
-	local startPos = root.Position
+	local startPos = lastSetPos or root.Position
 	if not IsFiniteVec(startPos) then ResetPath(); return end
 	local pos = startPos
 	local moved = false
@@ -5358,27 +5424,22 @@ local function ControllerStep(dt)
 		end
 		local toPickup = dist - CoinEngine.PickupDistance
 		if toPickup <= 0 or dist < 1e-3 or budget >= toPickup then
-			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-			if safe then minGap = minGap + (lastCollectAt % 0.2) end   -- jitter barato y determinista
-			if now - lastCollectAt < minGap then
-				-- aun en pausa entre monedas: acercarse sin pasar del radio de recogida
-				if toPickup > 0 then
-					local stepTo = math.min(budget, toPickup)
-					pos = pos + (delta / dist) * stepTo
-					moved = true
-				end
-				break
-			end
+			-- Llegada: ir hasta el radio de recogida y quedarse EXACTAMENTE ahi
 			if toPickup > 0 then
 				pos = pos + (delta / dist) * toPickup
 				budget -= toPickup
-				moved = true
 			end
+			moved = true                                       -- mantener/escribir posicion (con noclip no hay suelo que nos sostenga)
+			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
+			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
+			local settle = safe and GetSettleTime(now) or 0.03
+			if now - arriveAt < settle or now - lastCollectAt < minGap then break end   -- esperar a que el servidor te vea aqui
 			lastCollectAt = now
+			arriveTarget = nil
 			CollectCoin(root, target, now)
 			transitions += 1
 			coinsSinceRest += 1
-			if safe and coinsSinceRest >= CoinEngine.RestEvery then
+			if safe and coinsSinceRest >= CoinEngine.RestEvery and not IsInsideSolid(pos) then
 				coinsSinceRest = 0
 				pauseUntil = now + CoinEngine.RestMin + math.random() * (CoinEngine.RestMax - CoinEngine.RestMin)
 			end
@@ -5395,6 +5456,8 @@ local function ControllerStep(dt)
 		local stepLen = (pos - startPos).Magnitude
 		local maxStep = currentSpeed * dt * Param(1.25, 1.1) + 0.25
 		if IsSafeCoinPosition(pos) and stepLen == stepLen and stepLen <= maxStep then
+			CoinEngine.NoclipWanted = true                     -- atraviesa paredes mientras vuela / espera la recogida
+			NoclipStep()                                       -- aplicar YA (no esperar al siguiente Stepped)
 			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
@@ -5438,11 +5501,15 @@ CoinEngine.Destroy = function()
 	local controller = CoinEngine.Controller
 	CoinEngine.Controller = nil
 	if controller then controller:Disconnect() end
+	if CoinEngine.NoclipConn then CoinEngine.NoclipConn:Disconnect(); CoinEngine.NoclipConn = nil end
+	CoinEngine.NoclipWanted = false
+	RestoreCollisions()
 	if _G.Celestial.ConnectionFarm == controller then _G.Celestial.ConnectionFarm = nil end
 	Deactivate()
 end
 
 -- Un unico controlador: la conexion anterior (si existia) ya fue destruida arriba.
+CoinEngine.NoclipConn = RunService.Stepped:Connect(function() pcall(NoclipStep) end)
 CoinEngine.Controller = RunService.Heartbeat:Connect(SafeControllerStep)
 _G.Celestial.ConnectionFarm = CoinEngine.Controller
 
@@ -8482,8 +8549,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Max speed (hard cap 45; 28 with Safe Mode).", 10, 45, math.min(State.TweenSpeed, 45), function(v) State.TweenSpeed = v end)
-		AddToggleToSection(secFarm, "Safe Mode (extra protection)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 100, State.TweenSpeed, function(v) State.TweenSpeed = v end)
+		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
 		-- COMBAT TAB
