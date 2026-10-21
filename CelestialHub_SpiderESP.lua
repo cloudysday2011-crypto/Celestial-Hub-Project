@@ -5132,14 +5132,17 @@ end
 -- No registrar monedas que aparezcan en objetos ajenos al mapa/ronda activa.
 -- DescendantAdded se escucha en Workspace por eficiencia, pero eso no convierte todo Workspace en una fuente valida.
 local function IsInRecognizedCoinSource(obj)
-	if not obj or not obj.Parent then return false end
+	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then return false end
+	if not CoinNameMatches(obj) then return false end
 	local coinContainer = FindCoinContainer()
-	if coinContainer then return obj:IsDescendantOf(coinContainer) end
+	if coinContainer and obj:IsDescendantOf(coinContainer) then return true end
 	for _, name in ipairs({"Map", "Normal", "Round"}) do
 		local mapRoot = Workspace:FindFirstChild(name)
 		if mapRoot and obj:IsDescendantOf(mapRoot) then return true end
 	end
-	return false
+	-- Algunos mapas/rondas colocan las monedas directamente en Workspace o fuera de CoinContainer.
+	-- IsValidCoin y el chequeo de suelo siguen filtrando piezas que no sean monedas utilizables.
+	return true
 end
 
 -- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
@@ -5158,15 +5161,15 @@ end
 local function RescanCoins()
 	local container = FindCoinContainer()
 	local found = 0
-	if container then
-		found = ScanContainer(container)
-	else
-		for _, name in ipairs({"Map", "Normal", "Round"}) do
-			local c = Workspace:FindFirstChild(name)
-			if c then found += ScanContainer(c) end
-		end
-		-- No escanear Workspace entero como ultimo recurso: eso permitia tratar piezas ajenas al mapa
-		-- como monedas y encadenar objetivos que no pertenecen a la ronda.
+	if container then found += ScanContainer(container) end
+	for _, name in ipairs({"Map", "Normal", "Round"}) do
+		local c = Workspace:FindFirstChild(name)
+		if c and c ~= container then found += ScanContainer(c) end
+	end
+	-- Fallback compatible con mapas que guardan monedas directamente en Workspace.
+	-- ScanContainer solo registra BaseParts cuyo nombre coincide con CoinNameMatches y pasa IsValidCoin.
+	if found == 0 and CoinEngine.CoinCount == 0 then
+		found = ScanContainer(Workspace)
 	end
 	lastContainer = container
 	if found > 0 then rescanBackoff = 1.0 else rescanBackoff = math.min(rescanBackoff * 1.5, 4) end
