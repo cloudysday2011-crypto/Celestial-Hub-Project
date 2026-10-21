@@ -2,7 +2,7 @@
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
 -- + OTI (OBJECT THREAT INTELLIGENCE) — SEPARADO DE QMA
--- + QMA REFORGED / COIN FARM V2 DYNAMIC TARGETS (CONTINUOUS MOVEMENT)
+-- + QMA REFORGED / COIN FARM V2 DYNAMIC TARGETS (DIAGNOSTIC GUARD)
 -- + DUAL GAME MODE (MM2 / MURDER DUELS) + TEAM ESP + SMART AIMBOT
 -- + LOBBY/MATCH DETECTION + SELF ESP + DEFERRED UI LOADING
 -- + QMA ADAPTIVE BATCH SCHEDULER & PERFORMANCE OPTIMIZATIONS
@@ -5274,8 +5274,18 @@ local function IsInsideSolid(pos)
 	if container then ignore[#ignore + 1] = container end
 	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
 	overlapParams.FilterDescendantsInstances = ignore
-	local ok, parts = pcall(function() return Workspace:GetPartBoundsInRadius(pos, 1.6, overlapParams) end)
-	return ok and parts and #parts > 0
+	-- Probe only the character's central volume. The former 1.6-stud radius could count a nearby
+	-- floor/wall as an overlap even when the root was not actually inside collidable geometry.
+	local probeCFrame = CFrame.new(pos + Vector3.new(0, 0.2, 0))
+	local probeSize = Vector3.new(1.4, 1.4, 1.4)
+	local ok, parts = pcall(function()
+		return Workspace:GetPartBoundsInBox(probeCFrame, probeSize, overlapParams)
+	end)
+	if not ok or not parts then return false end
+	for _, part in ipairs(parts) do
+		if part:IsA("BasePart") and part.CanCollide then return true end
+	end
+	return false
 end
 
 -- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera ese tiempo al llegar
@@ -5291,43 +5301,92 @@ local function GetSettleTime(now)
 end
 
 -- ---------------------------------------------------------------
--- REGISTRO DE DIAGNOSTICO: guarda ~40 s de telemetria en "CelestialFarmLog.txt" (carpeta workspace del
--- ejecutor) cada 3 s y SIEMPRE al recibir un kick, para ver que pasaba justo antes de "Invalid Position".
+-- REGISTRO DE DIAGNOSTICO + GUARDIA DE MOVIMIENTO
+-- Guarda ~40 s de muestras en CelestialFarmLog.txt. Separa la velocidad ordenada por CH de la
+-- velocidad fisica real. Si hay solapamiento con geometria solida persistente, detiene el AutoFarm
+-- y restaura el estado normal del personaje; no intenta continuar atravesando la geometria.
 -- ---------------------------------------------------------------
 
 local logBuf, pendingEvents = {}, {}
 local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
+local logFinalized = false
+local lastLogPos, lastLogAt = nil, nil
+local nextSolidGuardCheck, solidOverlapSince = 0, nil
+local SOLID_OVERLAP_CONFIRM_TIME = 0.60
 
 local function LogEvent(tag)
-	if #pendingEvents < 8 then pendingEvents[#pendingEvents + 1] = tag end
+	if logFinalized then return end
+	if #pendingEvents < 8 then pendingEvents[#pendingEvents + 1] = tostring(tag) end
 end
 
-local function FlushLog(reason)
-	if not writefile then return end
-	pcall(writefile, "CelestialFarmLog.txt", "reason: " .. tostring(reason) .. "\n" .. table.concat(logBuf, "\n"))
+local function FlushLog(reason, forceOverwrite)
+	if logFinalized and not forceOverwrite then return end
+	if type(writefile) ~= "function" then return end
+	local payload = "reason: " .. tostring(reason) .. "\n" .. table.concat(logBuf, "\n")
+	pcall(writefile, "CelestialFarmLog.txt", payload)
+end
+
+local function ResetDiagnosticLog()
+	logFinalized = false
+	table.clear(logBuf)
+	table.clear(pendingEvents)
+	nextLogAt, nextFlushAt = 0, 0
+	lastLogPos, lastLogAt = nil, nil
+	nextSolidGuardCheck, solidOverlapSince = 0, nil
+	LogEvent("diagnostic-restarted")
 end
 
 local function LogStep(now, dt, force)
+	if logFinalized and not force then return end
 	if not force and now < nextLogAt then return end
 	nextLogAt = now + 0.25
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root then return end
 	local p = root.Position
 	local tgt = CoinEngine.CurrentTarget
+	local sampleDt = lastLogAt and math.max(now - lastLogAt, 0) or 0
+	local sampleDelta = lastLogPos and (p - lastLogPos).Magnitude or -1
+	local sampleSpeed = (sampleDelta >= 0 and sampleDt > 0.001) and (sampleDelta / sampleDt) or -1
+	local physicalVelocity = root.AssemblyLinearVelocity
+	local physicalSpeed = physicalVelocity.Magnitude
 	local line = string.format(
-		"t=%.2f pos=(%.0f,%.0f,%.0f) drift=%.2f spd=%.0f toCoin=%.0f fps=%.0f ping=%.0f state=%s noclip=%s inSolid=%s coins=%d round=%s n=%d ev=%s",
+		"t=%.2f pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d ev=%s",
 		now, p.X, p.Y, p.Z,
-		lastSetPos and (p - lastSetPos).Magnitude or -1,
+		sampleDelta, sampleSpeed,
+		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
 		currentSpeed,
 		tgt and (tgt.Position - p).Magnitude or -1,
 		dt > 0 and 1 / dt or 0, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
+		hum and tostring(hum.PlatformStand) or "?",
 		tostring(noclipOn), tostring(IsInsideSolid(p)),
 		coinsCollectedTotal, tostring(roundActive), roundCollected, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
-	if force or now >= nextFlushAt then nextFlushAt = now + 3; FlushLog(force and "forced" or "periodic") end
+	lastLogPos, lastLogAt = p, now
+	if force or now >= nextFlushAt then
+		nextFlushAt = now + 3
+		FlushLog(force and "forced" or "periodic")
+	end
+end
+
+local function StopFarmForSafety(reason)
+	if logFinalized then return end
+	LogEvent("SAFETY-STOP: " .. tostring(reason))
+	-- Capture the movement state while the issue is still present.
+	pcall(LogStep, os.clock(), 0, true)
+	logFinalized = true
+	pcall(FlushLog, "safety-stop: " .. tostring(reason), true)
+	State.FarmEnabled = false
+	local setter = _G.Celestial.ToggleSetters and _G.Celestial.ToggleSetters["Auto Farm Coins"]
+	if type(setter) == "function" then pcall(setter, false) end
+	CoinEngine.NoclipWanted = false
+	StopFlight()
+	RestoreCollisions()
+	ResetPath()
+	solidOverlapSince = nil
+	SetStatus("safety-stop")
 end
 
 -- ---------------------------------------------------------------
@@ -5517,9 +5576,12 @@ end
 
 local function ControllerStep(dt)
 	if not State.FarmEnabled then
+		solidOverlapSince = nil
+		nextSolidGuardCheck = 0
 		if CoinEngine.Active then Deactivate() end
 		return
 	end
+	if logFinalized then ResetDiagnosticLog() end
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
@@ -5648,9 +5710,26 @@ local function ControllerStep(dt)
 		end
 	end
 
-	-- ===== VUELO hacia la moneda (BodyVelocity + BodyGyro + PlatformStand, como "Fly") =====
+	-- ===== VUELO hacia la moneda =====
 	SetStatus("farming")
 	EnsureFlight(root, hum)
+
+	-- Safety guard: sustained overlap with solid map geometry means the character is still passing
+	-- through a wall/solid region. Stop instead of continuing the same trajectory into a server kick.
+	-- A short confirmation window avoids stopping on a single noisy overlap sample.
+	if now >= nextSolidGuardCheck then
+		nextSolidGuardCheck = now + 0.12
+		if IsInsideSolid(root.Position) then
+			solidOverlapSince = solidOverlapSince or now
+			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
+				StopFarmForSafety("sustained-solid-overlap")
+				return
+			end
+		else
+			solidOverlapSince = nil
+		end
+	end
+
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
 	dt = math.clamp(dt, 0, 0.05)
@@ -5778,8 +5857,24 @@ end
 -- Un unico controlador: la conexion anterior (si existia) ya fue destruida arriba.
 CoinEngine.NoclipConn = RunService.Stepped:Connect(function() pcall(NoclipStep) end)
 CoinEngine.KickConn = game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
-	if msg and msg ~= "" then
-		LogEvent("KICK: " .. tostring(msg))
+	if not msg or msg == "" or logFinalized then return end
+	local cleanMessage = tostring(msg):gsub("[%c]+", " "):sub(1, 180)
+	local normalizedMessage = string.lower(cleanMessage)
+	if string.find(normalizedMessage, "invalid position", 1, true) then
+		LogEvent("KICK: " .. cleanMessage)
+		pcall(LogStep, os.clock(), 0, true)
+		logFinalized = true
+		pcall(FlushLog, "invalid-position-final", true)
+		State.FarmEnabled = false
+		local setter = _G.Celestial.ToggleSetters and _G.Celestial.ToggleSetters["Auto Farm Coins"]
+		if type(setter) == "function" then pcall(setter, false) end
+		CoinEngine.NoclipWanted = false
+		StopFlight()
+		RestoreCollisions()
+		ResetPath()
+		SetStatus("kick-detected")
+	else
+		LogEvent("GUI-ERROR: " .. cleanMessage)
 		pcall(LogStep, os.clock(), 0, true)
 	end
 end)
@@ -8541,6 +8636,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
 		local sections = {}
 		_G.Celestial.ToggleButtons = _G.Celestial.ToggleButtons or {}
+		_G.Celestial.ToggleSetters = _G.Celestial.ToggleSetters or {}
 
 		local function CreateSection(name)
 			local scroll = Instance.new("ScrollingFrame")
@@ -8681,6 +8777,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				knob.Position = active and UDim2.new(1, -24, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
 				callback(active)
 			end
+			_G.Celestial.ToggleSetters[text] = setToggleState
 			btn.MouseButton1Click:Connect(function() setToggleState(not active) end)
 			return btn
 		end
