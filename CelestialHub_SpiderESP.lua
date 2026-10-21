@@ -11044,4 +11044,134 @@ end)
 State.AntiFlingActive = true
 State.PowerDetectorActive = true
 
+
+-- ====================================================================
+-- CELESTIAL FARM LOG RECOVERY (SAFE STARTUP DIAGNOSTICS)
+-- Recovers a log saved by a previous session and offers manual copying.
+-- This does not attempt to bypass a kick or automatically rejoin servers.
+-- ====================================================================
+task.spawn(function()
+	local okRead, previousLog = pcall(function()
+		if type(isfile) == "function" and not isfile("CelestialFarmLog.txt") then
+			return nil
+		end
+		if type(readfile) ~= "function" then return nil end
+		return readfile("CelestialFarmLog.txt")
+	end)
+	if not okRead or type(previousLog) ~= "string" or previousLog == "" then
+		return
+	end
+
+	local oldGui = CoreGui:FindFirstChild("CelestialFarmLogRecovery")
+	if oldGui then pcall(function() oldGui:Destroy() end) end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "CelestialFarmLogRecovery"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = CoreGui
+
+	local frame = Instance.new("Frame")
+	frame.Name = "LogFrame"
+	frame.Size = UDim2.new(0, 340, 0, 250)
+	frame.Position = UDim2.new(0.5, -170, 0.5, -125)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -20, 0, 32)
+	title.Position = UDim2.new(0, 10, 0, 8)
+	title.BackgroundTransparency = 1
+	title.Text = "Loading CelestialFarm.Logtxt..."
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.Parent = frame
+
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, -20, 0, 22)
+	status.Position = UDim2.new(0, 10, 0, 42)
+	status.BackgroundTransparency = 1
+	status.Text = "Recovering the previous session log..."
+	status.TextColor3 = Color3.fromRGB(190, 190, 200)
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 11
+	status.Parent = frame
+
+	task.wait(1.5)
+
+	title.Text = "CelestialFarm.Logtxt"
+	status.Text = "Previous-session log recovered."
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Name = "LogPreview"
+	scroll.Size = UDim2.new(1, -20, 0, 130)
+	scroll.Position = UDim2.new(0, 10, 0, 68)
+	scroll.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 5
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scroll.Parent = frame
+	Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
+
+	local preview = Instance.new("TextLabel")
+	preview.Size = UDim2.new(1, -12, 0, 0)
+	preview.Position = UDim2.new(0, 6, 0, 6)
+	preview.AutomaticSize = Enum.AutomaticSize.Y
+	preview.BackgroundTransparency = 1
+	preview.Text = previousLog
+	preview.TextColor3 = Color3.fromRGB(220, 220, 225)
+	preview.Font = Enum.Font.Code
+	preview.TextSize = 10
+	preview.TextXAlignment = Enum.TextXAlignment.Left
+	preview.TextYAlignment = Enum.TextYAlignment.Top
+	preview.TextWrapped = true
+	preview.Parent = scroll
+	task.defer(function()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+	end)
+
+	local copy = Instance.new("TextButton")
+	copy.Name = "CopyLog"
+	copy.Size = UDim2.new(0.62, -8, 0, 32)
+	copy.Position = UDim2.new(0, 10, 1, -42)
+	copy.BackgroundColor3 = Color3.fromRGB(65, 105, 190)
+	copy.BorderSizePixel = 0
+	copy.Text = "Copy Log"
+	copy.TextColor3 = Color3.new(1, 1, 1)
+	copy.Font = Enum.Font.GothamBold
+	copy.TextSize = 13
+	copy.Parent = frame
+	Instance.new("UICorner", copy).CornerRadius = UDim.new(0, 7)
+
+	local close = Instance.new("TextButton")
+	close.Name = "CloseLog"
+	close.Size = UDim2.new(0.38, -12, 0, 32)
+	close.Position = UDim2.new(0.62, 2, 1, -42)
+	close.BackgroundColor3 = Color3.fromRGB(65, 65, 72)
+	close.BorderSizePixel = 0
+	close.Text = "Close"
+	close.TextColor3 = Color3.new(1, 1, 1)
+	close.Font = Enum.Font.GothamBold
+	close.TextSize = 13
+	close.Parent = frame
+	Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
+
+	copy.Activated:Connect(function()
+		local clipboard = setclipboard or toclipboard or set_clipboard
+		if type(clipboard) == "function" then
+			local okCopy = pcall(clipboard, previousLog)
+			status.Text = okCopy and "Log copied to clipboard." or "Clipboard failed; use the preview or file."
+		else
+			status.Text = "Clipboard API unavailable; open CelestialFarmLog.txt manually."
+		end
+	end)
+	close.Activated:Connect(function()
+		pcall(function() gui:Destroy() end)
+	end)
+end)
+
 print("✨ CELESTIAL FRAMEWORK V19.18.16 - MM2 / DUELS / SPIDER ESP + OBJECT ESP + SELF ESP ✨")
