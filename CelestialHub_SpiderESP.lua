@@ -796,7 +796,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 95, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 40, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -4945,10 +4945,22 @@ local CoinEngine = {
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
-	MaxDistance = 250,         -- antes 600: volar tan lejos suele significar que estas en el lobby / fuera del mapa
-	SafeMaxSpeed = 55,         -- tope de velocidad real (studs/s) con Safe Mode activo
-	RampTime = 0.35,           -- segundos para llegar de 0 a velocidad maxima (sin arranques bruscos)
+	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
+	BaseMaxSpeed = 45,         -- tope duro de velocidad (studs/s); el slider nunca lo supera
+	RampTime = 0.4,            -- segundos para llegar de 0 a velocidad maxima (sin arranques bruscos)
 	MinCollectInterval = 0.12, -- pausa minima entre recogidas
+	MaxDistance = 200,         -- no volar hacia monedas lejanas (lobby / fuera del mapa)
+	MaxVerticalGap = 35,       -- ignora monedas a mucha mas altura/profundidad que el jugador
+	-- ===== EXTRA con Safe Mode =====
+	SafeMaxSpeed = 28,
+	SafeRampTime = 0.8,
+	SafeMinCollectInterval = 0.3,
+	SafeMaxDistance = 110,
+	SafeMaxVerticalGap = 15,
+	RestEvery = 10,            -- descanso cada N monedas
+	RestMin = 2.0,
+	RestMax = 4.0,
+	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 3.4,
 	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
 	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
@@ -4975,6 +4987,7 @@ local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta 
 local pauseUntil = 0
 local currentSpeed = 0
 local lastCollectAt = 0
+local coinsSinceRest = 0
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
@@ -5022,6 +5035,7 @@ local function UnregisterCoin(coin)
 	end
 	CoinEngine.Blacklist[coin] = nil
 	CoinEngine.Attempts[coin] = nil
+	CoinEngine.GroundOk[coin] = nil
 	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
 	if CoinEngine.NextTarget == coin then CoinEngine.NextTarget = nil end
 end
@@ -5103,6 +5117,8 @@ local function Deactivate()
 	table.clear(CoinEngine.CoinCache)
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
+	table.clear(CoinEngine.GroundOk)
+	coinsSinceRest = 0
 	CoinEngine.CoinCount = 0
 	ResetPath()
 	lastRoot = nil
@@ -5124,9 +5140,35 @@ local function IsAvailable(coin, now)
 	return true
 end
 
+local function SafeOn() return State.FarmSafeMode ~= false end
+local function Param(base, safe) if SafeOn() then return safe end return base end
+
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.RespectCanCollide = false
+
+-- La moneda debe tener suelo real debajo (descarta monedas fuera del mapa / flotando en el vacio).
+local function IsGrounded(coin)
+	if CoinEngine.GroundOk[coin] then return true end
+	local ignore = {}
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	groundParams.FilterDescendantsInstances = ignore
+	local ok, hit = pcall(function()
+		return Workspace:Raycast(coin.Position + Vector3.new(0, 2, 0), Vector3.new(0, -40, 0), groundParams)
+	end)
+	if ok and hit then
+		CoinEngine.GroundOk[coin] = true
+		return true
+	end
+	return false
+end
+
 -- Una sola pasada O(N): la moneda disponible mas cercana a "fromPos".
-local function PickNearest(fromPos, exclude, now)
-	local best, bestD = nil, CoinEngine.MaxDistance
+local function PickNearestRaw(fromPos, exclude, now)
+	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	local best, bestD = nil, Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
 			if not coin.Parent then
@@ -5134,7 +5176,7 @@ local function PickNearest(fromPos, exclude, now)
 			else
 				local bl = CoinEngine.Blacklist[coin]
 				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-				if not bl and IsSafeCoinPosition(coin.Position) then
+				if not bl and IsSafeCoinPosition(coin.Position) and math.abs(coin.Position.Y - fromPos.Y) <= maxGap then
 					local d = (coin.Position - fromPos).Magnitude
 					if d <= bestD then best, bestD = coin, d end
 				end
@@ -5142,6 +5184,16 @@ local function PickNearest(fromPos, exclude, now)
 		end
 	end
 	return best
+end
+
+local function PickNearest(fromPos, exclude, now)
+	for _ = 1, 6 do
+		local c = PickNearestRaw(fromPos, exclude, now)
+		if not c then return nil end
+		if IsGrounded(c) then return c end
+		CoinEngine.Blacklist[c] = now + 6          -- sin suelo: se reintenta mas tarde
+	end
+	return nil
 end
 
 -- El siguiente objetivo se elige desde la posicion del ACTUAL (no desde el jugador),
@@ -5164,7 +5216,7 @@ end
 
 local function AdvanceTarget(root, now)
 	local nxt = CoinEngine.NextTarget
-	if nxt and IsAvailable(nxt, now) and (nxt.Position - root.Position).Magnitude <= CoinEngine.MaxDistance then
+	if nxt and IsAvailable(nxt, now) and (nxt.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance) then
 		SetCurrent(nxt, now)
 		return
 	end
@@ -5208,6 +5260,15 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
+
+	-- Tirón de FPS / lag: NO "recuperar" el tiempo perdido moviendose de golpe (el servidor lo ve como salto).
+	if dt > Param(0.15, 0.1) then
+		pauseUntil = now + 0.6
+		currentSpeed = 0
+		lastSetPos = nil
+		return
+	end
+
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root or not hum or hum.Health <= 0 then
 		if lastRoot then lastRoot = nil; ResetPath() end
@@ -5217,19 +5278,28 @@ local function ControllerStep(dt)
 
 	-- Si el juego/servidor nos movio (inicio/fin de ronda, lobby, respawn), NO seguir volando hacia un
 	-- objetivo viejo desde otro punto del mundo: esa es una causa tipica de "Invalid Position".
-	if lastSetPos and (root.Position - lastSetPos).Magnitude > 12 then
+	if lastSetPos and (root.Position - lastSetPos).Magnitude > 8 then
 		ResetPath()
 		pauseUntil = now + 1.5
 		return
 	end
 	if now < pauseUntil then return end
-	if hum.Sit or hum:GetState() == Enum.HumanoidStateType.Dead then return end
+	local st = hum:GetState()
+	if hum.Sit or hum.PlatformStand or st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll
+		or st == Enum.HumanoidStateType.FallingDown or st == Enum.HumanoidStateType.Physics
+		or st == Enum.HumanoidStateType.Seated then
+		lastSetPos = nil
+		currentSpeed = 0
+		return
+	end
 
 	-- Mantenimiento barato (2 veces por segundo)
 	if now >= nextHousekeeping then
 		nextHousekeeping = now + 0.5
 		if FindCoinContainer() ~= lastContainer then
 			rescanBackoff = 1.0
+			ResetPath()
+			pauseUntil = now + 1.5                          -- cambio de ronda/mapa: esperar a que el juego termine de moverte
 			RescanCoins()                                   -- nueva ronda / nuevo mapa
 		elseif CoinEngine.CoinCount == 0 and now >= nextRescanAt then
 			RescanCoins()                                   -- red de seguridad con backoff
@@ -5259,10 +5329,12 @@ local function ControllerStep(dt)
 		end
 	end
 
-	local speed = math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100)
-	if State.FarmSafeMode ~= false then speed = math.min(speed, CoinEngine.SafeMaxSpeed) end
-	dt = math.clamp(dt, 0, 0.05)                      -- paso maximo por frame acotado (evita saltos grandes tras un lag)
-	currentSpeed = math.min(speed, currentSpeed + speed * dt / CoinEngine.RampTime)   -- aceleracion gradual
+	local safe = SafeOn()
+	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	if safe then speed = speed * (1 + 0.12 * math.noise(now * 0.8, 7.3)) end   -- ligera variacion (+-6%), movimiento menos mecanico
+	dt = math.clamp(dt, 0, 0.05)
+	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
+	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual
 	local budget = currentSpeed * dt
 	local startPos = root.Position
 	if not IsFiniteVec(startPos) then ResetPath(); return end
@@ -5285,21 +5357,32 @@ local function ControllerStep(dt)
 			break
 		end
 		local toPickup = dist - CoinEngine.PickupDistance
-		if toPickup <= 0 or dist < 1e-3 then
-			if now - lastCollectAt < CoinEngine.MinCollectInterval then break end
+		if toPickup <= 0 or dist < 1e-3 or budget >= toPickup then
+			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
+			if safe then minGap = minGap + (lastCollectAt % 0.2) end   -- jitter barato y determinista
+			if now - lastCollectAt < minGap then
+				-- aun en pausa entre monedas: acercarse sin pasar del radio de recogida
+				if toPickup > 0 then
+					local stepTo = math.min(budget, toPickup)
+					pos = pos + (delta / dist) * stepTo
+					moved = true
+				end
+				break
+			end
+			if toPickup > 0 then
+				pos = pos + (delta / dist) * toPickup
+				budget -= toPickup
+				moved = true
+			end
 			lastCollectAt = now
 			CollectCoin(root, target, now)
 			transitions += 1
-			if State.FarmSafeMode ~= false then break end   -- una recogida por frame
-		elseif budget >= toPickup then
-			if now - lastCollectAt < CoinEngine.MinCollectInterval then break end
-			pos = pos + (delta / dist) * toPickup
-			budget -= toPickup
-			moved = true
-			lastCollectAt = now
-			CollectCoin(root, target, now)
-			transitions += 1
-			if State.FarmSafeMode ~= false then break end
+			coinsSinceRest += 1
+			if safe and coinsSinceRest >= CoinEngine.RestEvery then
+				coinsSinceRest = 0
+				pauseUntil = now + CoinEngine.RestMin + math.random() * (CoinEngine.RestMax - CoinEngine.RestMin)
+			end
+			break                                            -- una recogida por frame (siempre)
 		else
 			pos = pos + (delta / dist) * budget
 			budget = 0
@@ -5310,7 +5393,8 @@ local function ControllerStep(dt)
 	-- Nunca aplicar una posicion invalida: NaN/inf, bajo el vacio, o un salto mayor al esperado
 	if moved then
 		local stepLen = (pos - startPos).Magnitude
-		if IsSafeCoinPosition(pos) and stepLen == stepLen and stepLen <= speed * 0.2 + 5 then
+		local maxStep = currentSpeed * dt * Param(1.25, 1.1) + 0.25
+		if IsSafeCoinPosition(pos) and stepLen == stepLen and stepLen <= maxStep then
 			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
@@ -5318,6 +5402,7 @@ local function ControllerStep(dt)
 		else
 			pos = startPos
 			ResetPath()
+			pauseUntil = now + 0.3
 		end
 	else
 		lastSetPos = nil
@@ -8397,8 +8482,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins.", 10, 100, State.TweenSpeed, function(v) State.TweenSpeed = v end)
-		AddToggleToSection(secFarm, "Safe Mode (anti Invalid Position)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
+		AddSliderToSection(secFarm, "Tween Speed", "Max speed (hard cap 45; 28 with Safe Mode).", 10, 45, math.min(State.TweenSpeed, 45), function(v) State.TweenSpeed = v end)
+		AddToggleToSection(secFarm, "Safe Mode (extra protection)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
 		-- COMBAT TAB
