@@ -4179,23 +4179,33 @@ local function SpiderFindBotCandidate()
 end
 
 local function SpiderResolveWorldItem(instance)
+	-- Only mark a real item container whose own name matches a known alias.
+	-- Do not inherit an item's name from arbitrary ancestors: that was allowing
+	-- unrelated map geometry (and distant Workspace descendants) to be ESP'd.
+	if not instance or instance == Workspace or not instance:IsDescendantOf(Workspace) then
+		return nil, nil
+	end
 	local node = instance
-	local partFallback, fallbackKind = nil, nil
 	while node and node ~= Workspace do
 		local kind = SpiderClassifyItemName(node.Name)
 		if kind then
-			if node:IsA("Tool") or node:IsA("Model") then return node, kind end
-			if node:IsA("BasePart") and not partFallback then partFallback, fallbackKind = node, kind end
+			if node:IsA("Tool") or node:IsA("Model") then
+				return node, kind
+			end
+			-- A BasePart is accepted only when its own name is a known item alias.
+			if node:IsA("BasePart") then return node, kind end
 		end
 		node = node.Parent
 	end
-	if partFallback then return partFallback, fallbackKind end
 	return nil, nil
 end
 
 local function SpiderIsAvailableWorldItem(target)
-	return target ~= nil and target.Parent ~= nil and target:IsDescendantOf(Workspace)
-		and not SpiderIsPlayerCharacterDescendant(target)
+	if not target or not target.Parent or not target:IsDescendantOf(Workspace) then return false end
+	if SpiderIsPlayerCharacterDescendant(target) then return false end
+	-- Reject Workspace's generic map containers unless the object itself has a
+	-- known item name. This prevents broad ancestor matches from highlighting map parts.
+	return SpiderClassifyItemName(target.Name) ~= nil
 end
 
 local function SpiderClearItemVisual(target)
@@ -4292,12 +4302,19 @@ local function SpiderEnsureItemVisual(target, kind)
 		SpiderWorldItems[target] = kind
 		return SpiderEnsureItemVisual(target, kind)
 	end
+	-- Reassert the semantic item color on reused visuals; the v3 event path could
+	-- reuse an old visual after a kind change and leave its previous color visible.
+	local itemColor = SPIDER_ITEM_COLORS[kind]
+	if not itemColor then
+		SpiderClearItemVisual(target)
+		return nil
+	end
 	if visual.Label then pcall(function() visual.Label:Destroy() end); visual.Label = nil end
 	if visual.Highlight and visual.Highlight.Parent ~= folder then visual.Highlight.Parent = folder end
 	local highlightAdornee = target:IsA("Tool") and SpiderGetLabelAdornee(target) or target
 	if visual.Highlight.Adornee ~= highlightAdornee then visual.Highlight.Adornee = highlightAdornee end
-	if visual.Highlight.FillColor ~= SPIDER_ITEM_COLORS[kind] then visual.Highlight.FillColor = SPIDER_ITEM_COLORS[kind] end
-	if visual.Highlight.OutlineColor ~= SPIDER_ITEM_COLORS[kind] then visual.Highlight.OutlineColor = SPIDER_ITEM_COLORS[kind] end
+	if visual.Highlight.FillColor ~= itemColor then visual.Highlight.FillColor = itemColor end
+	if visual.Highlight.OutlineColor ~= itemColor then visual.Highlight.OutlineColor = itemColor end
 
 	-- SelectionBox supplies a stronger, screen-visible edge for small distant items.
 	-- It is attached only to BaseParts; Models keep their full Highlight silhouette.
@@ -4308,13 +4325,13 @@ local function SpiderEnsureItemVisual(target, kind)
 			edge.Name = "CHSpiderItemEdge_" .. kind
 			edge.LineThickness = 0.08
 			edge.SurfaceTransparency = 1
-			edge.Color3 = SPIDER_ITEM_COLORS[kind]
+			edge.Color3 = itemColor
 			edge.Adornee = edgePart
 			edge.Parent = folder
 			visual.Edge = edge
 		else
 			visual.Edge.Adornee = edgePart
-			visual.Edge.Color3 = SPIDER_ITEM_COLORS[kind]
+			visual.Edge.Color3 = itemColor
 			if visual.Edge.Parent ~= folder then visual.Edge.Parent = folder end
 		end
 	elseif visual.Edge then
