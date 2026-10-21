@@ -5375,6 +5375,37 @@ local SOLID_OVERLAP_CONFIRM_TIME = 0.60
 local lastFrameDt = 1 / 60
 local nextLogPingAt = 0
 
+-- Buffer de ALTA RESOLUCION: una linea por frame (~6 s a 60 FPS) en un anillo de tamaño fijo.
+-- Solo se vuelca al archivo cuando ocurre el kick / safety-stop, para ver que paso frame a frame
+-- justo antes del incidente (el log normal muestrea cada 0.25 s y oculta picos de un frame).
+local HIRES_N = 360
+local hiRes, hiResHead, hiResCount = {}, 0, 0
+local hiTag = nil          -- marca para el frame actual (p. ej. "COLLECT d=2.1 ...")
+
+local function HiResPush(now, dt)
+	local root = GetRoot()
+	if not root then return end
+	local p, v = root.Position, root.AssemblyLinearVelocity
+	local tgt = CoinEngine.CurrentTarget
+	hiResHead = hiResHead % HIRES_N + 1
+	hiRes[hiResHead] = string.format(
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f coins=%d%s",
+		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, currentSpeed,
+		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, coinsCollectedTotal,
+		hiTag and (" <" .. hiTag .. ">") or "")
+	hiResCount = math.min(hiResCount + 1, HIRES_N)
+	hiTag = nil
+end
+
+local function HiResDump()
+	local out = {}
+	local start = hiResCount < HIRES_N and 1 or (hiResHead % HIRES_N + 1)
+	for i = 0, hiResCount - 1 do
+		out[#out + 1] = hiRes[(start - 1 + i) % HIRES_N + 1]
+	end
+	return table.concat(out, "\n")
+end
+
 local function LogEvent(tag)
 	if logFinalized then return end
 	if #pendingEvents >= 8 then table.remove(pendingEvents, 1) end   -- conserva los eventos MAS recientes
@@ -5385,6 +5416,12 @@ local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
 	local payload = "reason: " .. tostring(reason) .. "\n" .. table.concat(logBuf, "\n")
+	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
+		local okDump, dump = pcall(HiResDump)
+		if okDump and dump ~= "" then
+			payload = payload .. "\n--- HI-RES: ultimos " .. hiResCount .. " frames (1 linea por frame) ---\n" .. dump
+		end
+	end
 	pcall(writefile, "CelestialFarmLog.txt", payload)
 end
 
@@ -5392,6 +5429,8 @@ local function ResetDiagnosticLog()
 	logFinalized = false
 	table.clear(logBuf)
 	table.clear(pendingEvents)
+	table.clear(hiRes)
+	hiResHead, hiResCount, hiTag = 0, 0, nil
 	nextLogAt, nextFlushAt = 0, 0
 	lastLogPos, lastLogAt = nil, nil
 	nextSolidGuardCheck, solidOverlapSince = 0, nil
@@ -5827,11 +5866,18 @@ local function ControllerStep(dt)
 			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
 			local settle = safe and GetSettleTime(now) or 0.03
 			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
+				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
+				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
+				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
+				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f",
+					dist, root.AssemblyLinearVelocity.Magnitude, now - arriveAt, now - lastCollectAt, settle,
+					target.Position.Y - rootPos.Y)
 				lastCollectAt = now
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
 					coinsCollectedTotal += 1
-					LogEvent("collect")
+					LogEvent(collectInfo)
+					hiTag = collectInfo
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 					if not touchedCoins[target] then
@@ -5882,6 +5928,7 @@ local function SafeControllerStep(dt)
 	if dt and dt > 0 then lastFrameDt = dt end
 	local ok = pcall(ControllerStep, dt)
 	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
+	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt) end
 	if State.FarmEnabled then pcall(LogStep, os.clock(), dt, false) end
 	if ok then
 		errorStreak = 0
