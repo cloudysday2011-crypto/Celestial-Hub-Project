@@ -5082,8 +5082,10 @@ local function CoinNameMatches(obj)
 end
 
 local function IsFiniteVec(v)
+	-- Rechaza NaN, infinito y coordenadas numericamente absurdas antes de calcular distancias/velocidades.
+	-- Los mapas normales de MM2 quedan muy por debajo de este limite; no es un detector anticheat.
 	return v and v.X == v.X and v.Y == v.Y and v.Z == v.Z
-		and math.abs(v.X) < 1e5 and math.abs(v.Y) < 1e5 and math.abs(v.Z) < 1e5
+		and math.abs(v.X) < 1e4 and math.abs(v.Y) < 1e4 and math.abs(v.Z) < 1e4
 end
 
 local function IsSafeCoinPosition(pos)
@@ -5127,6 +5129,19 @@ local function FindCoinContainer()
 	return Workspace:FindFirstChild("CoinContainer")
 end
 
+-- No registrar monedas que aparezcan en objetos ajenos al mapa/ronda activa.
+-- DescendantAdded se escucha en Workspace por eficiencia, pero eso no convierte todo Workspace en una fuente valida.
+local function IsInRecognizedCoinSource(obj)
+	if not obj or not obj.Parent then return false end
+	local coinContainer = FindCoinContainer()
+	if coinContainer then return obj:IsDescendantOf(coinContainer) end
+	for _, name in ipairs({"Map", "Normal", "Round"}) do
+		local mapRoot = Workspace:FindFirstChild(name)
+		if mapRoot and obj:IsDescendantOf(mapRoot) then return true end
+	end
+	return false
+end
+
 -- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
 local function ScanContainer(container)
 	if not container then return 0 end
@@ -5150,9 +5165,8 @@ local function RescanCoins()
 			local c = Workspace:FindFirstChild(name)
 			if c then found += ScanContainer(c) end
 		end
-		if found == 0 and CoinEngine.CoinCount == 0 then
-			found = ScanContainer(Workspace)
-		end
+		-- No escanear Workspace entero como ultimo recurso: eso permitia tratar piezas ajenas al mapa
+		-- como monedas y encadenar objetivos que no pertenecen a la ronda.
 	end
 	lastContainer = container
 	if found > 0 then rescanBackoff = 1.0 else rescanBackoff = math.min(rescanBackoff * 1.5, 4) end
@@ -5163,7 +5177,9 @@ end
 local function OnDescendantAdded(obj)
 	if obj:IsA("BasePart") and CoinNameMatches(obj) then
 		task.defer(function()
-			if CoinEngine.Active and IsValidCoin(obj) then RegisterCoin(obj) end
+			if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
+				RegisterCoin(obj)
+			end
 		end)
 	end
 end
@@ -5317,6 +5333,10 @@ end
 
 local function IsAvailable(coin, now)
 	if not coin or not CoinEngine.CoinCache[coin] or not coin.Parent then return false end
+	if not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+		UnregisterCoin(coin)
+		return false
+	end
 	if not IsSafeCoinPosition(coin.Position) then return false end
 	local bl = CoinEngine.Blacklist[coin]
 	if bl then
@@ -5357,7 +5377,7 @@ local function PickNearestRaw(fromPos, exclude, now)
 	local best, bestD = nil, Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
-			if not coin.Parent then
+			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
 				UnregisterCoin(coin)
 			else
 				local bl = CoinEngine.Blacklist[coin]
@@ -5417,21 +5437,27 @@ local function AdvanceTarget(root, now)
 end
 
 local function CollectCoin(root, coin, now)
+	-- No usar una asignacion directa de CFrame al root como alternativa: incluso un salto corto
+	-- puede poner el root dentro de geometria y producir una posicion que el servidor rechace.
+	-- Sin firetouchinterest dejamos que el contacto fisico normal recoja la moneda.
+	if not firetouchinterest then
+		LogEvent("touch-api-unavailable")
+		return false
+	end
+	local ok = pcall(function()
+		firetouchinterest(root, coin, 0)
+		firetouchinterest(root, coin, 1)
+	end)
+	if not ok then
+		LogEvent("touch-api-failed")
+		return false
+	end
 	CoinEngine.Blacklist[coin] = now + CoinEngine.CollectCooldown
 	local n = (CoinEngine.Attempts[coin] or 0) + 1
 	CoinEngine.Attempts[coin] = n
 	if n >= 3 then CoinEngine.Blacklist[coin] = now + 8 end
-	if firetouchinterest then
-		pcall(function()
-			firetouchinterest(root, coin, 0)
-			firetouchinterest(root, coin, 1)
-		end)
-	else
-		pcall(function()
-			if IsSafeCoinPosition(coin.Position) then root.CFrame = CFrame.new(coin.Position) end
-		end)
-	end
 	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
+	return true
 end
 
 -- ---------------------------------------------------------------
@@ -5643,44 +5669,52 @@ local function ControllerStep(dt)
 		return
 	end
 
-	if dist <= CoinEngine.PickupDistance then
-		-- Llegada: flotar quieto (velocidad 0) y recoger
-		if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
-		lastProgress = now
-		if safe then currentSpeed = currentSpeed * 0.5 end
-		local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-		local settle = safe and GetSettleTime(now) or 0.03
-		if now - arriveAt >= settle and now - lastCollectAt >= minGap then   -- esperar a que el servidor te vea aqui
-			lastCollectAt = now
-			arriveTarget = nil
-			CollectCoin(root, target, now)
-			coinsCollectedTotal += 1
-			LogEvent("collect")
+	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
+	if dist <= pickupDistance then
+		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
+		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
+		if firetouchinterest then
+			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
+			lastProgress = now
+			if safe then currentSpeed = currentSpeed * 0.5 end
+			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
+			local settle = safe and GetSettleTime(now) or 0.03
+			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
+				lastCollectAt = now
+				arriveTarget = nil
+				if CollectCoin(root, target, now) then
+					coinsCollectedTotal += 1
+					LogEvent("collect")
 
-			-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
-			if not touchedCoins[target] then
-				touchedCoins[target] = true
-				roundCollected += 1
-				batchCollected += 1
+					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
+					if not touchedCoins[target] then
+						touchedCoins[target] = true
+						roundCollected += 1
+						batchCollected += 1
+					end
+					if roundCollected >= batchTotal then
+						limitReached = true
+						LogEvent("limit")
+						SetStatus("limit")
+					elseif safe and batchCollected >= (CoinEngine.Batches[batchIndex] or batchTotal) then
+						batchPausePending = true
+					end
+					if batchPausePending and not limitReached and not IsInsideSolid(rootPos) then
+						batchPausePending = false
+						batchPausing = true
+						batchIndex += 1
+						batchCollected = 0
+						pauseUntil = now + CoinEngine.BatchPauseTime
+						currentSpeed = 0
+						LogEvent("batch-pause")
+						SetStatus("batch-pause")
+					end
+				end
 			end
-			if roundCollected >= batchTotal then
-				limitReached = true                            -- 50 monedas: limite maximo, detener el farm
-				LogEvent("limit")
-				SetStatus("limit")
-			elseif safe and batchCollected >= (CoinEngine.Batches[batchIndex] or batchTotal) then
-				batchPausePending = true                       -- lote completo: pausar en cuanto sea seguro
-			end
-			-- Solo se pausa FUERA de geometria solida
-			if batchPausePending and not limitReached and not IsInsideSolid(rootPos) then
-				batchPausePending = false
-				batchPausing = true
-				batchIndex += 1
-				batchCollected = 0
-				pauseUntil = now + CoinEngine.BatchPauseTime
-				currentSpeed = 0
-				LogEvent("batch-pause")
-				SetStatus("batch-pause")
-			end
+		else
+			-- A distancia de contacto no hay que declarar recogida ni limpiar el objetivo manualmente.
+			-- La moneda desaparecera por el contacto del juego o seguira siendo el objetivo.
+			lastProgress = now
 		end
 	else
 		-- Vuelo: velocidad real hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
