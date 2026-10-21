@@ -3841,79 +3841,65 @@ _G.Celestial.ConnectionTrapRemoving =
 
 _G.Celestial.ConnectionTrapESP = nil
 
+local FindDroppedGun   -- (un solo local en el chunk principal: limite de 200 locales)
+do
 local lastDeepGunScan = 0
--- FindDroppedGun(force): devuelve el BasePart de la pistola caida (GunDrop) o nil.
---  * Usa una cache (_G.Celestial.GunDropCache) para que varios llamadores (ESP, scanner de roles,
---    boton TP TO GUN) no se "roben" el escaneo profundo, que antes estaba limitado a 1 por segundo
---    y compartido: el boton casi siempre recibia nil y mostraba "No gun dropped".
---  * force = true ignora el limite de tiempo (lo usa el boton TP TO GUN).
-local function FindDroppedGun(force)
-	local function resolvePart(obj)
-		if not obj then return nil end
-		if obj:IsA("BasePart") then return obj end
-		if obj:IsA("Model") or obj:IsA("Tool") then
-			return obj:FindFirstChild("Handle") or obj:FindFirstChildWhichIsA("BasePart", true)
-		end
-		return nil
-	end
-	local function isGunDropName(name)
-		local n = string.lower(name)
-		return n == "gundrop" or n == "revolverdrop" or n == "gun_drop" or n == "droppedgun"
-	end
-	local function remember(part)
-		_G.Celestial.GunDropCache = part
-		return part
-	end
+local cachedGunDrop = nil
 
-	-- 1) Cache: sigue siendo valida mientras la pieza exista dentro de Workspace
-	local cached = _G.Celestial.GunDropCache
-	if cached then
-		if cached.Parent and cached:IsDescendantOf(Workspace) then return cached end
-		_G.Celestial.GunDropCache = nil
+local function ResolveGunPart(obj)
+	if not obj then return nil end
+	if obj:IsA("BasePart") then return obj end
+	if obj:IsA("Model") or obj:IsA("Tool") then
+		return obj:FindFirstChild("Handle") or obj:FindFirstChildWhichIsA("BasePart", true)
 	end
+	return nil
+end
 
-	-- 2) Busqueda directa (barata)
-	for _, dropName in ipairs({"GunDrop", "RevolverDrop"}) do
-		local part = resolvePart(Workspace:FindFirstChild(dropName))
-		if part then return remember(part) end
+local function IsGunDropName(name)
+	local n = string.lower(name)
+	return n == "gundrop" or n == "revolverdrop" or n == "gun_drop" or n == "droppedgun"
+end
+
+-- force = true ignora el limite de tiempo del escaneo profundo (lo usa el boton TP TO GUN).
+-- Antes el escaneo profundo estaba limitado a 1/seg y lo consumia el escaner de roles, asi que el
+-- boton casi siempre recibia nil ("No gun dropped"). Ahora se cachea el ultimo resultado valido.
+FindDroppedGun = function(force)
+	if cachedGunDrop and cachedGunDrop.Parent and cachedGunDrop:IsDescendantOf(Workspace) then
+		return cachedGunDrop
 	end
-	local mapContainers = {"Normal", "Map", "Round", "CoinContainer"}
-	for _, containerName in ipairs(mapContainers) do
+	cachedGunDrop = nil
+
+	local direct = Workspace:FindFirstChild("GunDrop") or Workspace:FindFirstChild("RevolverDrop")
+	local part = ResolveGunPart(direct)
+	if part then cachedGunDrop = part; return part end
+
+	for _, containerName in ipairs({"Normal", "Map", "Round", "CoinContainer"}) do
 		local container = Workspace:FindFirstChild(containerName)
 		if container then
-			for _, dropName in ipairs({"GunDrop", "RevolverDrop"}) do
-				local part = resolvePart(container:FindFirstChild(dropName))
-				if part then return remember(part) end
-			end
+			local found = container:FindFirstChild("GunDrop", true) or container:FindFirstChild("RevolverDrop", true)
+			part = ResolveGunPart(found)
+			if part then cachedGunDrop = part; return part end
 		end
 	end
 
-	-- 3) Escaneo profundo (limitado a 1/s salvo que se fuerce)
 	local now = tick()
 	if force or now - lastDeepGunScan > 1.0 then
 		lastDeepGunScan = now
 		for _, obj in ipairs(Workspace:GetDescendants()) do
-			if isGunDropName(obj.Name) then
-				local part = resolvePart(obj)
-				if part then return remember(part) end
+			if IsGunDropName(obj.Name) and (obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Tool")) then
+				-- ignorar armas que lleva un jugador en la mano / mochila
+				local owner = obj:FindFirstAncestorOfClass("Model")
+				local heldByPlayer = owner and Players:GetPlayerFromCharacter(owner)
+				if not heldByPlayer then
+					part = ResolveGunPart(obj)
+					if part then cachedGunDrop = part; return part end
+				end
 			end
 		end
 	end
 	return nil
 end
-
--- Cuando aparece algo llamado GunDrop, permite que la siguiente consulta haga escaneo profundo
--- de inmediato (sin esperar al limite de 1 segundo).
-if _G.Celestial.GunDropAddedConnection then
-	pcall(function() _G.Celestial.GunDropAddedConnection:Disconnect() end)
-	_G.Celestial.GunDropAddedConnection = nil
 end
-_G.Celestial.GunDropAddedConnection = Workspace.DescendantAdded:Connect(function(obj)
-	local n = string.lower(obj.Name)
-	if n == "gundrop" or n == "revolverdrop" or n == "gun_drop" or n == "droppedgun" then
-		lastDeepGunScan = 0
-	end
-end)
 
 do
 -- ====================================================================
@@ -4960,10 +4946,6 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	MaxDistance = 600,
-	MaxSpeed = 45,             -- tope REAL de velocidad (studs/s); el slider no puede superarlo
-	ServerMoveTolerance = 15,  -- si el personaje se aleja mas de esto de lo que escribimos, lo movio otro (servidor/modulo)
-	SpawnGrace = 1.5,          -- segundos de pausa tras reaparecer / ser movido por el servidor
-	VoidMargin = 50,           -- monedas por debajo de FallenPartsDestroyHeight + margen se ignoran
 	PickupDistance = 3.4,
 	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
 	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
@@ -4986,30 +4968,6 @@ local nextRescanAt = 0
 local rescanBackoff = 1.0
 local nextImproveCheck = 0
 local errorStreak = 0
-local lastWritePos = nil     -- ultima posicion escrita por el controlador (detecta movimientos ajenos)
-local graceUntil = 0         -- no mover antes de este instante (os.clock)
-
-local function IsFiniteVec(v)
-	if typeof(v) ~= "Vector3" then return false end
-	local x, y, z = v.X, v.Y, v.Z
-	return x == x and y == y and z == z and math.abs(x) < 1e6 and math.abs(y) < 1e6 and math.abs(z) < 1e6
-end
-
-local function IsSafeCoinPosition(p)
-	return IsFiniteVec(p) and p.Y > Workspace.FallenPartsDestroyHeight + CoinEngine.VoidMargin
-end
-
--- Unica via de escritura de posicion del AutoFarm: nunca escribe NaN/inf (causa de "Invalid Position").
-local function WritePosition(root, pos)
-	if not IsFiniteVec(pos) then return false end
-	local ok = pcall(function()
-		root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-	end)
-	if ok then lastWritePos = pos end
-	return ok
-end
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
@@ -5018,6 +4976,17 @@ local function CoinNameMatches(obj)
 		return name ~= "coincontainer"
 	end
 	return false
+end
+
+local function IsFiniteVec(v)
+	return v and v.X == v.X and v.Y == v.Y and v.Z == v.Z
+		and math.abs(v.X) < 1e5 and math.abs(v.Y) < 1e5 and math.abs(v.Z) < 1e5
+end
+
+local function IsSafeCoinPosition(pos)
+	if not IsFiniteVec(pos) then return false end
+	local voidY = (Workspace.FallenPartsDestroyHeight or -500) + 25
+	return pos.Y > voidY
 end
 
 local function IsValidCoin(obj)
@@ -5129,8 +5098,6 @@ local function Deactivate()
 	ResetPath()
 	lastRoot = nil
 	lastContainer = nil
-	lastWritePos = nil
-	graceUntil = 0
 end
 
 -- ---------------------------------------------------------------
@@ -5214,7 +5181,7 @@ local function CollectCoin(root, coin, now)
 		end)
 	else
 		pcall(function()
-			if IsFiniteVec(coin.Position) then root.CFrame = CFrame.new(coin.Position) * root.CFrame.Rotation end
+			if IsSafeCoinPosition(coin.Position) then root.CFrame = CFrame.new(coin.Position) end
 		end)
 	end
 	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
@@ -5227,7 +5194,6 @@ end
 local function ControllerStep(dt)
 	if not State.FarmEnabled then
 		if CoinEngine.Active then Deactivate() end
-		lastWritePos = nil
 		return
 	end
 	if not CoinEngine.Active then Activate() end
@@ -5236,32 +5202,9 @@ local function ControllerStep(dt)
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root or not hum or hum.Health <= 0 then
 		if lastRoot then lastRoot = nil; ResetPath() end
-		lastWritePos = nil
 		return
 	end
-	if not IsFiniteVec(root.Position) then return end
-
-	if root ~= lastRoot then   -- reaparicion / cambio de personaje
-		lastRoot = root
-		ResetPath()
-		lastWritePos = nil
-		graceUntil = now + CoinEngine.SpawnGrace
-	end
-
-	-- Otro modulo (fling) controla el personaje: no mover mientras tanto
-	if State.FlingActive or _G.Celestial.FlingSessionActive then
-		lastWritePos = nil
-		graceUntil = now + 0.5
-		return
-	end
-
-	-- El servidor u otro modulo nos movio (rubberband, TP, inicio de ronda): no pelear contra eso.
-	-- Seguir escribiendo posiciones desde un estado desincronizado es lo que provoca "Invalid Position".
-	if lastWritePos and (root.Position - lastWritePos).Magnitude > CoinEngine.ServerMoveTolerance then
-		lastWritePos = nil
-		ResetPath()
-		graceUntil = now + CoinEngine.SpawnGrace
-	end
+	if root ~= lastRoot then lastRoot = root; ResetPath() end   -- reaparicion / cambio de personaje
 
 	-- Mantenimiento barato (2 veces por segundo)
 	if now >= nextHousekeeping then
@@ -5273,8 +5216,6 @@ local function ControllerStep(dt)
 			RescanCoins()                                   -- red de seguridad con backoff
 		end
 	end
-
-	if now < graceUntil then return end                     -- periodo de gracia tras reaparecer / TP
 
 	if CoinEngine.CoinCount == 0 then return end            -- espera sin coste hasta que un evento registre monedas
 	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
@@ -5299,15 +5240,15 @@ local function ControllerStep(dt)
 		end
 	end
 
-	-- Velocidad efectiva: el slider manda, pero nunca supera MaxSpeed (velocidades altas hacen que
-	-- el servidor rechace la posicion y reinicie al personaje).
-	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100), CoinEngine.MaxSpeed)
-	local budget = speed * math.min(dt, 0.05)
-	local pos = root.Position
-	local pending = false          -- hay movimiento calculado que aun no se escribio en el personaje
+	local speed = math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100)
+	local budget = speed * math.clamp(dt, 0, 0.05)   -- paso maximo por frame acotado (evita saltos grandes tras un lag)
+	local startPos = root.Position
+	if not IsFiniteVec(startPos) then ResetPath(); return end
+	local pos = startPos
+	local moved = false
 	local transitions = 0
 
-	while budget > 0 and transitions < 3 do
+	while budget > 0 and transitions < 6 do
 		local target = CoinEngine.CurrentTarget
 		if not target or not IsAvailable(target, now) then
 			AdvanceTarget(root, now)
@@ -5316,27 +5257,39 @@ local function ControllerStep(dt)
 		end
 		local delta = target.Position - pos
 		local dist = delta.Magnitude
+		if dist ~= dist or dist == math.huge then
+			CoinEngine.Blacklist[target] = now + 10
+			SetCurrent(nil, now)
+			break
+		end
 		local toPickup = dist - CoinEngine.PickupDistance
-		if toPickup <= 0 then
+		if toPickup <= 0 or dist < 1e-3 then
 			CollectCoin(root, target, now)
 			transitions += 1
 		elseif budget >= toPickup then
-			pos = pos + delta.Unit * toPickup
+			pos = pos + (delta / dist) * toPickup
 			budget -= toPickup
-			-- El personaje debe estar REALMENTE junto a la moneda cuando se dispara el toque
-			if not WritePosition(root, pos) then ResetPath(); pending = false; break end
-			pending = false
+			moved = true
 			CollectCoin(root, target, now)             -- recoge y encadena al siguiente en el MISMO frame
 			transitions += 1
 		else
-			pos = pos + delta.Unit * budget
+			pos = pos + (delta / dist) * budget
 			budget = 0
-			pending = true
+			moved = true
 		end
 	end
 
-	if pending then
-		if not WritePosition(root, pos) then ResetPath() end
+	-- Nunca aplicar una posicion invalida: NaN/inf, bajo el vacio, o un salto mayor al esperado
+	if moved then
+		local stepLen = (pos - startPos).Magnitude
+		if IsSafeCoinPosition(pos) and stepLen == stepLen and stepLen <= speed * 0.2 + 5 then
+			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		else
+			pos = startPos
+			ResetPath()
+		end
 	end
 
 	-- Personaje bloqueado: sin progreso hacia el objetivo -> descartarlo temporalmente
@@ -7326,7 +7279,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end
 			task.spawn(function()
 				forceTouchEnabled()
-				root.CFrame = gunDrop.CFrame + Vector3.new(0, 1.5, 0)
+				if not gunDrop.Parent then return end
+				root.CFrame = CFrame.new(gunDrop.Position + Vector3.new(0, 1.5, 0))
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
 				task.wait(0.2)
