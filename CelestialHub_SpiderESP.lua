@@ -5737,15 +5737,6 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Limite alcanzado (13 + 13 + 13 + 11 = 50): el farm se detiene hasta la siguiente ronda
-	if limitReached then
-		StopFlight()
-		lastSetPos = nil
-		currentSpeed = 0
-		SetStatus("limit")
-		return
-	end
-
 	if CoinEngine.CoinCount == 0 then return end            -- espera (flotando quieto) hasta que un evento registre monedas
 	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
 
@@ -5833,23 +5824,7 @@ local function ControllerStep(dt)
 						roundCollected += 1
 						batchCollected += 1
 					end
-					if roundCollected >= batchTotal then
-						limitReached = true
-						LogEvent("limit")
-						SetStatus("limit")
-					elseif safe and batchCollected >= (CoinEngine.Batches[batchIndex] or batchTotal) then
-						batchPausePending = true
-					end
-					if batchPausePending and not limitReached and not IsInsideSolid(rootPos) then
-						batchPausePending = false
-						batchPausing = true
-						batchIndex += 1
-						batchCollected = 0
-						pauseUntil = now + CoinEngine.BatchPauseTime
-						currentSpeed = 0
-						LogEvent("batch-pause")
-						SetStatus("batch-pause")
-					end
+					-- (Eliminado) Ya no hay pausa de 3s entre lotes ni limite de 50 monedas: el farm sigue sin detenerse.
 				end
 			end
 		else
