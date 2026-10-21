@@ -5192,6 +5192,46 @@ local function GetSettleTime(now)
 end
 
 -- ---------------------------------------------------------------
+-- REGISTRO DE DIAGNOSTICO: guarda ~40 s de telemetria en "CelestialFarmLog.txt" (carpeta workspace del
+-- ejecutor) cada 3 s y SIEMPRE al recibir un kick, para ver que pasaba justo antes de "Invalid Position".
+-- ---------------------------------------------------------------
+
+local logBuf, pendingEvents = {}, {}
+local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
+
+local function LogEvent(tag)
+	if #pendingEvents < 8 then pendingEvents[#pendingEvents + 1] = tag end
+end
+
+local function FlushLog(reason)
+	if not writefile then return end
+	pcall(writefile, "CelestialFarmLog.txt", "reason: " .. tostring(reason) .. "\n" .. table.concat(logBuf, "\n"))
+end
+
+local function LogStep(now, dt, force)
+	if not force and now < nextLogAt then return end
+	nextLogAt = now + 0.25
+	local root, hum = GetRoot(), GetHumanoid()
+	if not root then return end
+	local p = root.Position
+	local tgt = CoinEngine.CurrentTarget
+	local line = string.format(
+		"t=%.2f pos=(%.0f,%.0f,%.0f) drift=%.2f spd=%.0f toCoin=%.0f fps=%.0f ping=%.0f state=%s noclip=%s inSolid=%s coins=%d ev=%s",
+		now, p.X, p.Y, p.Z,
+		lastSetPos and (p - lastSetPos).Magnitude or -1,
+		currentSpeed,
+		tgt and (tgt.Position - p).Magnitude or -1,
+		dt > 0 and 1 / dt or 0, cachedPingMs,
+		hum and tostring(hum:GetState()) or "?",
+		tostring(noclipOn), tostring(IsInsideSolid(p)),
+		coinsCollectedTotal, table.concat(pendingEvents, ","))
+	table.clear(pendingEvents)
+	logBuf[#logBuf + 1] = line
+	if #logBuf > 160 then table.remove(logBuf, 1) end
+	if force or now >= nextFlushAt then nextFlushAt = now + 3; FlushLog(force and "forced" or "periodic") end
+end
+
+-- ---------------------------------------------------------------
 -- SELECTOR DE OBJETIVOS
 -- ---------------------------------------------------------------
 
@@ -5330,6 +5370,7 @@ local function ControllerStep(dt)
 
 	-- Tirón de FPS / lag: NO "recuperar" el tiempo perdido moviendose de golpe (el servidor lo ve como salto).
 	if dt > Param(0.15, 0.1) then
+		LogEvent("lag")
 		pauseUntil = now + 0.6
 		currentSpeed = 0
 		lastSetPos = nil
@@ -5346,6 +5387,7 @@ local function ControllerStep(dt)
 	-- Si el juego/servidor nos movio (inicio/fin de ronda, lobby, respawn), NO seguir volando hacia un
 	-- objetivo viejo desde otro punto del mundo: esa es una causa tipica de "Invalid Position".
 	if lastSetPos and (root.Position - lastSetPos).Magnitude > 8 then
+		LogEvent("server-moved-us")
 		ResetPath()
 		pauseUntil = now + 1.5
 		return
@@ -5437,10 +5479,13 @@ local function ControllerStep(dt)
 			lastCollectAt = now
 			arriveTarget = nil
 			CollectCoin(root, target, now)
+			coinsCollectedTotal += 1
+			LogEvent("collect")
 			transitions += 1
 			coinsSinceRest += 1
 			if safe and coinsSinceRest >= CoinEngine.RestEvery and not IsInsideSolid(pos) then
 				coinsSinceRest = 0
+				LogEvent("rest")
 				pauseUntil = now + CoinEngine.RestMin + math.random() * (CoinEngine.RestMax - CoinEngine.RestMin)
 			end
 			break                                            -- una recogida por frame (siempre)
@@ -5464,6 +5509,7 @@ local function ControllerStep(dt)
 			lastSetPos = pos
 		else
 			pos = startPos
+			LogEvent("step-rejected")
 			ResetPath()
 			pauseUntil = now + 0.3
 		end
@@ -5488,6 +5534,7 @@ end
 
 local function SafeControllerStep(dt)
 	local ok = pcall(ControllerStep, dt)
+	if State.FarmEnabled then pcall(LogStep, os.clock(), dt, false) end
 	if ok then
 		errorStreak = 0
 	else
@@ -5502,6 +5549,7 @@ CoinEngine.Destroy = function()
 	CoinEngine.Controller = nil
 	if controller then controller:Disconnect() end
 	if CoinEngine.NoclipConn then CoinEngine.NoclipConn:Disconnect(); CoinEngine.NoclipConn = nil end
+	if CoinEngine.KickConn then CoinEngine.KickConn:Disconnect(); CoinEngine.KickConn = nil end
 	CoinEngine.NoclipWanted = false
 	RestoreCollisions()
 	if _G.Celestial.ConnectionFarm == controller then _G.Celestial.ConnectionFarm = nil end
@@ -5510,6 +5558,12 @@ end
 
 -- Un unico controlador: la conexion anterior (si existia) ya fue destruida arriba.
 CoinEngine.NoclipConn = RunService.Stepped:Connect(function() pcall(NoclipStep) end)
+CoinEngine.KickConn = game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
+	if msg and msg ~= "" then
+		LogEvent("KICK: " .. tostring(msg))
+		pcall(LogStep, os.clock(), 0, true)
+	end
+end)
 CoinEngine.Controller = RunService.Heartbeat:Connect(SafeControllerStep)
 _G.Celestial.ConnectionFarm = CoinEngine.Controller
 
