@@ -1359,13 +1359,14 @@ function AntiFlingQuantum.GetDangerIsolationHold() return tonumber(State.AntiFli
 
 function AntiFlingQuantum.RefreshSelfActionContext(now)
 	local ctx = AntiFlingQuantum.SelfActionContext
-	ctx.FlyActive = State.FlyActive == true
+	ctx.FlyActive = State.FlyActive == true or _G.Celestial.FarmFlying == true
 	ctx.NoClipActive = State.NoClipActive == true
 	local jumpPower = tonumber(State.JumpPower) or 50
 	local walkSpeed = tonumber(State.WalkSpeed) or 16
 	local flySpeed = tonumber(State.FlySpeed) or 50
 	ctx.ExpectedMaxVertical = math.max(jumpPower * 1.75, 120)
-	ctx.ExpectedMaxHorizontal = math.max(walkSpeed * 2.5, flySpeed * 1.6, 60)
+	local farmSpeed = (_G.Celestial.FarmFlying == true) and (tonumber(State.TweenSpeed) or 0) or 0
+	ctx.ExpectedMaxHorizontal = math.max(walkSpeed * 2.5, flySpeed * 1.6, farmSpeed * 1.6, 60)
 end
 
 local function SafeMagnitude(v)
@@ -4957,16 +4958,18 @@ local CoinEngine = {
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
 	SafeMaxVerticalGap = 60,
-	-- ===== LOTES DE MONEDAS (solo con Safe Mode) + LIMITE DE LA BOLSA =====
-	BatchSize = 13,            -- pausa cada 13 monedas en el inventario (a las 13, 26 y 39)...
-	BatchPauses = 3,           -- ...3 veces; el ultimo lote son las que faltan hasta MaxCoins (11)
-	BatchPauseTime = 3.0,      -- segundos de pausa entre lotes
-	MaxCoins = 50,             -- limite de la bolsa: al llegar aqui el farm se detiene hasta la siguiente ronda
-	TouchSafetyMargin = 15,    -- red de seguridad: tras MaxCoins + 15 monedas distintas tocadas se detiene aunque la UI falle
+	-- ===== LOTES FIJOS (solo con Safe Mode) =====
+	Batches = {13, 13, 13, 11},  -- monedas RECOGIDAS por el script en cada lote; tras cada lote (menos el ultimo) hay pausa
+	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
+	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
+	StopDistance = 2.0,          -- el vuelo apunta a quedar a esta distancia de la moneda (recoge a PickupDistance)
+	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
+	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
+	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
 	-- ===== DETECTOR DE RONDA =====
-	WeaponDebounce = 0.4,      -- armas asignadas (y monedas presentes) durante este tiempo = ronda iniciada
-	RoundStartGrace = 1.0,     -- espera tras detectar el inicio (el juego aun puede estar moviendote)
-	RoundEndDebounce = 3.0,    -- sin armas en ningun inventario durante este tiempo = ronda terminada
+	WeaponDebounce = 0.4,        -- armas asignadas (y monedas presentes) durante este tiempo = ronda iniciada
+	RoundStartGrace = 1.0,       -- espera tras detectar el inicio (el juego aun puede estar moviendote)
+	RoundEndDebounce = 3.0,      -- sin armas en ningun inventario durante este tiempo = ronda terminada
 	SettleMin = 0.03,          -- espera minima al llegar a la moneda (el servidor ve tu posicion con retraso)
 	SettleMax = 0.15,
 	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
@@ -5004,31 +5007,69 @@ local noclipOn = false
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
 local cachedPingMs, nextPingAt = 80, 0
 
--- ===== Estado: detector de ronda + lotes de monedas (config en CoinEngine: Batch*, MaxCoins, Round*) =====
+-- ===== Estado: detector de ronda + lotes FIJOS de monedas + vuelo (config en CoinEngine) =====
 local roundActive = false              -- true solo mientras la ronda esta en curso (armas asignadas + monedas)
 local weaponsSince, noWeaponsSince = nil, nil
 local nextRoundCheck = 0
-local activatedAt = 0
-local needInitialSync = false          -- farm activado a mitad de ronda: leer la bolsa real una vez
-local bagBase, touchedSinceSync, roundTouchedTotal = 0, 0, 0
-local touchedCoins = setmetatable({}, {__mode = "k"})   -- [coin] = true (monedas distintas tocadas esta ronda)
-local batchPausing, batchPausePending = false, false
-local limitReached, limitFromSync, limitAt, nextLimitCheck = false, false, 0, 0
+local roundCollected, batchCollected, batchIndex = 0, 0, 1   -- monedas recogidas por el script (total / lote actual / n de lote)
+local batchTotal = 0                   -- 13 + 13 + 13 + 11 = 50
+for _, n in ipairs(CoinEngine.Batches) do batchTotal += n end
+local touchedCoins = setmetatable({}, {__mode = "k"})   -- [coin] = true (monedas distintas recogidas esta ronda)
+local batchPausing, batchPausePending, limitReached = false, false, false
 local curStatus = ""
+local flightGyro, flightVel, flightOn = nil, nil, false  -- mismos elementos que usa "Fly": BodyGyro + BodyVelocity + PlatformStand
+local velApplied = false               -- el controlador dio orden de velocidad este frame (si no, se flota quieto)
 
 local function SetStatus(s)
 	if s ~= curStatus then curStatus = s; _G.Celestial.FarmStatus = s end
 end
 
--- Monedas estimadas en la bolsa = ultima lectura sincronizada + recogidas desde entonces
-local function BagEstimate() return bagBase + touchedSinceSync end
-
 local function ResetRoundCounters()
-	bagBase, touchedSinceSync, roundTouchedTotal = 0, 0, 0
+	roundCollected, batchCollected, batchIndex = 0, 0, 1
 	table.clear(touchedCoins)
-	batchPausing, batchPausePending = false, false
-	limitReached, limitFromSync = false, false
-	needInitialSync = false
+	batchPausing, batchPausePending, limitReached = false, false, false
+end
+
+-- ---------------------------------------------------------------
+-- VUELO (arquitectura de la funcion "Fly" de CH): en vez de teletransportar el CFrame cada frame,
+-- el personaje vuela con fisica real (BodyVelocity), con PlatformStand activo: sin animacion de
+-- caida/caminar en el aire ni posiciones "saltadas" que el anti-cheat pueda marcar como invalidas.
+-- ---------------------------------------------------------------
+
+local function StopFlight()
+	if flightGyro then pcall(function() flightGyro:Destroy() end); flightGyro = nil end
+	if flightVel then pcall(function() flightVel:Destroy() end); flightVel = nil end
+	if flightOn then
+		local hum = GetHumanoid()
+		if hum then pcall(function() hum.PlatformStand = false end) end
+	end
+	flightOn = false
+	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
+	CoinEngine.NoclipWanted = false
+end
+
+local function EnsureFlight(root, hum)
+	if not flightGyro or flightGyro.Parent ~= root then
+		if flightGyro then pcall(function() flightGyro:Destroy() end) end
+		flightGyro = Instance.new("BodyGyro")
+		flightGyro.Name = "__CelestialFarmGyro"
+		flightGyro.MaxTorque = Vector3.new(99999, 99999, 99999)
+		flightGyro.P = 9000
+		flightGyro.CFrame = root.CFrame
+		flightGyro.Parent = root
+	end
+	if not flightVel or flightVel.Parent ~= root then
+		if flightVel then pcall(function() flightVel:Destroy() end) end
+		flightVel = Instance.new("BodyVelocity")
+		flightVel.Name = "__CelestialFarmVel"
+		flightVel.MaxForce = Vector3.new(99999, 99999, 99999)
+		flightVel.Velocity = Vector3.zero
+		flightVel.Parent = root
+	end
+	if not hum.PlatformStand then hum.PlatformStand = true end
+	flightOn = true
+	_G.Celestial.FarmFlying = true
+	CoinEngine.NoclipWanted = true       -- atraviesa paredes mientras vuela / flota
 end
 
 local function CoinNameMatches(obj)
@@ -5144,7 +5185,6 @@ end
 local function Activate()
 	if CoinEngine.Active then return end
 	CoinEngine.Active = true
-	activatedAt = os.clock()
 	CoinEngine.AddedConnection = Workspace.DescendantAdded:Connect(OnDescendantAdded)
 	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
 	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
@@ -5166,8 +5206,8 @@ local function Deactivate()
 	CoinEngine.CoinCount = 0
 	roundActive = false
 	weaponsSince, noWeaponsSince = nil, nil
-	activatedAt = 0
 	ResetRoundCounters()
+	StopFlight()
 	SetStatus("off")
 	ResetPath()
 	lastRoot = nil
@@ -5256,7 +5296,7 @@ local function LogStep(now, dt, force)
 	local p = root.Position
 	local tgt = CoinEngine.CurrentTarget
 	local line = string.format(
-		"t=%.2f pos=(%.0f,%.0f,%.0f) drift=%.2f spd=%.0f toCoin=%.0f fps=%.0f ping=%.0f state=%s noclip=%s inSolid=%s coins=%d round=%s bag=%d ev=%s",
+		"t=%.2f pos=(%.0f,%.0f,%.0f) drift=%.2f spd=%.0f toCoin=%.0f fps=%.0f ping=%.0f state=%s noclip=%s inSolid=%s coins=%d round=%s n=%d ev=%s",
 		now, p.X, p.Y, p.Z,
 		lastSetPos and (p - lastSetPos).Magnitude or -1,
 		currentSpeed,
@@ -5264,7 +5304,7 @@ local function LogStep(now, dt, force)
 		dt > 0 and 1 / dt or 0, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
 		tostring(noclipOn), tostring(IsInsideSolid(p)),
-		coinsCollectedTotal, tostring(roundActive), BagEstimate(), table.concat(pendingEvents, ","))
+		coinsCollectedTotal, tostring(roundActive), roundCollected, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -5395,62 +5435,6 @@ local function CollectCoin(root, coin, now)
 end
 
 -- ---------------------------------------------------------------
--- BOLSA DE MONEDAS: contador real de la UI del juego (si se encuentra) con respaldo por conteo de recogidas
--- ---------------------------------------------------------------
-
-local bagLabel, nextBagSearch = nil, 0
-
-local function ReadBagCoins()
-	local now = os.clock()
-	if not bagLabel or not bagLabel.Parent then
-		bagLabel = nil
-		if now < nextBagSearch then return nil end
-		nextBagSearch = now + 5
-		local pg = LocalPlayer:FindFirstChild("PlayerGui")
-		local bags = pg and pg:FindFirstChild("CoinBags", true)
-		if bags then
-			local byName = bags:FindFirstChild("Coins", true)
-			if byName and byName:IsA("TextLabel") then
-				bagLabel = byName
-			else
-				for _, d in ipairs(bags:GetDescendants()) do
-					if d:IsA("TextLabel") and string.match(d.Text, "^%s*%d+%s*$") then bagLabel = d; break end
-				end
-			end
-		end
-		if not bagLabel then return nil end
-	end
-	return tonumber(string.match(bagLabel.Text, "%d+"))
-end
-
--- Siguiente umbral de pausa (13, 26, 39) por encima de "count"; el ultimo lote llega hasta MaxCoins (50).
-local function NextCoinGoal(count, safe)
-	if safe then
-		for i = 1, CoinEngine.BatchPauses do
-			local t = CoinEngine.BatchSize * i
-			if t > count and t < CoinEngine.MaxCoins then return t end
-		end
-	end
-	return CoinEngine.MaxCoins
-end
-
--- Sincroniza el conteo estimado con el contador real de la bolsa (solo si se puede leer y es coherente).
-local function SyncBag(initial)
-	local est = BagEstimate()
-	local ui = ReadBagCoins()
-	local value = est
-	if ui and (initial or (ui >= est - 4 and ui <= est + 2)) then value = ui end
-	bagBase = value
-	touchedSinceSync = 0
-	if bagBase >= CoinEngine.MaxCoins then
-		limitReached = true
-		limitFromSync = initial and true or false
-		limitAt = os.clock()
-		LogEvent("limit")
-	end
-end
-
--- ---------------------------------------------------------------
 -- DETECTOR DE RONDA: se basa en el inventario de los jugadores (cuchillo / pistola asignados) y en que
 -- las monedas hayan aparecido. No predice donde aparecen las monedas, solo espera a que existan.
 -- ---------------------------------------------------------------
@@ -5474,11 +5458,9 @@ local function UpdateRound(now)
 		if CoinEngine.CoinCount > 0 and WeaponsAssigned(false) then
 			weaponsSince = weaponsSince or now
 			if now - weaponsSince >= CoinEngine.WeaponDebounce then
-				local midRound = activatedAt > 0 and (now - activatedAt) < 2.0   -- farm encendido con la ronda ya empezada
 				roundActive = true
 				weaponsSince, noWeaponsSince = nil, nil
 				ResetRoundCounters()
-				needInitialSync = midRound
 				ResetPath()
 				pauseUntil = math.max(pauseUntil, now + CoinEngine.RoundStartGrace)
 				LogEvent("round-start")
@@ -5512,12 +5494,20 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
-	CoinEngine.NoclipWanted = false     -- se vuelve a pedir solo si este frame realmente vuela
+	local rawDt = dt
+	CoinEngine.NoclipWanted = flightOn     -- mientras se vuela (o se flota en una pausa) se atraviesa la geometria
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
 
-	-- Tirón de FPS / lag: NO "recuperar" el tiempo perdido moviendose de golpe (el servidor lo ve como salto).
+	-- Fly manual o fling activos: el farm no compite con ellos
+	if State.FlyActive or State.FlingActive or _G.Celestial.FlingSessionActive then
+		StopFlight()
+		ResetPath()
+		return
+	end
+
+	-- Tirón de FPS / lag: no acelerar de golpe tras el tiron (se queda flotando quieto)
 	if dt > Param(0.15, 0.1) then
 		LogEvent("lag")
 		pauseUntil = now + 0.6
@@ -5528,7 +5518,15 @@ local function ControllerStep(dt)
 
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root or not hum or hum.Health <= 0 then
+		StopFlight()
 		if lastRoot then lastRoot = nil; ResetPath() end
+		return
+	end
+	if not IsSafeCoinPosition(root.Position) then       -- NaN / fuera del mapa / bajo el vacio
+		LogEvent("bad-position")
+		StopFlight()
+		ResetPath()
+		pauseUntil = now + 1.0
 		return
 	end
 	if root ~= lastRoot then lastRoot = root; ResetPath(); pauseUntil = now + 1.0 end   -- reaparicion / cambio de personaje
@@ -5549,64 +5547,56 @@ local function ControllerStep(dt)
 		end
 	end
 
-	-- Sin ronda en curso (lobby / cuenta atras / armas aun sin asignar): NO mover al personaje.
+	-- Sin ronda en curso (lobby / cuenta atras / armas aun sin asignar): NO volar ni mover al personaje.
 	if not roundActive then
+		StopFlight()
 		lastSetPos = nil
 		currentSpeed = 0
 		SetStatus("waiting-round")
 		return
 	end
 
-	-- Si el juego/servidor nos movio (inicio/fin de ronda, lobby, respawn), NO seguir volando hacia un
-	-- objetivo viejo desde otro punto del mundo: esa es una causa tipica de "Invalid Position".
-	if lastSetPos and (root.Position - lastSetPos).Magnitude > 8 then
-		LogEvent("server-moved-us")
-		ResetPath()
-		pauseUntil = now + 1.5
-		return
+	-- Si el juego/servidor nos movio (inicio/fin de ronda, lobby, respawn), no seguir hacia un objetivo viejo
+	-- desde otro punto del mundo. El movimiento ahora es fisico: un salto de posicion NO viene de nosotros.
+	if lastSetPos then
+		local jump = (root.Position - lastSetPos).Magnitude
+		if jump > math.max(10, currentSpeed * math.max(rawDt, 0.02) * 2.5 + 6) then
+			LogEvent("server-moved-us")
+			ResetPath()
+			pauseUntil = now + 1.5
+			return
+		end
 	end
+	lastSetPos = root.Position            -- ultima posicion observada (ya no se escribe el CFrame)
+
 	if now < pauseUntil then
 		if batchPausing then SetStatus("batch-pause") end
-		return
+		return                            -- SafeControllerStep deja la velocidad en 0: flota quieto en el sitio
 	end
-	if batchPausing then                                    -- fin de la pausa de lote: re-sincronizar y continuar
+	if batchPausing then
 		batchPausing = false
-		SyncBag(false)
 		LogEvent("batch-resume")
 	end
-	if needInitialSync then                                 -- farm encendido a mitad de ronda: leer la bolsa real
-		needInitialSync = false
-		SyncBag(true)
-	end
+
 	local st = hum:GetState()
-	if hum.Sit or hum.PlatformStand or st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll
-		or st == Enum.HumanoidStateType.FallingDown or st == Enum.HumanoidStateType.Physics
-		or st == Enum.HumanoidStateType.Seated then
+	if hum.Sit or st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll
+		or st == Enum.HumanoidStateType.FallingDown or st == Enum.HumanoidStateType.Seated then
+		StopFlight()
 		lastSetPos = nil
 		currentSpeed = 0
 		return
 	end
 
-	-- Limite de la bolsa alcanzado: el farm se detiene hasta la siguiente ronda (o hasta que la UI muestre que faltan monedas)
+	-- Limite alcanzado (13 + 13 + 13 + 11 = 50): el farm se detiene hasta la siguiente ronda
 	if limitReached then
+		StopFlight()
 		lastSetPos = nil
 		currentSpeed = 0
 		SetStatus("limit")
-		if now >= nextLimitCheck then
-			nextLimitCheck = now + 0.5
-			if now - limitAt > 1.5 and roundTouchedTotal < CoinEngine.MaxCoins + CoinEngine.TouchSafetyMargin then
-				local ui = ReadBagCoins()
-				if ui and ui < CoinEngine.MaxCoins and (limitFromSync or ui >= BagEstimate() - 4) then
-					limitReached = false                    -- algun toque fue rechazado: faltan monedas de verdad
-					bagBase, touchedSinceSync = ui, 0
-					LogEvent("limit-resume")
-				end
-			end
-		end
 		return
 	end
 
-	if CoinEngine.CoinCount == 0 then return end            -- espera sin coste hasta que un evento registre monedas
+	if CoinEngine.CoinCount == 0 then return end            -- espera (flotando quieto) hasta que un evento registre monedas
 	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
 
 	if not CoinEngine.CurrentTarget or not IsAvailable(CoinEngine.CurrentTarget, now) then
@@ -5629,119 +5619,89 @@ local function ControllerStep(dt)
 		end
 	end
 
+	-- ===== VUELO hacia la moneda (BodyVelocity + BodyGyro + PlatformStand, como "Fly") =====
 	SetStatus("farming")
+	EnsureFlight(root, hum)
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
 	dt = math.clamp(dt, 0, 0.05)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual
-	local budget = currentSpeed * dt
-	local startPos = lastSetPos or root.Position
-	if not IsFiniteVec(startPos) then ResetPath(); return end
-	local pos = startPos
-	local moved = false
-	local transitions = 0
-	local startedPause, hitLimit = false, false
 
-	while budget > 0 and transitions < 6 do
-		local target = CoinEngine.CurrentTarget
-		if not target or not IsAvailable(target, now) then
-			AdvanceTarget(root, now)
-			target = CoinEngine.CurrentTarget
-			if not target then break end
-		end
-		local delta = target.Position - pos
-		local dist = delta.Magnitude
-		if dist ~= dist or dist == math.huge then
-			CoinEngine.Blacklist[target] = now + 10
-			SetCurrent(nil, now)
-			break
-		end
-		local toPickup = dist - CoinEngine.PickupDistance
-		if toPickup <= 0 or dist < 1e-3 or budget >= toPickup then
-			-- Llegada: ir hasta el radio de recogida y quedarse EXACTAMENTE ahi
-			if toPickup > 0 then
-				pos = pos + (delta / dist) * toPickup
-				budget -= toPickup
-			end
-			moved = true                                       -- mantener/escribir posicion (con noclip no hay suelo que nos sostenga)
-			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
-			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-			local settle = safe and GetSettleTime(now) or 0.03
-			if now - arriveAt < settle or now - lastCollectAt < minGap then break end   -- esperar a que el servidor te vea aqui
+	local target = CoinEngine.CurrentTarget
+	if not target or not IsAvailable(target, now) then
+		AdvanceTarget(root, now)
+		target = CoinEngine.CurrentTarget
+		if not target then return end
+	end
+	local rootPos = root.Position
+	local delta = target.Position - rootPos
+	local dist = delta.Magnitude
+	if dist ~= dist or dist == math.huge then
+		CoinEngine.Blacklist[target] = now + 10
+		SetCurrent(nil, now)
+		return
+	end
+
+	if dist <= CoinEngine.PickupDistance then
+		-- Llegada: flotar quieto (velocidad 0) y recoger
+		if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
+		lastProgress = now
+		if safe then currentSpeed = currentSpeed * 0.5 end
+		local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
+		local settle = safe and GetSettleTime(now) or 0.03
+		if now - arriveAt >= settle and now - lastCollectAt >= minGap then   -- esperar a que el servidor te vea aqui
 			lastCollectAt = now
 			arriveTarget = nil
 			CollectCoin(root, target, now)
 			coinsCollectedTotal += 1
 			LogEvent("collect")
-			transitions += 1
 
-			-- Conteo de la bolsa (monedas distintas tocadas) para los lotes y el limite
+			-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 			if not touchedCoins[target] then
 				touchedCoins[target] = true
-				touchedSinceSync += 1
-				roundTouchedTotal += 1
+				roundCollected += 1
+				batchCollected += 1
 			end
-			local est = BagEstimate()
-			if est >= CoinEngine.MaxCoins or roundTouchedTotal >= CoinEngine.MaxCoins + CoinEngine.TouchSafetyMargin then
+			if roundCollected >= batchTotal then
 				limitReached = true                            -- 50 monedas: limite maximo, detener el farm
-				limitFromSync = false
-				limitAt = now
-				hitLimit = true
 				LogEvent("limit")
-			elseif safe and est >= NextCoinGoal(bagBase, true) then
-				batchPausePending = true                       -- lote completo (13 / 26 / 39): pausar en cuanto sea seguro
+				SetStatus("limit")
+			elseif safe and batchCollected >= (CoinEngine.Batches[batchIndex] or batchTotal) then
+				batchPausePending = true                       -- lote completo: pausar en cuanto sea seguro
 			end
-			-- Solo se pausa FUERA de geometria solida: quedarse quieto dentro de una pared hace que la fisica
-			-- te empuje y el servidor reciba una posicion incoherente.
-			if batchPausePending and not hitLimit and not IsInsideSolid(pos) then
+			-- Solo se pausa FUERA de geometria solida
+			if batchPausePending and not limitReached and not IsInsideSolid(rootPos) then
 				batchPausePending = false
 				batchPausing = true
-				startedPause = true
+				batchIndex += 1
+				batchCollected = 0
 				pauseUntil = now + CoinEngine.BatchPauseTime
+				currentSpeed = 0
 				LogEvent("batch-pause")
+				SetStatus("batch-pause")
 			end
-			break                                            -- una recogida por frame (siempre)
-		else
-			pos = pos + (delta / dist) * budget
-			budget = 0
-			moved = true
-		end
-	end
-
-	-- Nunca aplicar una posicion invalida: NaN/inf, bajo el vacio, o un salto mayor al esperado
-	if moved then
-		local stepLen = (pos - startPos).Magnitude
-		local maxStep = currentSpeed * dt * Param(1.25, 1.1) + 0.25
-		if IsSafeCoinPosition(pos) and stepLen == stepLen and stepLen <= maxStep then
-			CoinEngine.NoclipWanted = true                     -- atraviesa paredes mientras vuela / espera la recogida
-			NoclipStep()                                       -- aplicar YA (no esperar al siguiente Stepped)
-			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
-			root.AssemblyLinearVelocity = Vector3.zero
-			root.AssemblyAngularVelocity = Vector3.zero
-			lastSetPos = pos
-		else
-			pos = startPos
-			LogEvent("step-rejected")
-			ResetPath()
-			pauseUntil = now + 0.3
 		end
 	else
-		lastSetPos = nil
-		currentSpeed = currentSpeed * 0.5
-	end
-
-	-- Pausa de lote o limite: quedar quieto, sin noclip, y reanudar luego desde la posicion real
-	if startedPause or hitLimit then
-		lastSetPos = nil
-		currentSpeed = 0
-		SetStatus(hitLimit and "limit" or "batch-pause")
+		-- Vuelo: velocidad real hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
+		local dir = delta / dist
+		local remaining = dist - CoinEngine.StopDistance
+		local v = math.min(currentSpeed, math.max(remaining, 0) * Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain))
+		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
+		if v == v and flightVel then
+			flightVel.Velocity = dir * v
+			velApplied = true
+		end
+		local horiz = Vector3.new(dir.X, 0, dir.Z)
+		if horiz.Magnitude > 0.05 and flightGyro then
+			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + horiz)   -- de frente hacia donde vuela, siempre derecho
+		end
 	end
 
 	-- Personaje bloqueado: sin progreso hacia el objetivo -> descartarlo temporalmente
 	local cur = CoinEngine.CurrentTarget
 	if cur then
-		local d = (cur.Position - pos).Magnitude
+		local d = (cur.Position - root.Position).Magnitude
 		if d < bestDist - 0.5 then
 			bestDist = d
 			lastProgress = now
@@ -5753,7 +5713,9 @@ local function ControllerStep(dt)
 end
 
 local function SafeControllerStep(dt)
+	velApplied = false
 	local ok = pcall(ControllerStep, dt)
+	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
 	if State.FarmEnabled then pcall(LogStep, os.clock(), dt, false) end
 	if ok then
 		errorStreak = 0
