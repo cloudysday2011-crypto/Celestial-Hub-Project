@@ -4246,6 +4246,24 @@ local function SpiderRegisterWorldItem(instance)
 	end
 end
 
+local function SpiderRefreshRegisteredWorldItems()
+	local folder = _G.Celestial.ESPFolder
+	if not folder or not folder.Parent then return end
+	for target, kind in pairs(SpiderWorldItems) do
+		if not SpiderIsAvailableWorldItem(target) then
+			SpiderClearItemVisual(target)
+		else
+			local currentTarget, currentKind = SpiderResolveWorldItem(target)
+			if not currentTarget or currentTarget ~= target or currentKind ~= kind then
+				SpiderClearItemVisual(target)
+				if currentTarget and currentKind then SpiderRegisterWorldItem(currentTarget) end
+			else
+				SpiderEnsureItemVisual(target, kind)
+			end
+		end
+	end
+end
+
 local function SpiderProcessDirtyItems(maxItems)
 	local folder = _G.Celestial.ESPFolder
 	if not folder or not folder.Parent then return end
@@ -4586,7 +4604,7 @@ local function SpiderUpdateESP(activePlayers, now)
 	SpiderAdvanceRoleScan(activePlayers, now)
 	-- Player highlights/role metadata need no RenderStepped-rate refresh.
 	if now - SpiderLastVisualUpdate < 0.38 then
-		SpiderProcessDirtyItems(6)
+		SpiderRefreshRegisteredWorldItems()
 		return
 	end
 	SpiderLastVisualUpdate = now
@@ -4658,7 +4676,7 @@ local function SpiderUpdateESP(activePlayers, now)
 
 	-- Only new/changed items are processed. DescendantAdded/Removing handles lifecycle
 	-- updates, so rescanning every registered item 5 times per second was redundant.
-	SpiderProcessDirtyItems(18)
+	SpiderRefreshRegisteredWorldItems()
 end
 
 _G.Celestial.SpiderESPCleanup = SpiderStop
