@@ -796,7 +796,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 95,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 95, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -4945,7 +4945,10 @@ local CoinEngine = {
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
-	MaxDistance = 600,
+	MaxDistance = 250,         -- antes 600: volar tan lejos suele significar que estas en el lobby / fuera del mapa
+	SafeMaxSpeed = 55,         -- tope de velocidad real (studs/s) con Safe Mode activo
+	RampTime = 0.35,           -- segundos para llegar de 0 a velocidad maxima (sin arranques bruscos)
+	MinCollectInterval = 0.12, -- pausa minima entre recogidas
 	PickupDistance = 3.4,
 	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
 	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
@@ -4968,6 +4971,10 @@ local nextRescanAt = 0
 local rescanBackoff = 1.0
 local nextImproveCheck = 0
 local errorStreak = 0
+local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
+local pauseUntil = 0
+local currentSpeed = 0
+local lastCollectAt = 0
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
@@ -5073,6 +5080,8 @@ local function ResetPath()
 	CoinEngine.NextTarget = nil
 	bestDist = math.huge
 	noTargetUntil = 0
+	currentSpeed = 0
+	lastSetPos = nil
 end
 
 local function Activate()
@@ -5204,7 +5213,17 @@ local function ControllerStep(dt)
 		if lastRoot then lastRoot = nil; ResetPath() end
 		return
 	end
-	if root ~= lastRoot then lastRoot = root; ResetPath() end   -- reaparicion / cambio de personaje
+	if root ~= lastRoot then lastRoot = root; ResetPath(); pauseUntil = now + 1.0 end   -- reaparicion / cambio de personaje
+
+	-- Si el juego/servidor nos movio (inicio/fin de ronda, lobby, respawn), NO seguir volando hacia un
+	-- objetivo viejo desde otro punto del mundo: esa es una causa tipica de "Invalid Position".
+	if lastSetPos and (root.Position - lastSetPos).Magnitude > 12 then
+		ResetPath()
+		pauseUntil = now + 1.5
+		return
+	end
+	if now < pauseUntil then return end
+	if hum.Sit or hum:GetState() == Enum.HumanoidStateType.Dead then return end
 
 	-- Mantenimiento barato (2 veces por segundo)
 	if now >= nextHousekeeping then
@@ -5241,7 +5260,10 @@ local function ControllerStep(dt)
 	end
 
 	local speed = math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100)
-	local budget = speed * math.clamp(dt, 0, 0.05)   -- paso maximo por frame acotado (evita saltos grandes tras un lag)
+	if State.FarmSafeMode ~= false then speed = math.min(speed, CoinEngine.SafeMaxSpeed) end
+	dt = math.clamp(dt, 0, 0.05)                      -- paso maximo por frame acotado (evita saltos grandes tras un lag)
+	currentSpeed = math.min(speed, currentSpeed + speed * dt / CoinEngine.RampTime)   -- aceleracion gradual
+	local budget = currentSpeed * dt
 	local startPos = root.Position
 	if not IsFiniteVec(startPos) then ResetPath(); return end
 	local pos = startPos
@@ -5264,14 +5286,20 @@ local function ControllerStep(dt)
 		end
 		local toPickup = dist - CoinEngine.PickupDistance
 		if toPickup <= 0 or dist < 1e-3 then
+			if now - lastCollectAt < CoinEngine.MinCollectInterval then break end
+			lastCollectAt = now
 			CollectCoin(root, target, now)
 			transitions += 1
+			if State.FarmSafeMode ~= false then break end   -- una recogida por frame
 		elseif budget >= toPickup then
+			if now - lastCollectAt < CoinEngine.MinCollectInterval then break end
 			pos = pos + (delta / dist) * toPickup
 			budget -= toPickup
 			moved = true
-			CollectCoin(root, target, now)             -- recoge y encadena al siguiente en el MISMO frame
+			lastCollectAt = now
+			CollectCoin(root, target, now)
 			transitions += 1
+			if State.FarmSafeMode ~= false then break end
 		else
 			pos = pos + (delta / dist) * budget
 			budget = 0
@@ -5286,10 +5314,14 @@ local function ControllerStep(dt)
 			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
+			lastSetPos = pos
 		else
 			pos = startPos
 			ResetPath()
 		end
+	else
+		lastSetPos = nil
+		currentSpeed = currentSpeed * 0.5
 	end
 
 	-- Personaje bloqueado: sin progreso hacia el objetivo -> descartarlo temporalmente
@@ -8366,6 +8398,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
 		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins.", 10, 100, State.TweenSpeed, function(v) State.TweenSpeed = v end)
+		AddToggleToSection(secFarm, "Safe Mode (anti Invalid Position)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
 		-- COMBAT TAB
