@@ -253,9 +253,12 @@ _G.Celestial.SpiderShared = {
 	RoleColors = SPIDER_ROLE_COLORS
 }
 
-local SpiderDetectionCache = {At = 0, Evidence = nil}
+local SpiderDetectionCache = {At = 0, Evidence = nil, Scanning = false, Generation = 0}
 local function ScanSpiderEvidence(forceRefresh)
 	local now = tick()
+	if SpiderDetectionCache.Scanning and SpiderDetectionCache.Evidence then
+		return SpiderDetectionCache.Evidence
+	end
 	if not forceRefresh and SpiderDetectionCache.Evidence and now - SpiderDetectionCache.At < 3.0 then
 		return SpiderDetectionCache.Evidence
 	end
@@ -287,66 +290,117 @@ local function ScanSpiderEvidence(forceRefresh)
 			or lower:find("escape", 1, true)) then evidence.SpiderUI = true end
 	end
 
-	local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
-	if ok and descendants then
-		for _, obj in ipairs(descendants) do
-			evidence.Inspected = evidence.Inspected + 1
-			if evidence.Inspected > 18000 then break end
-			InspectText(obj.Name, false)
-			if obj:IsA("StringValue") or obj:IsA("ObjectValue") then
-				pcall(function() InspectText(obj.Value, false) end)
-			end
-		end
-	end
-
-	local pg = LocalPlayer:FindFirstChild("PlayerGui")
-	if pg then
-		local guiOK, guiDescendants = pcall(function() return pg:GetDescendants() end)
-		if guiOK and guiDescendants then
-			for i, obj in ipairs(guiDescendants) do
-				if i > 5000 then break end
-				InspectText(obj.Name, true)
-				if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-					InspectText(obj.Text, true)
-				end
-			end
-		end
-	end
-
-	for _, plr in ipairs(Players:GetPlayers()) do
-		local team = plr.Team
-		if team then
-			local teamName = string.lower(team.Name)
-			if teamName:find("spider", 1, true) or teamName:find("infected", 1, true)
-				or teamName:find("survivor", 1, true) or teamName:find("human", 1, true) then
-				evidence.RoleHint = true
-			end
-		end
-	end
-
 	SpiderDetectionCache.At = now
 	SpiderDetectionCache.Evidence = evidence
+	SpiderDetectionCache.Scanning = true
+	SpiderDetectionCache.Generation = SpiderDetectionCache.Generation + 1
+	local generation = SpiderDetectionCache.Generation
+
+	-- Spider detection used to allocate two enormous GetDescendants() arrays before
+	-- the Hub opened. Scan the same evidence gradually, yielding after bounded batches.
+	task.spawn(function()
+		local ok = pcall(function()
+			local stack = Workspace:GetChildren()
+			local inspected = 0
+			while #stack > 0 and inspected < 18000 do
+				if generation ~= SpiderDetectionCache.Generation then return end
+				local batch = 0
+				while #stack > 0 and batch < 260 and inspected < 18000 do
+					local obj = stack[#stack]
+					stack[#stack] = nil
+					if obj and obj.Parent then
+						InspectText(obj.Name, false)
+						if obj:IsA("StringValue") or obj:IsA("ObjectValue") then
+							pcall(function() InspectText(obj.Value, false) end)
+						end
+						local childrenOK, children = pcall(function() return obj:GetChildren() end)
+						if childrenOK and children then
+							for index = #children, 1, -1 do stack[#stack + 1] = children[index] end
+						end
+					end
+					inspected = inspected + 1
+					batch = batch + 1
+				end
+				evidence.Inspected = inspected
+				task.wait()
+			end
+
+			local pg = LocalPlayer:FindFirstChild("PlayerGui")
+			if pg then
+				local guiStack = pg:GetChildren()
+				local guiInspected = 0
+				while #guiStack > 0 and guiInspected < 5000 do
+					if generation ~= SpiderDetectionCache.Generation then return end
+					local batch = 0
+					while #guiStack > 0 and batch < 260 and guiInspected < 5000 do
+						local obj = guiStack[#guiStack]
+						guiStack[#guiStack] = nil
+						if obj and obj.Parent then
+							InspectText(obj.Name, true)
+							if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+								InspectText(obj.Text, true)
+							end
+							local childrenOK, children = pcall(function() return obj:GetChildren() end)
+							if childrenOK and children then
+								for index = #children, 1, -1 do guiStack[#guiStack + 1] = children[index] end
+							end
+						end
+						guiInspected = guiInspected + 1
+						batch = batch + 1
+					end
+					task.wait()
+				end
+			end
+
+			for _, plr in ipairs(Players:GetPlayers()) do
+				local team = plr.Team
+				if team then
+					local teamName = string.lower(team.Name)
+					if teamName:find("spider", 1, true) or teamName:find("infected", 1, true)
+						or teamName:find("survivor", 1, true) or teamName:find("human", 1, true) then
+						evidence.RoleHint = true
+					end
+				end
+			end
+		end)
+		if generation == SpiderDetectionCache.Generation then
+			SpiderDetectionCache.At = tick()
+			SpiderDetectionCache.Scanning = false
+		end
+	end)
 	return evidence
 end
 
 local function IsSpiderGame()
 	local e = ScanSpiderEvidence(false)
-	-- The known PlaceId is corroborated by server capacity or live Spider signals.
-	if e.KnownPlace and (e.MaxPlayersSix or e.SpiderName or e.ItemKindCount >= 2 or e.SpiderUI) then
+	local function confirmed()
+		-- Once the signals are sufficient, stop the background evidence sweep so it
+		-- cannot overlap with Spider ESP's incremental map scan.
+		if SpiderDetectionCache.Scanning then
+			SpiderDetectionCache.Generation = SpiderDetectionCache.Generation + 1
+			SpiderDetectionCache.Scanning = false
+			SpiderDetectionCache.At = tick()
+		end
 		return true
 	end
+	-- The known PlaceId is corroborated by server capacity or live Spider signals.
+	if e.KnownPlace and (e.MaxPlayersSix or e.SpiderName or e.ItemKindCount >= 2 or e.SpiderUI) then
+		return confirmed()
+	end
 	-- Fallback for changed/sub-place IDs: require multiple independent signals.
-	if e.MaxPlayersSix and e.ItemKindCount >= 3 and e.SpiderName then return true end
-	if e.ItemKindCount >= 4 and (e.SpiderName or e.SpiderUI) then return true end
-	if e.MaxPlayersSix and e.SpiderName and e.LobbyName and e.RoleHint then return true end
+	if e.MaxPlayersSix and e.ItemKindCount >= 3 and e.SpiderName then return confirmed() end
+	if e.ItemKindCount >= 4 and (e.SpiderName or e.SpiderUI) then return confirmed() end
+	if e.MaxPlayersSix and e.SpiderName and e.LobbyName and e.RoleHint then return confirmed() end
 	return false
 end
 
 _G.Celestial.IsSpiderGame = IsSpiderGame
+_G.Celestial.IsSpiderDetectionPending = function() return SpiderDetectionCache.Scanning end
 end
 
 local function ScanGameMode()
 	if _G.Celestial.IsSpiderGame and _G.Celestial.IsSpiderGame() then return "SPIDER" end
+	if _G.Celestial.IsSpiderDetectionPending and _G.Celestial.IsSpiderDetectionPending() then return nil end
 	local scoreMM2 = 0
 	local scoreDuels = 0
 
@@ -3798,7 +3852,17 @@ local SpiderWorldItems = {}
 local SpiderItemVisuals = {}
 local SpiderBotVisual = nil
 local SpiderLastRoleRefresh = 0
+local SpiderLastVisualUpdate = 0
+local SpiderRoleScanActive = false
+local SpiderRoleScanPlayers = {}
+local SpiderRoleScanIndex = 1
+local SpiderRoleScanSpiderPlayer = nil
 local SpiderCachedPlayerRoles = {}
+local SpiderPlayerCharacterModels = {}
+local SpiderDirtyItemQueue = {}
+local SpiderDirtyItemSet = {}
+local SpiderDirtyItemHead = 1
+local SpiderScanGeneration = 0
 
 local function SpiderKeepConnection(connection)
 	if connection then table.insert(SpiderESPConnections, connection) end
@@ -3807,9 +3871,10 @@ end
 
 local function SpiderIsPlayerCharacterDescendant(instance)
 	if not instance then return false end
-	for _, plr in ipairs(Players:GetPlayers()) do
-		local character = plr.Character
-		if character and (instance == character or instance:IsDescendantOf(character)) then return true end
+	local node = instance
+	while node and node ~= Workspace do
+		if SpiderPlayerCharacterModels[node] then return true end
+		node = node.Parent
 	end
 	return false
 end
@@ -3896,7 +3961,7 @@ end
 
 local function SpiderGetPlayerRole(player, now)
 	local cached = SpiderCachedPlayerRoles[player]
-	if cached and now - cached.At < 1.0 then return cached.Role end
+	if cached and now - cached.At < 1.3 then return cached.Role end
 	local role = SpiderRoleFromContainer(player)
 	-- Some games expose only the local player's current role through a HUD text.
 	if not role and player == LocalPlayer then
@@ -4059,8 +4124,11 @@ local function SpiderIsRelevantNPCModel(model)
 	if not root then return false end
 	local nameNorm = SpiderNormalizeName(model.Name)
 	local hasSpiderName = nameNorm:find("spider", 1, true) or nameNorm:find("infected", 1, true)
+	-- A clear spider/infected model name is already strong evidence; don't walk its
+	-- whole role-value tree just to confirm what the name already establishes.
+	if hasSpiderName then return true end
 	local explicitRole = SpiderRoleFromContainer(model)
-	if explicitRole == "SPIDER" or hasSpiderName then return true end
+	if explicitRole == "SPIDER" then return true end
 	-- Some versions give the spider a generic rig name, so let a verified account
 	-- username in its own inventory act as a fallback identifier.
 	local inventory = model:FindFirstChild("Inventory", true) or model:FindFirstChild("Backpack", true)
@@ -4069,10 +4137,20 @@ local function SpiderIsRelevantNPCModel(model)
 end
 
 local function SpiderConsiderNPC(instance)
+	if not instance then return end
+	local firstName = SpiderNormalizeName(instance.Name)
+	local insideInventory = firstName == "inventory" or firstName == "backpack"
+		or firstName == "playerinventory" or firstName == "spiderinventory"
 	local node = instance
 	while node and node ~= Workspace do
-		if node:IsA("Model") and SpiderIsRelevantNPCModel(node) then
-			SpiderNPCModels[node] = true
+		if node:IsA("Model") then
+			local normalized = SpiderNormalizeName(node.Name)
+			local namedSpider = normalized:find("spider", 1, true) or normalized:find("infected", 1, true)
+			local hasDirectInventory = node:FindFirstChild("Inventory") or node:FindFirstChild("Backpack")
+				or node:FindFirstChild("PlayerInventory") or node:FindFirstChild("SpiderInventory")
+			if (namedSpider or hasDirectInventory or insideInventory) and SpiderIsRelevantNPCModel(node) then
+				SpiderNPCModels[node] = true
+			end
 		end
 		node = node.Parent
 	end
@@ -4087,9 +4165,9 @@ local function SpiderFindBotCandidate()
 		else
 			local root = SpiderModelRoot(model)
 			if root then
-				local explicitRole = SpiderRoleFromContainer(model)
 				local nameNorm = SpiderNormalizeName(model.Name)
 				local nameSignal = nameNorm:find("spider", 1, true) or nameNorm:find("infected", 1, true)
+				local explicitRole = nameSignal and "SPIDER" or SpiderRoleFromContainer(model)
 				local usernameSignal = SpiderModelInventoryHasUsername(model)
 				local rank = explicitRole == "SPIDER" and 3 or (nameSignal and 2 or (usernameSignal and 1 or 0))
 				if rank > topRank then topModel, topRank = model, rank end
@@ -4128,7 +4206,8 @@ local function SpiderClearItemVisual(target)
 		if visual.Label then pcall(function() visual.Label:Destroy() end) end
 		SpiderItemVisuals[target] = nil
 	end
-	SpiderWorldItems[target] = nil
+ 	SpiderWorldItems[target] = nil
+	SpiderDirtyItemSet[target] = nil
 end
 
 local function SpiderRegisterWorldItem(instance)
@@ -4138,6 +4217,45 @@ local function SpiderRegisterWorldItem(instance)
 	local previous = SpiderWorldItems[target]
 	if previous and previous ~= kind then SpiderClearItemVisual(target) end
 	SpiderWorldItems[target] = kind
+	if not SpiderItemVisuals[target] and not SpiderDirtyItemSet[target] then
+		SpiderDirtyItemSet[target] = true
+		SpiderDirtyItemQueue[#SpiderDirtyItemQueue + 1] = target
+	end
+end
+
+local function SpiderProcessDirtyItems(maxItems)
+	local folder = _G.Celestial.ESPFolder
+	if not folder or not folder.Parent then return end
+	local processed = 0
+	while SpiderDirtyItemHead <= #SpiderDirtyItemQueue and processed < maxItems do
+		local target = SpiderDirtyItemQueue[SpiderDirtyItemHead]
+		SpiderDirtyItemQueue[SpiderDirtyItemHead] = false
+		SpiderDirtyItemHead = SpiderDirtyItemHead + 1
+		processed = processed + 1
+		if target and SpiderDirtyItemSet[target] then
+			SpiderDirtyItemSet[target] = nil
+			local kind = SpiderWorldItems[target]
+			if kind then
+				if not SpiderIsAvailableWorldItem(target) then
+					SpiderClearItemVisual(target)
+				else
+					local currentTarget, currentKind = SpiderResolveWorldItem(target)
+					if currentTarget == target and currentKind == kind then
+						SpiderEnsureItemVisual(target, kind)
+					elseif currentTarget and currentKind then
+						SpiderClearItemVisual(target)
+						SpiderRegisterWorldItem(currentTarget)
+					else
+						SpiderClearItemVisual(target)
+					end
+				end
+			end
+		end
+	end
+	if SpiderDirtyItemHead > #SpiderDirtyItemQueue then
+		SpiderDirtyItemQueue = {}
+		SpiderDirtyItemHead = 1
+	end
 end
 
 local function SpiderGetLabelAdornee(target)
@@ -4171,14 +4289,15 @@ local function SpiderEnsureItemVisual(target, kind)
 
 	if visual.Kind ~= kind then
 		SpiderClearItemVisual(target)
+		SpiderWorldItems[target] = kind
 		return SpiderEnsureItemVisual(target, kind)
 	end
 	if visual.Label then pcall(function() visual.Label:Destroy() end); visual.Label = nil end
 	if visual.Highlight and visual.Highlight.Parent ~= folder then visual.Highlight.Parent = folder end
 	local highlightAdornee = target:IsA("Tool") and SpiderGetLabelAdornee(target) or target
-	visual.Highlight.Adornee = highlightAdornee
-	visual.Highlight.FillColor = SPIDER_ITEM_COLORS[kind]
-	visual.Highlight.OutlineColor = SPIDER_ITEM_COLORS[kind]
+	if visual.Highlight.Adornee ~= highlightAdornee then visual.Highlight.Adornee = highlightAdornee end
+	if visual.Highlight.FillColor ~= SPIDER_ITEM_COLORS[kind] then visual.Highlight.FillColor = SPIDER_ITEM_COLORS[kind] end
+	if visual.Highlight.OutlineColor ~= SPIDER_ITEM_COLORS[kind] then visual.Highlight.OutlineColor = SPIDER_ITEM_COLORS[kind] end
 
 	-- SelectionBox supplies a stronger, screen-visible edge for small distant items.
 	-- It is attached only to BaseParts; Models keep their full Highlight silhouette.
@@ -4241,6 +4360,47 @@ local function SpiderUpdateBotVisual(model, playerControlled)
 	if SpiderBotVisual.Label then pcall(function() SpiderBotVisual.Label:Destroy() end); SpiderBotVisual.Label = nil end
 end
 
+local function SpiderAdvanceRoleScan(activePlayers, now)
+	if not SpiderRoleScanActive and now - SpiderLastRoleRefresh >= 1.5 then
+		SpiderLastRoleRefresh = now
+		SpiderRoleScanPlayers = {}
+		for _, player in ipairs(activePlayers) do
+			SpiderRoleScanPlayers[#SpiderRoleScanPlayers + 1] = player
+		end
+		SpiderRoleScanIndex = 1
+		SpiderRoleScanSpiderPlayer = nil
+		SpiderRoleScanActive = true
+	end
+	if not SpiderRoleScanActive then return end
+
+	-- Inspect only two players per scanner pass so role assignment cannot cause one large hitch.
+	local processed = 0
+	while SpiderRoleScanIndex <= #SpiderRoleScanPlayers and processed < 2 do
+		local player = SpiderRoleScanPlayers[SpiderRoleScanIndex]
+		SpiderRoleScanIndex = SpiderRoleScanIndex + 1
+		processed = processed + 1
+		if player and player.Parent == Players then
+			local role = SpiderGetPlayerRole(player, now)
+			if role == "SPIDER" and not SpiderRoleScanSpiderPlayer then
+				SpiderRoleScanSpiderPlayer = player
+			end
+		end
+	end
+
+	if SpiderRoleScanIndex > #SpiderRoleScanPlayers then
+		for _, player in ipairs(SpiderRoleScanPlayers) do
+			SpiderRoleCache[player] = player == SpiderRoleScanSpiderPlayer and "SPIDER" or "HUMAN"
+		end
+		local botModel = SpiderFindBotCandidate()
+		local botHasUsername = botModel and SpiderModelInventoryHasUsername(botModel) or false
+		SpiderUpdateBotVisual(botModel, botHasUsername)
+		SpiderRoleScanActive = false
+		SpiderRoleScanPlayers = {}
+		SpiderRoleScanIndex = 1
+		SpiderRoleScanSpiderPlayer = nil
+	end
+end
+
 local function SpiderClearAllItemVisuals()
 	for target in pairs(SpiderItemVisuals) do SpiderClearItemVisual(target) end
 	for target in pairs(SpiderWorldItems) do SpiderWorldItems[target] = nil end
@@ -4248,6 +4408,7 @@ end
 
 local function SpiderStop()
 	SpiderESPActive = false
+	SpiderScanGeneration = SpiderScanGeneration + 1
 	for _, connection in ipairs(SpiderESPConnections) do pcall(function() connection:Disconnect() end) end
 	SpiderESPConnections = {}
 	SpiderClearAllItemVisuals()
@@ -4256,47 +4417,120 @@ local function SpiderStop()
 	SpiderModelUsernameCache = {}
 	SpiderRoleCache = {}
 	SpiderCachedPlayerRoles = {}
-	SpiderLastRoleRefresh = 0
+	SpiderPlayerCharacterModels = {}
+	SpiderDirtyItemQueue = {}
+	SpiderDirtyItemSet = {}
+	SpiderDirtyItemHead = 1
+ 	SpiderLastRoleRefresh = 0
+	SpiderLastVisualUpdate = 0
+	SpiderRoleScanActive = false
+	SpiderRoleScanPlayers = {}
+	SpiderRoleScanIndex = 1
+	SpiderRoleScanSpiderPlayer = nil
 end
 
 local function SpiderStart()
 	if SpiderESPActive then return end
 	SpiderESPActive = true
+	SpiderScanGeneration = SpiderScanGeneration + 1
+	local scanGeneration = SpiderScanGeneration
 	SpiderWorldItems = {}
+	SpiderItemVisuals = {}
 	SpiderNPCModels = {}
 	SpiderRoleCache = {}
 	SpiderCachedPlayerRoles = {}
-	-- Process the existing world in small batches instead of doing thousands of
-	-- registrations and NPC ancestry checks in one frame when a round starts.
-	local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
-	if ok and descendants then
-		local scanLimit = math.min(#descendants, 22000)
-		local index = 1
-		local function scanBatch()
-			if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
-			local batchEnd = math.min(index + 249, scanLimit)
-			while index <= batchEnd do
-				local obj = descendants[index]
-				if obj and obj.Parent then
-					SpiderRegisterWorldItem(obj)
-					-- Only candidate Models need NPC classification. Checking every
-					-- descendant's ancestor chain multiplied the work dramatically.
-					if obj:IsA("Model") then SpiderConsiderNPC(obj) end
-				end
-				index = index + 1
-			end
-			if index <= scanLimit then
-				task.defer(scanBatch)
-			end
-		end
-		task.defer(scanBatch)
+	SpiderPlayerCharacterModels = {}
+	SpiderDirtyItemQueue = {}
+	SpiderDirtyItemSet = {}
+ 	SpiderDirtyItemHead = 1
+	SpiderRoleScanActive = false
+	SpiderRoleScanPlayers = {}
+	SpiderRoleScanIndex = 1
+	SpiderRoleScanSpiderPlayer = nil
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character then SpiderPlayerCharacterModels[player.Character] = true end
+		SpiderKeepConnection(player.CharacterAdded:Connect(function(character)
+			SpiderPlayerCharacterModels[character] = true
+		end))
+		SpiderKeepConnection(player.CharacterRemoving:Connect(function(character)
+			SpiderPlayerCharacterModels[character] = nil
+		end))
 	end
+
+	-- Depth-first, bounded batches avoid allocating Workspace:GetDescendants() all at once.
+	-- A 22k cap preserves the original scanner's safety limit.
+	local initialChildren = Workspace:GetChildren()
+	task.spawn(function()
+		local stack = {}
+		for index = #initialChildren, 1, -1 do stack[#stack + 1] = initialChildren[index] end
+		local scanned = 0
+		while #stack > 0 and scanned < 22000 do
+			if not SpiderESPActive or SpiderScanGeneration ~= scanGeneration
+				or _G.Celestial.GameMode ~= "SPIDER" then return end
+			local batchCount = 0
+			while #stack > 0 and batchCount < 160 and scanned < 22000 do
+				local obj = stack[#stack]
+				stack[#stack] = nil
+				if obj and obj.Parent then
+					local normalized = SpiderNormalizeName(obj.Name)
+					if SpiderClassifyItemName(obj.Name) then SpiderRegisterWorldItem(obj) end
+					if obj:IsA("Model") or normalized == "inventory" or normalized == "backpack"
+						or normalized == "playerinventory" or normalized == "spiderinventory"
+						or normalized:find("spider", 1, true) or normalized:find("infected", 1, true) then
+						SpiderConsiderNPC(obj)
+					end
+					local ok, children = pcall(function() return obj:GetChildren() end)
+					if ok and children then
+						for index = #children, 1, -1 do stack[#stack + 1] = children[index] end
+					end
+				end
+				scanned = scanned + 1
+				batchCount = batchCount + 1
+			end
+			task.wait()
+		end
+	end)
+	-- Let the initial tree walk get a head start before deep role/inventory metadata scans.
+	SpiderLastRoleRefresh = tick() - 0.75
+	SpiderKeepConnection(Players.PlayerAdded:Connect(function(player)
+		if player.Character then SpiderPlayerCharacterModels[player.Character] = true end
+		SpiderKeepConnection(player.CharacterAdded:Connect(function(character)
+			SpiderPlayerCharacterModels[character] = true
+		end))
+		SpiderKeepConnection(player.CharacterRemoving:Connect(function(character)
+			SpiderPlayerCharacterModels[character] = nil
+		end))
+	end))
 	SpiderKeepConnection(Workspace.DescendantAdded:Connect(function(obj)
 		if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
 		task.defer(function()
-			if SpiderESPActive and _G.Celestial.GameMode == "SPIDER" then
+			if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
+			local normalized = SpiderNormalizeName(obj.Name)
+			if SpiderClassifyItemName(obj.Name) then
 				SpiderRegisterWorldItem(obj)
+				return
+			end
+			local isInventoryRoot = normalized == "inventory" or normalized == "backpack"
+				or normalized == "playerinventory" or normalized == "spiderinventory"
+			if isInventoryRoot or obj:IsA("Model") then
 				SpiderConsiderNPC(obj)
+				return
+			end
+			-- Parts added to a known spider model can complete its rig after the Model appears.
+			local node = obj.Parent
+			while node and node ~= Workspace do
+				if node:IsA("Model") then
+					if SpiderNPCModels[node] then break end
+					local name = SpiderNormalizeName(node.Name)
+					local hasInventory = node:FindFirstChild("Inventory") or node:FindFirstChild("Backpack")
+						or node:FindFirstChild("PlayerInventory") or node:FindFirstChild("SpiderInventory")
+					if name:find("spider", 1, true) or name:find("infected", 1, true) or hasInventory then
+						SpiderConsiderNPC(obj)
+						break
+					end
+				end
+				node = node.Parent
 			end
 		end)
 	end))
@@ -4306,6 +4540,7 @@ local function SpiderStart()
 		SpiderModelUsernameCache[obj] = nil
 	end))
 	SpiderKeepConnection(Players.PlayerRemoving:Connect(function(player)
+		if player.Character then SpiderPlayerCharacterModels[player.Character] = nil end
 		SpiderCachedPlayerRoles[player] = nil
 		SpiderRoleCache[player] = nil
 	end))
@@ -4313,30 +4548,13 @@ end
 
 local function SpiderUpdateESP(activePlayers, now)
 	if not State.ESPEnabled or _G.Celestial.GameMode ~= "SPIDER" then return end
-	if now - SpiderLastRoleRefresh >= 0.75 then
-		SpiderLastRoleRefresh = now
-		local explicitSpiderPlayers = {}
-		for _, player in ipairs(activePlayers) do
-			local role = SpiderGetPlayerRole(player, now)
-			SpiderRoleCache[player] = role
-			if role == "SPIDER" then table.insert(explicitSpiderPlayers, player) end
-		end
-		local spiderPlayer = #explicitSpiderPlayers >= 1 and explicitSpiderPlayers[1] or nil
-		local botModel = SpiderFindBotCandidate()
-		local botHasUsername = botModel and SpiderModelInventoryHasUsername(botModel) or false
-		-- Do not make all player ESP disappear just because role metadata is missing.
-		-- Keep the uniquely identified spider pink and default unclassified players to human cyan.
-		for _, player in ipairs(activePlayers) do
-			local role = SpiderRoleCache[player]
-			if player == spiderPlayer then
-				role = "SPIDER"
-			else
-				role = "HUMAN"
-			end
-			SpiderRoleCache[player] = role
-		end
-		SpiderUpdateBotVisual(botModel, botHasUsername)
+	SpiderAdvanceRoleScan(activePlayers, now)
+	-- Player highlights/role metadata need no RenderStepped-rate refresh.
+	if now - SpiderLastVisualUpdate < 0.38 then
+		SpiderProcessDirtyItems(6)
+		return
 	end
+	SpiderLastVisualUpdate = now
 
 	local folder = _G.Celestial.ESPFolder
 	if not folder or not folder.Parent then return end
@@ -4354,13 +4572,13 @@ local function SpiderUpdateESP(activePlayers, now)
 					_G.Celestial.Highlights[player] = highlight
 				end
 				local color = role == "SPIDER" and SPIDER_ROLE_COLORS.PLAYER_SPIDER or SPIDER_ROLE_COLORS.HUMAN
-				highlight.Adornee = character
-				highlight.Enabled = true
-				highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-				highlight.FillColor = color
-				highlight.OutlineColor = color
-				highlight.FillTransparency = 0.5
-				highlight.OutlineTransparency = 0.1
+ 				if highlight.Adornee ~= character then highlight.Adornee = character end
+				if not highlight.Enabled then highlight.Enabled = true end
+				if highlight.DepthMode ~= Enum.HighlightDepthMode.AlwaysOnTop then highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop end
+				if highlight.FillColor ~= color then highlight.FillColor = color end
+				if highlight.OutlineColor ~= color then highlight.OutlineColor = color end
+				if highlight.FillTransparency ~= 0.5 then highlight.FillTransparency = 0.5 end
+				if highlight.OutlineTransparency ~= 0.1 then highlight.OutlineTransparency = 0.1 end
 			elseif highlight then
 				highlight.Adornee = nil
 				highlight.Enabled = false
@@ -4385,13 +4603,13 @@ local function SpiderUpdateESP(activePlayers, now)
 					_G.Celestial.SelfHighlight = own
 				end
 				local color = role == "SPIDER" and SPIDER_ROLE_COLORS.PLAYER_SPIDER or SPIDER_ROLE_COLORS.HUMAN
-				own.Adornee = character
-				own.Enabled = true
-				own.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-				own.FillColor = color
-				own.OutlineColor = color
-				own.FillTransparency = 0.5
-				own.OutlineTransparency = 0.1
+ 				if own.Adornee ~= character then own.Adornee = character end
+				if not own.Enabled then own.Enabled = true end
+				if own.DepthMode ~= Enum.HighlightDepthMode.AlwaysOnTop then own.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop end
+				if own.FillColor ~= color then own.FillColor = color end
+				if own.OutlineColor ~= color then own.OutlineColor = color end
+				if own.FillTransparency ~= 0.5 then own.FillTransparency = 0.5 end
+				if own.OutlineTransparency ~= 0.1 then own.OutlineTransparency = 0.1 end
 			end
 		elseif _G.Celestial.SelfHighlight then
 			_G.Celestial.SelfHighlight.Enabled = false
@@ -4403,19 +4621,9 @@ local function SpiderUpdateESP(activePlayers, now)
 		end
 	end
 
-	for target, kind in pairs(SpiderWorldItems) do
-		if not SpiderIsAvailableWorldItem(target) then
-			SpiderClearItemVisual(target)
-		else
-			local currentTarget, currentKind = SpiderResolveWorldItem(target)
-			if not currentTarget or currentTarget ~= target or currentKind ~= kind then
-				SpiderClearItemVisual(target)
-				if currentTarget and currentKind then SpiderRegisterWorldItem(currentTarget) end
-			else
-				SpiderEnsureItemVisual(target, kind)
-			end
-		end
-	end
+	-- Only new/changed items are processed. DescendantAdded/Removing handles lifecycle
+	-- updates, so rescanning every registered item 5 times per second was redundant.
+	SpiderProcessDirtyItems(18)
 end
 
 _G.Celestial.SpiderESPCleanup = SpiderStop
@@ -6085,10 +6293,17 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			if detectedMode then break end
 		end
 		if elapsed >= maxScanTime then
-			detectedMode = detectedMode or "DUELS"
-			break
+			local spiderScanPending = _G.Celestial.IsSpiderDetectionPending
+				and _G.Celestial.IsSpiderDetectionPending()
+			if spiderScanPending and elapsed < maxScanTime + 3.0 then
+				task.wait(0.25)
+			else
+				detectedMode = detectedMode or "DUELS"
+				break
+			end
+		else
+			task.wait(0.25)
 		end
-		task.wait(0.25)
 	end
 	_G.Celestial.GameMode = detectedMode
 	if scanGui and scanGui.Parent then scanGui:Destroy() end
