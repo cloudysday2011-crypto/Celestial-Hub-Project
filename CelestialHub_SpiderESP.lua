@@ -2,7 +2,7 @@
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
 -- + OTI (OBJECT THREAT INTELLIGENCE) — SEPARADO DE QMA
--- + QMA REFORGED / COIN FARM TWO-TARGET MICRO-BATCH
+-- + QMA REFORGED / COIN FARM V2 DYNAMIC TARGETS (CONTINUOUS MOVEMENT)
 -- + DUAL GAME MODE (MM2 / MURDER DUELS) + TEAM ESP + SMART AIMBOT
 -- + LOBBY/MATCH DETECTION + SELF ESP + DEFERRED UI LOADING
 -- + QMA ADAPTIVE BATCH SCHEDULER & PERFORMANCE OPTIMIZATIONS
@@ -4897,16 +4897,55 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- COIN FARMING SYSTEM
+-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
+-- Gestor de monedas (cache incremental por eventos) + selector de objetivos
+-- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
 -- ====================================================================
 
+-- Limpieza de una ejecucion anterior (re-ejecucion del script)
+if _G.Celestial.CoinEngine and _G.Celestial.CoinEngine.Destroy then
+	pcall(_G.Celestial.CoinEngine.Destroy)
+end
+if _G.Celestial.CoinDescendantConnection then
+	pcall(function() _G.Celestial.CoinDescendantConnection:Disconnect() end)
+	_G.Celestial.CoinDescendantConnection = nil
+end
+if _G.Celestial.CoinFarmLoopThread then
+	pcall(function() task.cancel(_G.Celestial.CoinFarmLoopThread) end)
+	_G.Celestial.CoinFarmLoopThread = nil
+end
+
 local CoinEngine = {
-	Running = false, CurrentTarget = nil, TargetQueue = {}, CurrentTween = nil,
-	CoinCache = {}, CoinConnections = {}, LastFullScan = 0, FullScanInterval = 1.5,
-	LastTargetScan = 0, TargetScanInterval = 0.018, MaxDistance = 600,
-	PickupDistance = 3.4, ScanDebounce = {},
+	Active = false,            -- conexiones de eventos abiertas
+	CoinCache = {},            -- [coin] = true (monedas validas conocidas)
+	CoinCount = 0,
+	Blacklist = {},            -- [coin] = os.clock() hasta el que se ignora
+	Attempts = {},             -- [coin] = intentos de recogida
+	CurrentTarget = nil,
+	NextTarget = nil,          -- precalculado mientras se viaja al actual
+	MaxDistance = 600,
+	PickupDistance = 3.4,
+	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
+	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
+	StuckBlacklist = 5,
+	SwitchRatio = 0.5,         -- solo cambia de objetivo si el nuevo esta a < 50% de distancia
+	Controller = nil,          -- unica conexion Heartbeat autorizada a mover al personaje
+	AddedConnection = nil,
+	RemovingConnection = nil,
 }
 _G.Celestial.CoinEngine = CoinEngine
+
+local lastRoot = nil
+local lastContainer = nil
+local bestDist = math.huge
+local lastProgress = 0
+local noTargetUntil = 0
+local nextPrepareAt = 0
+local nextHousekeeping = 0
+local nextRescanAt = 0
+local rescanBackoff = 1.0
+local nextImproveCheck = 0
+local errorStreak = 0
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
@@ -4923,190 +4962,324 @@ local function IsValidCoin(obj)
 	return not (s.X > 10 or s.Y > 10 or s.Z > 10)
 end
 
+-- ---------------------------------------------------------------
+-- GESTOR DE MONEDAS (cache incremental)
+-- ---------------------------------------------------------------
+
 local function RegisterCoin(coin)
-	if not IsValidCoin(coin) or CoinEngine.CoinCache[coin] then return end
+	if CoinEngine.CoinCache[coin] or not IsValidCoin(coin) then return end
 	CoinEngine.CoinCache[coin] = true
-	local connection
-	connection = coin.AncestryChanged:Connect(function(_, parent)
-		if not parent then
-			CoinEngine.CoinCache[coin] = nil
-			if connection then connection:Disconnect() end
-			CoinEngine.CoinConnections[coin] = nil
-			if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
-		end
-	end)
-	CoinEngine.CoinConnections[coin] = connection
+	CoinEngine.CoinCount += 1
+	noTargetUntil = 0   -- despierta al controlador si estaba esperando monedas
+	nextPrepareAt = 0
 end
 
 local function UnregisterCoin(coin)
-	CoinEngine.CoinCache[coin] = nil
-	local connection = CoinEngine.CoinConnections[coin]
-	if connection then connection:Disconnect() end
-	CoinEngine.CoinConnections[coin] = nil
+	if CoinEngine.CoinCache[coin] then
+		CoinEngine.CoinCache[coin] = nil
+		CoinEngine.CoinCount -= 1
+	end
+	CoinEngine.Blacklist[coin] = nil
+	CoinEngine.Attempts[coin] = nil
 	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
+	if CoinEngine.NextTarget == coin then CoinEngine.NextTarget = nil end
 end
 
+local function FindCoinContainer()
+	return Workspace:FindFirstChild("CoinContainer")
+end
+
+-- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
 local function ScanContainer(container)
-	if not container then return end
+	if not container then return 0 end
+	local found = 0
 	for _, obj in ipairs(container:GetDescendants()) do
-		if IsValidCoin(obj) then RegisterCoin(obj) end
-	end
-end
-
-local function FullCoinScan()
-	local now = tick()
-	if now - CoinEngine.LastFullScan < CoinEngine.FullScanInterval then return end
-	CoinEngine.LastFullScan = now
-	local preferredContainers = {Workspace:FindFirstChild("CoinContainer"), Workspace:FindFirstChild("Map"), Workspace:FindFirstChild("Normal"), Workspace:FindFirstChild("Round")}
-	local scanned, foundAny = {}, false
-	for _, container in ipairs(preferredContainers) do
-		if container and not scanned[container] then scanned[container] = true; ScanContainer(container); foundAny = true end
-	end
-	if not foundAny and next(CoinEngine.CoinCache) == nil then ScanContainer(Workspace) end
-end
-
-local descendantConnection
-local function StartCoinDetection()
-	if descendantConnection then descendantConnection:Disconnect() end
-	descendantConnection = Workspace.DescendantAdded:Connect(function(obj)
-		if obj:IsA("BasePart") and CoinNameMatches(obj) then
-			task.defer(function() if IsValidCoin(obj) then RegisterCoin(obj) end end)
+		if obj:IsA("BasePart") and IsValidCoin(obj) and not CoinEngine.CoinCache[obj] then
+			RegisterCoin(obj)
+			found += 1
 		end
-	end)
-	_G.Celestial.CoinDescendantConnection = descendantConnection
-end
-
-local function CleanupCoinCache()
-	for coin in pairs(CoinEngine.CoinCache) do
-		if not IsValidCoin(coin) then UnregisterCoin(coin) end
 	end
+	return found
 end
 
-local function GetNearestCoins(root, maxTargets)
-	if not root then return {} end
-	maxTargets = maxTargets or 2
-	local pos, nearest = root.Position, {}
-	for coin in pairs(CoinEngine.CoinCache) do
-		if IsValidCoin(coin) then
-			local d = (pos - coin.Position).Magnitude
-			if d <= CoinEngine.MaxDistance then
-				local e = {Coin=coin, Distance=d}
-				local inserted = false
-				for i = 1, #nearest do
-					if d < nearest[i].Distance then table.insert(nearest, i, e); inserted = true; break end
-				end
-				if not inserted then nearest[#nearest + 1] = e end
-				while #nearest > maxTargets do table.remove(nearest) end
-			end
-		else UnregisterCoin(coin) end
-	end
-	local result = {}
-	for i = 1, math.min(maxTargets, #nearest) do result[i] = nearest[i].Coin end
-	return result
-end
-
-local function QueueTwoNearestCoins(root)
-	CoinEngine.TargetQueue = {}
-	for _, coin in ipairs(GetNearestCoins(root, 2)) do
-		if IsValidCoin(coin) then CoinEngine.TargetQueue[#CoinEngine.TargetQueue + 1] = coin end
-	end
-	return #CoinEngine.TargetQueue
-end
-
-local function CancelCoinTween(clearQueue)
-	if CoinEngine.CurrentTween then pcall(function() CoinEngine.CurrentTween:Cancel() end); CoinEngine.CurrentTween = nil end
-	CoinEngine.CurrentTarget = nil
-	if clearQueue then CoinEngine.TargetQueue = {} end
-end
-
-local function TryCollectCoin(root, coin)
-	if not root or not root.Parent or not IsValidCoin(coin) then return false end
-	if (root.Position - coin.Position).Magnitude > CoinEngine.PickupDistance then return false end
-	if firetouchinterest then
-		pcall(function() firetouchinterest(root, coin, 0) end)
-		task.wait()
-		pcall(function() firetouchinterest(root, coin, 1) end)
+local function RescanCoins()
+	local container = FindCoinContainer()
+	local found = 0
+	if container then
+		found = ScanContainer(container)
 	else
-		pcall(function() root.CFrame = CFrame.new(coin.Position) end)
-	end
-	pcall(function()
-		local v = SafeVector(root.AssemblyLinearVelocity)
-		if math.abs(v.Y) < 18 then root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z) end
-	end)
-	return true
-end
-
-local function MoveToCoin(root, hum, coin)
-	if not root or not hum or hum.Health <= 0 or not IsValidCoin(coin) then return false end
-	CoinEngine.CurrentTarget = coin
-	local speed = math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100)
-	local distance = (root.Position - coin.Position).Magnitude
-	if distance > CoinEngine.MaxDistance then return false end
-	if distance <= CoinEngine.PickupDistance then return TryCollectCoin(root, coin) end
-	local travelTime = math.clamp(distance / speed, 0.035, 8)
-	local targetCFrame = CFrame.new(coin.Position)
-	CancelCoinTween(false)
-	CoinEngine.CurrentTarget = coin
-	local tween = TweenService:Create(root, TweenInfo.new(travelTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), {CFrame = targetCFrame})
-	CoinEngine.CurrentTween = tween
-	tween:Play()
-	local startTime = tick()
-	while tween.PlaybackState == Enum.PlaybackState.Playing do
-		if not State.FarmEnabled or not root.Parent or not hum.Parent or hum.Health <= 0 or not IsValidCoin(coin) or tick() - startTime > travelTime + 1 then
-			tween:Cancel()
-			CoinEngine.CurrentTween = nil
-			return false
+		for _, name in ipairs({"Map", "Normal", "Round"}) do
+			local c = Workspace:FindFirstChild(name)
+			if c then found += ScanContainer(c) end
 		end
-		task.wait()
+		if found == 0 and CoinEngine.CoinCount == 0 then
+			found = ScanContainer(Workspace)
+		end
 	end
-	CoinEngine.CurrentTween = nil
-	if not State.FarmEnabled then return false end
-	if not IsValidCoin(coin) then return true end
-	TryCollectCoin(root, coin)
-	task.wait()
-	if not IsValidCoin(coin) then UnregisterCoin(coin); return true end
-	return true
+	lastContainer = container
+	if found > 0 then rescanBackoff = 1.0 else rescanBackoff = math.min(rescanBackoff * 1.5, 4) end
+	nextRescanAt = os.clock() + rescanBackoff
+	return found
 end
 
-local function CoinFarmLoop()
-	while true do
-		task.wait(CoinEngine.TargetScanInterval)
-		if not State.FarmEnabled then CancelCoinTween(true); continue end
-		pcall(function()
-			local root, hum = GetRoot(), GetHumanoid()
-			if not root or not hum or hum.Health <= 0 then CancelCoinTween(true); return end
-			FullCoinScan()
-			local now = tick()
-			if now - CoinEngine.LastTargetScan >= 0.25 then
-				CleanupCoinCache()
-				CoinEngine.LastTargetScan = now
-			end
-			if #CoinEngine.TargetQueue == 0 and not CoinEngine.CurrentTarget then
-				QueueTwoNearestCoins(root)
-			end
-			local target = table.remove(CoinEngine.TargetQueue, 1)
-			if target and IsValidCoin(target) then MoveToCoin(root, hum, target) end
+local function OnDescendantAdded(obj)
+	if obj:IsA("BasePart") and CoinNameMatches(obj) then
+		task.defer(function()
+			if CoinEngine.Active and IsValidCoin(obj) then RegisterCoin(obj) end
 		end)
 	end
 end
 
-StartCoinDetection()
-task.defer(function() pcall(function() CoinEngine.LastFullScan = 0; FullCoinScan() end) end)
-if _G.Celestial.CoinFarmLoopThread then pcall(function() task.cancel(_G.Celestial.CoinFarmLoopThread) end) end
-_G.Celestial.CoinFarmLoopThread = task.spawn(CoinFarmLoop)
-_G.Celestial.ConnectionFarm = _G.Celestial.CoinFarmLoopThread
+local function OnDescendantRemoving(obj)
+	if CoinEngine.CoinCache[obj] then UnregisterCoin(obj) end
+end
+
+local function ResetPath()
+	CoinEngine.CurrentTarget = nil
+	CoinEngine.NextTarget = nil
+	bestDist = math.huge
+	noTargetUntil = 0
+end
+
+local function Activate()
+	if CoinEngine.Active then return end
+	CoinEngine.Active = true
+	CoinEngine.AddedConnection = Workspace.DescendantAdded:Connect(OnDescendantAdded)
+	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
+	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
+	rescanBackoff = 1.0
+	ResetPath()
+	RescanCoins()
+end
+
+local function Deactivate()
+	CoinEngine.Active = false
+	if CoinEngine.AddedConnection then CoinEngine.AddedConnection:Disconnect(); CoinEngine.AddedConnection = nil end
+	if CoinEngine.RemovingConnection then CoinEngine.RemovingConnection:Disconnect(); CoinEngine.RemovingConnection = nil end
+	_G.Celestial.CoinDescendantConnection = nil
+	table.clear(CoinEngine.CoinCache)
+	table.clear(CoinEngine.Blacklist)
+	table.clear(CoinEngine.Attempts)
+	CoinEngine.CoinCount = 0
+	ResetPath()
+	lastRoot = nil
+	lastContainer = nil
+end
+
+-- ---------------------------------------------------------------
+-- SELECTOR DE OBJETIVOS
+-- ---------------------------------------------------------------
+
+local function IsAvailable(coin, now)
+	if not coin or not CoinEngine.CoinCache[coin] or not coin.Parent then return false end
+	local bl = CoinEngine.Blacklist[coin]
+	if bl then
+		if bl > now then return false end
+		CoinEngine.Blacklist[coin] = nil
+	end
+	return true
+end
+
+-- Una sola pasada O(N): la moneda disponible mas cercana a "fromPos".
+local function PickNearest(fromPos, exclude, now)
+	local best, bestD = nil, CoinEngine.MaxDistance
+	for coin in pairs(CoinEngine.CoinCache) do
+		if coin ~= exclude then
+			if not coin.Parent then
+				UnregisterCoin(coin)
+			else
+				local bl = CoinEngine.Blacklist[coin]
+				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
+				if not bl then
+					local d = (coin.Position - fromPos).Magnitude
+					if d <= bestD then best, bestD = coin, d end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- El siguiente objetivo se elige desde la posicion del ACTUAL (no desde el jugador),
+-- lo que reduce el recorrido total y deja la transicion lista antes de llegar.
+local function PrepareNext(now)
+	local cur = CoinEngine.CurrentTarget
+	if not cur or not cur.Parent then CoinEngine.NextTarget = nil; return end
+	local nxt = PickNearest(cur.Position, cur, now)
+	CoinEngine.NextTarget = nxt
+	nextPrepareAt = nxt and math.huge or (now + 0.25)
+end
+
+local function SetCurrent(coin, now)
+	CoinEngine.CurrentTarget = coin
+	CoinEngine.NextTarget = nil
+	bestDist = math.huge
+	lastProgress = now
+	if coin then nextPrepareAt = 0; PrepareNext(now) end
+end
+
+local function AdvanceTarget(root, now)
+	local nxt = CoinEngine.NextTarget
+	if nxt and IsAvailable(nxt, now) and (nxt.Position - root.Position).Magnitude <= CoinEngine.MaxDistance then
+		SetCurrent(nxt, now)
+		return
+	end
+	local c = PickNearest(root.Position, nil, now)
+	if c then
+		SetCurrent(c, now)
+	else
+		CoinEngine.CurrentTarget = nil
+		CoinEngine.NextTarget = nil
+		noTargetUntil = now + 0.15
+	end
+end
+
+local function CollectCoin(root, coin, now)
+	CoinEngine.Blacklist[coin] = now + CoinEngine.CollectCooldown
+	local n = (CoinEngine.Attempts[coin] or 0) + 1
+	CoinEngine.Attempts[coin] = n
+	if n >= 3 then CoinEngine.Blacklist[coin] = now + 8 end
+	if firetouchinterest then
+		pcall(function()
+			firetouchinterest(root, coin, 0)
+			firetouchinterest(root, coin, 1)
+		end)
+	else
+		pcall(function() root.CFrame = CFrame.new(coin.Position) end)
+	end
+	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
+end
+
+-- ---------------------------------------------------------------
+-- CONTROLADOR DE MOVIMIENTO (unico, Heartbeat, sin esperas)
+-- ---------------------------------------------------------------
+
+local function ControllerStep(dt)
+	if not State.FarmEnabled then
+		if CoinEngine.Active then Deactivate() end
+		return
+	end
+	if not CoinEngine.Active then Activate() end
+
+	local now = os.clock()
+	local root, hum = GetRoot(), GetHumanoid()
+	if not root or not hum or hum.Health <= 0 then
+		if lastRoot then lastRoot = nil; ResetPath() end
+		return
+	end
+	if root ~= lastRoot then lastRoot = root; ResetPath() end   -- reaparicion / cambio de personaje
+
+	-- Mantenimiento barato (2 veces por segundo)
+	if now >= nextHousekeeping then
+		nextHousekeeping = now + 0.5
+		if FindCoinContainer() ~= lastContainer then
+			rescanBackoff = 1.0
+			RescanCoins()                                   -- nueva ronda / nuevo mapa
+		elseif CoinEngine.CoinCount == 0 and now >= nextRescanAt then
+			RescanCoins()                                   -- red de seguridad con backoff
+		end
+	end
+
+	if CoinEngine.CoinCount == 0 then return end            -- espera sin coste hasta que un evento registre monedas
+	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
+
+	if not CoinEngine.CurrentTarget or not IsAvailable(CoinEngine.CurrentTarget, now) then
+		AdvanceTarget(root, now)
+		if not CoinEngine.CurrentTarget then return end
+	end
+
+	-- Preparar el siguiente objetivo mientras se viaja al actual
+	if not CoinEngine.NextTarget and now >= nextPrepareAt then PrepareNext(now) end
+
+	-- Mejora de objetivo con histéresis (evita oscilar por pequeñas diferencias)
+	if now >= nextImproveCheck then
+		nextImproveCheck = now + 0.35
+		local cur = CoinEngine.CurrentTarget
+		local cand = PickNearest(root.Position, nil, now)
+		if cand and cand ~= cur then
+			local dc = (cur.Position - root.Position).Magnitude
+			local dn = (cand.Position - root.Position).Magnitude
+			if dn < dc * CoinEngine.SwitchRatio then SetCurrent(cand, now) end
+		end
+	end
+
+	local speed = math.clamp(tonumber(State.TweenSpeed) or 95, 10, 100)
+	local budget = speed * math.min(dt, 0.1)
+	local pos = root.Position
+	local moved = false
+	local transitions = 0
+
+	while budget > 0 and transitions < 6 do
+		local target = CoinEngine.CurrentTarget
+		if not target or not IsAvailable(target, now) then
+			AdvanceTarget(root, now)
+			target = CoinEngine.CurrentTarget
+			if not target then break end
+		end
+		local delta = target.Position - pos
+		local dist = delta.Magnitude
+		local toPickup = dist - CoinEngine.PickupDistance
+		if toPickup <= 0 then
+			CollectCoin(root, target, now)
+			transitions += 1
+		elseif budget >= toPickup then
+			pos = pos + delta.Unit * toPickup
+			budget -= toPickup
+			moved = true
+			CollectCoin(root, target, now)             -- recoge y encadena al siguiente en el MISMO frame
+			transitions += 1
+		else
+			pos = pos + delta.Unit * budget
+			budget = 0
+			moved = true
+		end
+	end
+
+	if moved then
+		root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+
+	-- Personaje bloqueado: sin progreso hacia el objetivo -> descartarlo temporalmente
+	local cur = CoinEngine.CurrentTarget
+	if cur then
+		local d = (cur.Position - pos).Magnitude
+		if d < bestDist - 0.5 then
+			bestDist = d
+			lastProgress = now
+		elseif now - lastProgress > CoinEngine.StuckTimeout then
+			CoinEngine.Blacklist[cur] = now + CoinEngine.StuckBlacklist
+			SetCurrent(nil, now)
+		end
+	end
+end
+
+local function SafeControllerStep(dt)
+	local ok = pcall(ControllerStep, dt)
+	if ok then
+		errorStreak = 0
+	else
+		errorStreak += 1
+		ResetPath()
+		noTargetUntil = os.clock() + math.min(0.25 * errorStreak, 2)
+	end
+end
+
+CoinEngine.Destroy = function()
+	local controller = CoinEngine.Controller
+	CoinEngine.Controller = nil
+	if controller then controller:Disconnect() end
+	if _G.Celestial.ConnectionFarm == controller then _G.Celestial.ConnectionFarm = nil end
+	Deactivate()
+end
+
+-- Un unico controlador: la conexion anterior (si existia) ya fue destruida arriba.
+CoinEngine.Controller = RunService.Heartbeat:Connect(SafeControllerStep)
+_G.Celestial.ConnectionFarm = CoinEngine.Controller
 
 _G.Celestial.StopCoinEngine = function()
 	State.FarmEnabled = false
-	CancelCoinTween(true)
-	for coin, connection in pairs(CoinEngine.CoinConnections) do
-		if connection then connection:Disconnect() end
-		CoinEngine.CoinConnections[coin] = nil
-		CoinEngine.CoinCache[coin] = nil
-	end
-	if descendantConnection then descendantConnection:Disconnect(); descendantConnection = nil end
-	CoinEngine.CurrentTarget = nil
-	CoinEngine.TargetQueue = {}
+	CoinEngine.Destroy()
 end
 
 -- ====================================================================
