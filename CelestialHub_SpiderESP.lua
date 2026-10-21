@@ -5381,17 +5381,18 @@ local nextLogPingAt = 0
 local HIRES_N = 360
 local hiRes, hiResHead, hiResCount = {}, 0, 0
 local hiTag = nil          -- marca para el frame actual (p. ej. "COLLECT d=2.1 ...")
+local lastLogMs = 0        -- coste (ms) de la llamada a LogStep del frame anterior
 
-local function HiResPush(now, dt)
+local function HiResPush(now, dt, csMs)
 	local root = GetRoot()
 	if not root then return end
 	local p, v = root.Position, root.AssemblyLinearVelocity
 	local tgt = CoinEngine.CurrentTarget
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f coins=%d%s",
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f cs=%.1fms ls=%.1fms coins=%d%s",
 		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, currentSpeed,
-		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, coinsCollectedTotal,
+		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, csMs or -1, lastLogMs, coinsCollectedTotal,
 		hiTag and (" <" .. hiTag .. ">") or "")
 	hiResCount = math.min(hiResCount + 1, HIRES_N)
 	hiTag = nil
@@ -5928,10 +5929,16 @@ end
 local function SafeControllerStep(dt)
 	velApplied = false
 	if dt and dt > 0 then lastFrameDt = dt end
+	local csT0 = os.clock()
 	local ok = pcall(ControllerStep, dt)
+	local csMs = (os.clock() - csT0) * 1000     -- coste real de ControllerStep en este frame (diagnostico de tirones)
 	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
-	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt) end
-	if State.FarmEnabled then pcall(LogStep, os.clock(), dt, false) end
+	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt, csMs) end
+	if State.FarmEnabled then
+		local lsT0 = os.clock()
+		pcall(LogStep, os.clock(), dt, false)
+		lastLogMs = (os.clock() - lsT0) * 1000
+	end
 	if ok then
 		errorStreak = 0
 	else
