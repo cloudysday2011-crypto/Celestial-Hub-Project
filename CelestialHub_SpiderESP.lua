@@ -4179,21 +4179,26 @@ local function SpiderFindBotCandidate()
 end
 
 local function SpiderResolveWorldItem(instance)
-	-- Only mark a real item container whose own name matches a known alias.
-	-- Do not inherit an item's name from arbitrary ancestors: that was allowing
-	-- unrelated map geometry (and distant Workspace descendants) to be ESP'd.
+	-- Resolve to an actual pickup container. Descendant parts may be named
+	-- Handle/Part, so walk upward to a known Tool/Model alias, but never promote
+	-- an arbitrary BasePart or a Workspace/map ancestor into an item.
 	if not instance or instance == Workspace or not instance:IsDescendantOf(Workspace) then
 		return nil, nil
 	end
 	local node = instance
 	while node and node ~= Workspace do
 		local kind = SpiderClassifyItemName(node.Name)
-		if kind then
-			if node:IsA("Tool") or node:IsA("Model") then
+		if kind and (node:IsA("Tool") or node:IsA("Model")) then
+			if not SpiderIsPlayerCharacterDescendant(node) then
 				return node, kind
 			end
-			-- A BasePart is accepted only when its own name is a known item alias.
-			if node:IsA("BasePart") then return node, kind end
+		end
+		-- Directly named loose parts are allowed only if they have a pickup-like
+		-- name, a physical parent container, and are not part of a player rig.
+		if kind and node:IsA("BasePart") and node == instance
+			and node.Parent and (node.Parent:IsA("Model") or node.Parent:IsA("Folder"))
+			and not SpiderIsPlayerCharacterDescendant(node) then
+			return node, kind
 		end
 		node = node.Parent
 	end
@@ -4203,9 +4208,17 @@ end
 local function SpiderIsAvailableWorldItem(target)
 	if not target or not target.Parent or not target:IsDescendantOf(Workspace) then return false end
 	if SpiderIsPlayerCharacterDescendant(target) then return false end
-	-- Reject Workspace's generic map containers unless the object itself has a
-	-- known item name. This prevents broad ancestor matches from highlighting map parts.
-	return SpiderClassifyItemName(target.Name) ~= nil
+	-- Only pickup containers or explicitly named loose pickup parts are valid.
+	local kind = SpiderClassifyItemName(target.Name)
+	if not kind then return false end
+	if target:IsA("Tool") then return true end
+	if target:IsA("Model") then
+		return SpiderModelRoot(target) ~= nil
+	end
+	if target:IsA("BasePart") then
+		return target.Parent ~= Workspace and (target.Parent:IsA("Model") or target.Parent:IsA("Folder"))
+	end
+	return false
 end
 
 local function SpiderClearItemVisual(target)
@@ -4491,7 +4504,11 @@ local function SpiderStart()
 				stack[#stack] = nil
 				if obj and obj.Parent then
 					local normalized = SpiderNormalizeName(obj.Name)
-					if SpiderClassifyItemName(obj.Name) then SpiderRegisterWorldItem(obj) end
+					if SpiderClassifyItemName(obj.Name) then SpiderRegisterWorldItem(obj)
+					else
+						local resolved, resolvedKind = SpiderResolveWorldItem(obj)
+						if resolved and resolvedKind then SpiderRegisterWorldItem(obj) end
+					end
 					if obj:IsA("Model") or normalized == "inventory" or normalized == "backpack"
 						or normalized == "playerinventory" or normalized == "spiderinventory"
 						or normalized:find("spider", 1, true) or normalized:find("infected", 1, true) then
@@ -4524,7 +4541,8 @@ local function SpiderStart()
 		task.defer(function()
 			if not SpiderESPActive or _G.Celestial.GameMode ~= "SPIDER" then return end
 			local normalized = SpiderNormalizeName(obj.Name)
-			if SpiderClassifyItemName(obj.Name) then
+			local resolvedItem, resolvedKind = SpiderResolveWorldItem(obj)
+			if resolvedItem and resolvedKind then
 				SpiderRegisterWorldItem(obj)
 				return
 			end
