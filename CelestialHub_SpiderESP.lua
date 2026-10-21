@@ -5370,10 +5370,15 @@ local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
 local SOLID_OVERLAP_CONFIRM_TIME = 0.60
+-- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
+-- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
+local lastFrameDt = 1 / 60
+local nextLogPingAt = 0
 
 local function LogEvent(tag)
 	if logFinalized then return end
-	if #pendingEvents < 8 then pendingEvents[#pendingEvents + 1] = tostring(tag) end
+	if #pendingEvents >= 8 then table.remove(pendingEvents, 1) end   -- conserva los eventos MAS recientes
+	pendingEvents[#pendingEvents + 1] = tostring(tag)
 end
 
 local function FlushLog(reason, forceOverwrite)
@@ -5403,17 +5408,27 @@ local function LogStep(now, dt, force)
 	local tgt = CoinEngine.CurrentTarget
 	local sampleDt = lastLogAt and math.max(now - lastLogAt, 0) or 0
 	local sampleDelta = lastLogPos and (p - lastLogPos).Magnitude or -1
-	local sampleSpeed = (sampleDelta >= 0 and sampleDt > 0.001) and (sampleDelta / sampleDt) or -1
+	-- Si el intervalo es muy corto (muestra forzada justo despues de otra), la division amplifica el
+	-- ruido y el valor no es comparable: se marca con -1 en vez de reportar un numero engañoso.
+	local sampleSpeed = (sampleDelta >= 0 and sampleDt >= 0.10) and (sampleDelta / sampleDt) or -1
 	local physicalVelocity = root.AssemblyLinearVelocity
 	local physicalSpeed = physicalVelocity.Magnitude
+	-- Ping: antes solo se refrescaba al llegar a una moneda (GetSettleTime) y podia quedar viejo/80 por defecto.
+	if now >= nextLogPingAt then
+		nextLogPingAt = now + 0.5
+		pcall(function()
+			cachedPingMs = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+	end
+	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f ev=%s",
-		now, p.X, p.Y, p.Z,
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f ev=%s",
+		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
 		currentSpeed,
 		tgt and (tgt.Position - p).Magnitude or -1,
-		dt > 0 and 1 / dt or 0, cachedPingMs,
+		1 / frameDt, frameDt * 1000, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
 		hum and tostring(hum.PlatformStand) or "?",
 		tostring(noclipOn), tostring(IsInsideSolid(p)),
@@ -5864,6 +5879,7 @@ end
 
 local function SafeControllerStep(dt)
 	velApplied = false
+	if dt and dt > 0 then lastFrameDt = dt end
 	local ok = pcall(ControllerStep, dt)
 	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
 	if State.FarmEnabled then pcall(LogStep, os.clock(), dt, false) end
