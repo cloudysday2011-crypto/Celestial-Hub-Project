@@ -5025,6 +5025,8 @@ local CoinEngine = {
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
+	ChaseFix = true,             -- V3.2: compensa monedas que se mueven (sin esto, con gain 8 queda a ~3.7 > PickupDistance y nunca recoge). false = V3.1
+	ChaseMaxLead = 30,           -- V3.2: tope (studs/s) de la velocidad extra que se suma por mover la moneda
 	-- ===== PRUEBAS A/B (poner en false para volver al comportamiento anterior) =====
 	SoftBrake = true,            -- frenada progresiva: no pasar de 45 a 0 studs/s en un solo frame al llegar a la moneda
 	SoftBrakeGain = 8,           -- ganancia de frenado al acercarse con SoftBrake (menor = frena desde mas lejos)
@@ -5411,9 +5413,9 @@ local function HiResPush(now, dt, csMs)
 	local tgt = CoinEngine.CurrentTarget
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
 		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, currentSpeed,
-		tgt and (tgt.Position - p).Magnitude or -1, cachedPingMs, csMs or -1, lastLogMs,
+		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
 		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
 		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
 		coinsCollectedTotal,
@@ -5891,6 +5893,18 @@ local function ControllerStep(dt)
 		return
 	end
 
+	-- V3.2: velocidad estimada del objetivo (posicion entre frames, suavizada)
+	local tt = CoinEngine.TargetTrack
+	if not tt then tt = {vel = Vector3.zero, at = 0}; CoinEngine.TargetTrack = tt end
+	if tt.obj ~= target then
+		tt.obj, tt.pos, tt.at, tt.vel = target, target.Position, now, Vector3.zero
+	elseif now - tt.at >= 0.05 then
+		local rawV = (target.Position - tt.pos) / (now - tt.at)
+		tt.vel = tt.vel:Lerp(rawV, 0.5)
+		tt.pos, tt.at = target.Position, now
+	end
+	CoinEngine.LastTargetVel = tt.vel.Magnitude
+
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
 	if dist <= pickupDistance then
 		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
@@ -5946,6 +5960,10 @@ local function ControllerStep(dt)
 		local gain = Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain)
 		if CoinEngine.SoftBrake then gain = math.min(gain, CoinEngine.SoftBrakeGain) end
 		local v = math.min(currentSpeed, math.max(remaining, 0) * gain)
+		if CoinEngine.ChaseFix then
+			local lead = math.clamp(tt.vel:Dot(dir), 0, CoinEngine.ChaseMaxLead)
+			if lead > 0 then v = math.min(currentSpeed, v + lead) end
+		end
 		lastFlightV = v
 		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		if v == v and flightVel then
