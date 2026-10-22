@@ -34,6 +34,10 @@ pcall(function()
 	local previous = readfile("CelestialFarmResetLog.txt")
 	if type(previous) ~= "string" or previous == "" then return end
 	if not previous:find("CH-RESET-INCIDENT:", 1, true) then return end
+	-- V3.4/V3.5 could mislabel a natural round-end/lobby transition as a game reset.
+	-- Never recover those older ambiguous records as a Reset Log.
+	if previous:find("GAME_OR_ROUND_RESET_SUSPECTED", 1, true)
+		or previous:find("NORMAL_ROUND_TRANSITION", 1, true) then return end
 	local consumed = ""
 	if type(isfile) ~= "function" or isfile("CelestialFarmResetLogConsumed.txt") then
 		pcall(function() consumed = readfile("CelestialFarmResetLogConsumed.txt") or "" end)
@@ -5713,7 +5717,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		pcall(writefile, "CelestialFarmDiagnostics.txt", table.concat(parts, "\n"))
 		local resetKind = tostring(tag):match("RESET%-CLASSIFICATION kind=([%w_%-]+)")
 		local noDeathEvidence = tostring(tag):find("source=NO_DEATH", 1, true) ~= nil
-		if noDeathEvidence and (resetKind == "GAME_OR_ROUND_RESET_SUSPECTED" or resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM") then
+		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
 				"classification=" .. resetKind,
@@ -5909,8 +5913,8 @@ ResetDiag.ClassifyDeath = function(character, humanoid)
 		-- over guessing that a murderer or sheriff caused the death.
 		local roundUi = ResetDiag.ReadRoundUiEvidence()
 		if roundUi and not roleSnapshot.round then
-			classification, confidence = "GAME_OR_ROUND_RESET_SUSPECTED", "MEDIUM"
-			evidence = "Humanoid.Died without attacker source; round-ui=" .. roundUi
+			classification, confidence = "NORMAL_ROUND_TRANSITION", "HIGH"
+			evidence = "Humanoid.Died during normal round/lobby transition; round-ui=" .. roundUi
 		-- Role-based causes are explicitly marked as hypotheses, never as confirmed attribution.
 		elseif roleSnapshot.localRole == "MURDERER" and roleSnapshot.sheriff ~= "" then
 			classification, confidence = "POSSIBLE_SHERIFF_SHOT_UNCONFIRMED", "LOW"
@@ -5938,13 +5942,77 @@ ResetDiag.ClassifyDeath = function(character, humanoid)
 			.. " speed=" .. tostring(roleSnapshot.speed), character)
 end
 
+ResetDiag.HasAssignedPlayerWeapon = function()
+	-- A weapon is positive evidence of an active round, but its absence is NOT proof
+	-- of the lobby: players also have no role tools while the round is being assigned.
+	for _, player in ipairs(Players:GetPlayers()) do
+		local knife, gun = CheckPlayerInventory(player)
+		if knife or gun then return true end
+	end
+	return false
+end
+
+ResetDiag.DetectWorldPhase = function()
+	-- Prefer the local character's actual position inside named lobby/map roots.
+	-- Workspace may contain both assets, so mere existence of a Lobby object is not enough.
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local lobbyNames = {"Lobby", "Lobby3D", "LobbyArea", "MainLobby", "LobbyMap", "LobbySpawn", "WaitingRoom"}
+	local mapNames = {"Map", "Normal", "Round", "Arena", "DuelArena", "DuelsMap"}
+	if root then
+		for _, name in ipairs(lobbyNames) do
+			local zone = Workspace:FindFirstChild(name, true)
+			if zone and root:IsDescendantOf(zone) then return "LOBBY", "character-inside:" .. name end
+		end
+		for _, name in ipairs(mapNames) do
+			local zone = Workspace:FindFirstChild(name)
+			if zone and root:IsDescendantOf(zone) then return "MAP", "character-inside:" .. name end
+		end
+	end
+	-- Fallback signals: map container + active-round evidence; never infer lobby solely
+	-- from missing weapons because that also happens before roles are assigned.
+	local hasWeapons = ResetDiag.HasAssignedPlayerWeapon()
+	local mapContainer = Workspace:FindFirstChild("CoinContainer")
+	if roundActive or hasWeapons or (mapContainer and #mapContainer:GetChildren() > 0) then
+		return "MAP", "round-or-map-evidence"
+	end
+	local roundUi = ResetDiag.ReadRoundUiEvidence()
+	if roundUi then return "LOBBY", "round-ui:" .. roundUi end
+	for _, name in ipairs(lobbyNames) do
+		if Workspace:FindFirstChild(name, true) then return "LOBBY", "lobby-root-present-without-map-evidence:" .. name end
+	end
+	return "UNKNOWN", "no reliable lobby/map signal"
+end
+
+ResetDiag.IsNaturalRoundTransition = function(removal)
+	local roundUi = ResetDiag.ReadRoundUiEvidence()
+	if roundUi then return true, "round-end/lobby UI: " .. roundUi end
+	local phase, phaseEvidence = ResetDiag.DetectWorldPhase()
+	if phase == "LOBBY" then
+		return true, "world-phase=LOBBY; " .. tostring(phaseEvidence)
+	end
+	local hasWeapons = ResetDiag.HasAssignedPlayerWeapon()
+	if phase == "MAP" and hasWeapons and roundActive then
+		return false, "world-phase=MAP; active-round-and-role-weapon-evidence"
+	end
+	-- If phase cannot be established, don't create a Reset Log from ambiguous evidence.
+	-- No weapons alone is never sufficient to call an event a normal transition.
+	if phase == "UNKNOWN" or not hasWeapons then
+		return true, "world-phase=" .. tostring(phase) .. "; ambiguous/no role-weapon evidence; suppress Reset Log"
+	end
+	if removal and removal.RoundActive == false and roundActive == false and phase ~= "MAP" then
+		return true, "CH round detector idle outside confirmed map"
+	end
+	return false, nil
+end
+
 ResetDiag.ClassifyNoDeathReset = function(removal, newCharacter)
 	if not removal or removal.DeathObserved then return end
-	local roundUi = ResetDiag.ReadRoundUiEvidence()
+	local naturalRound, naturalEvidence = ResetDiag.IsNaturalRoundTransition(removal)
 	local classification, confidence, evidence
-	if roundUi then
-		classification, confidence = "GAME_OR_ROUND_RESET_SUSPECTED", "MEDIUM"
-		evidence = "character-removed-without-Died;round-ui=" .. roundUi
+	if naturalRound then
+		classification, confidence = "NORMAL_ROUND_TRANSITION", "HIGH"
+		evidence = naturalEvidence
 	elseif removal.Health and removal.Health > 0 and removal.FarmEnabled and removal.Noclip
 		and (tonumber(removal.Speed) or -1) >= 49.5 then
 		-- Stronger operational signature for the reported speed-50 failure. This is still
@@ -5981,7 +6049,8 @@ ResetDiag.Explain = function(classification)
 		POSSIBLE_SHERIFF_SHOT_UNCONFIRMED = "Posible disparo del Sheriff: inferido por los roles, no confirmado directamente.",
 		POSSIBLE_MURDERER_KILL_UNCONFIRMED = "Posible asesinato del Murderer: inferido por los roles, no confirmado directamente.",
 		DEATH_CAUSE_UNKNOWN = "Se observó una muerte normal, pero no se encontró quién la causó.",
-		GAME_OR_ROUND_RESET_SUSPECTED = "El personaje reapareció sin evento Died y la interfaz sugiere un cambio de ronda/juego.",
+		NORMAL_ROUND_TRANSITION = "El juego terminó la ronda y devolvió al personaje al lobby. Es un proceso normal; no genera Reset Log.",
+		GAME_OR_ROUND_RESET_SUSPECTED = "Clasificación antigua/ambigua; no se debe recuperar como incidente de Reset Log.",
 		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio probable del juego/servidor: el personaje desapareció vivo con AutoFarm y noclip activos a velocidad 50, sin evento Died. Roblox no expone la causa exacta, así que no es una certeza absoluta.",
 		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; origen ambiguo, no se guarda como reinicio del juego.",
 		RESET_WITHOUT_DEATH_SOURCE_UNKNOWN = "El personaje desapareció vivo; no hay evidencia suficiente para separar reset manual y reset del servidor/juego.",
@@ -6117,8 +6186,8 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(
 				evidence = death and "Humanoid.Died captured; not a game-reset log candidate" or "Character respawned; direct death cause unavailable"
 				PersistFarmDiagnosticEvent("respawn-after-observed-death cause=" .. tostring(classification), character)
 			end
-			local isGameResetCandidate = noDeathResetCandidate and (classification == "GAME_OR_ROUND_RESET_SUSPECTED"
-				or classification == "GAME_RESET_LIKELY_DURING_AUTOFARM")
+			local isGameResetCandidate = noDeathResetCandidate
+				and classification == "GAME_RESET_LIKELY_DURING_AUTOFARM"
 			if isGameResetCandidate then
 				local loader = ShowResetLogLoadingGui()
 				task.wait(1.15)
@@ -12035,6 +12104,34 @@ local function SummarizeFarmLog(raw, kind)
 	return table.concat(out, "\n"):sub(1, 1800)
 end
 
+local function CopyFarmTextToClipboard(value)
+	if type(value) ~= "string" or value == "" then return false end
+	local candidates, seen = {}, {}
+	local function add(fn)
+		if type(fn) == "function" and not seen[fn] then
+			seen[fn] = true
+			candidates[#candidates + 1] = fn
+		end
+	end
+	pcall(function() add(setclipboard); add(toclipboard); add(set_clipboard) end)
+	pcall(function()
+		if type(getgenv) == "function" then
+			local env = getgenv()
+			if type(env) == "table" then
+				add(env.setclipboard); add(env.toclipboard); add(env.set_clipboard)
+			end
+		end
+	end)
+	pcall(function()
+		if type(syn) == "table" then add(syn.write_clipboard); add(syn.set_clipboard) end
+	end)
+	for _, fn in ipairs(candidates) do
+		local ok, result = pcall(fn, value)
+		if ok and result ~= false then return true end
+	end
+	return false
+end
+
 local function IsUnconsumedKickLog(raw)
 	if type(raw) ~= "string" or raw == "" then return false end
 	local reason = raw:match("^reason:%s*([^\r\n]+)") or ""
@@ -12269,11 +12366,15 @@ task.spawn(function()
 	scroll.Parent = frame
 	Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
 
-	local preview = Instance.new("TextLabel")
+	local preview = Instance.new("TextBox")
+	preview.Name = "ResetLogContent"
 	preview.Size = UDim2.new(1, -12, 0, 0)
 	preview.Position = UDim2.new(0, 6, 0, 6)
 	preview.AutomaticSize = Enum.AutomaticSize.Y
 	preview.BackgroundTransparency = 1
+	preview.ClearTextOnFocus = false
+	preview.MultiLine = true
+	preview.TextEditable = true
 	preview.Text = resetSummary
 	preview.TextColor3 = Color3.fromRGB(220, 220, 225)
 	preview.Font = Enum.Font.Code
@@ -12290,7 +12391,7 @@ task.spawn(function()
 	copy.Position = UDim2.new(0, 10, 1, -42)
 	copy.BackgroundColor3 = Color3.fromRGB(65, 105, 190)
 	copy.BorderSizePixel = 0
-	copy.Text = "Copy Summary"
+	copy.Text = "Copiar log completo"
 	copy.TextColor3 = Color3.new(1, 1, 1)
 	copy.Font = Enum.Font.GothamBold
 	copy.TextSize = 12
@@ -12311,12 +12412,18 @@ task.spawn(function()
 	Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
 
 	copy.Activated:Connect(function()
-		local clipboard = setclipboard or toclipboard or set_clipboard
-		if type(clipboard) == "function" then
-			local okCopy = pcall(clipboard, resetSummary)
-			status.Text = okCopy and "Resumen copiado. El log completo sigue en el archivo." or "Clipboard failed; el resumen aparece en pantalla."
+		local okCopy = CopyFarmTextToClipboard(previousResetLog)
+		if okCopy then
+			status.Text = "Log completo copiado (" .. tostring(#previousResetLog) .. " caracteres). Ya puedes pegarlo en el chat."
 		else
-			status.Text = "Clipboard unavailable; el resumen aparece en pantalla."
+			-- Fallback usable even when the executor has no clipboard API: expose the full log
+			-- in a selectable TextBox inside the existing scroll frame.
+			preview.Text = previousResetLog
+			status.Text = "Sin API de portapapeles: selecciona el texto de abajo y cópialo manualmente."
+			task.defer(function()
+				scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+				scroll.CanvasPosition = Vector2.new(0, 0)
+			end)
 		end
 	end)
 	close.Activated:Connect(function()
