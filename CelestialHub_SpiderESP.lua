@@ -5006,13 +5006,13 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 45,         -- V3.3: tope 45 studs/s (A/B: 35 y 45 sin kick; 55 y 75-100 con kick)
+	BaseMaxSpeed = 50,         -- V3.3: tope 50 studs/s (PRUEBA; 35 y 45 ok, 1 kick a 45, kicks a 55-100). Volver a 45 si hay kicks
 	RampTime = 0.25,           -- aceleracion corta (sin arranques bruscos)
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	MaxVerticalGap = 60,
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 45,   -- V3.3: mismo tope que BaseMaxSpeed
+	SafeMaxSpeed = 50,   -- V3.3: mismo tope que BaseMaxSpeed
 	SafeRampTime = 0.3,
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
@@ -9164,7 +9164,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 45, State.TweenSpeed, function(v) State.TweenSpeed = v end)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 50, State.TweenSpeed, function(v) State.TweenSpeed = v end)
 		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
