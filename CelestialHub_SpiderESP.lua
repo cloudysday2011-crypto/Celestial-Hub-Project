@@ -5025,6 +5025,13 @@ local CoinEngine = {
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
+	-- ===== PRUEBAS A/B (poner en false para volver al comportamiento anterior) =====
+	SoftBrake = true,            -- frenada progresiva: no pasar de 45 a 0 studs/s en un solo frame al llegar a la moneda
+	SoftBrakeGain = 8,           -- ganancia de frenado al acercarse con SoftBrake (menor = frena desde mas lejos)
+	SoftBrakeDecay = 0.5,        -- factor por frame de la velocidad al llegar (0.5 = la mitad cada frame)
+	PingSettle = true,           -- espera previa a recoger = ping + margen (antes: ping/2 + 0.02)
+	PingSettleMargin = 0.05,
+	PingSettleMax = 0.30,
 	-- ===== DETECTOR DE RONDA =====
 	WeaponDebounce = 0.4,        -- armas asignadas (y monedas presentes) durante este tiempo = ronda iniciada
 	RoundStartGrace = 1.0,       -- espera tras detectar el inicio (el juego aun puede estar moviendote)
@@ -5357,6 +5364,16 @@ local function GetSettleTime(now)
 		end)
 	end
 	return math.clamp(cachedPingMs / 2000 + 0.02, CoinEngine.SettleMin, CoinEngine.SettleMax)
+end
+
+-- Con PingSettle: espera al menos un ping completo + margen para que el servidor te vea ya parado
+-- junto a la moneda antes del toque. Sin el interruptor devuelve el valor original.
+local function GetCollectSettle(now, safe)
+	local base = safe and GetSettleTime(now) or 0.03
+	if not CoinEngine.PingSettle then return base end
+	if not safe then GetSettleTime(now) end   -- refresca cachedPingMs tambien fuera de Safe Mode
+	local want = cachedPingMs / 1000 + CoinEngine.PingSettleMargin
+	return math.min(math.max(base, want), CoinEngine.PingSettleMax)
 end
 
 -- ---------------------------------------------------------------
@@ -5876,16 +5893,26 @@ local function ControllerStep(dt)
 		if firetouchinterest then
 			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
 			lastProgress = now
-			if safe then currentSpeed = currentSpeed * 0.5 end
+			if CoinEngine.SoftBrake then
+				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
+				currentSpeed = currentSpeed * CoinEngine.SoftBrakeDecay
+				if currentSpeed > 1 and flightVel and dist > 0.001 then
+					flightVel.Velocity = (delta / dist) * currentSpeed
+					velApplied = true
+				else
+					currentSpeed = 0
+				end
+			elseif safe then currentSpeed = currentSpeed * 0.5 end
 			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-			local settle = safe and GetSettleTime(now) or 0.03
+			local settle = GetCollectSettle(now, safe)
 			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
-				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f",
+				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d",
 					dist, root.AssemblyLinearVelocity.Magnitude, now - arriveAt, now - lastCollectAt, settle,
-					target.Position.Y - rootPos.Y)
+					target.Position.Y - rootPos.Y, CoinEngine.SoftBrake and 1 or 0, CoinEngine.PingSettle and 1 or 0,
+					math.floor(tonumber(State.TweenSpeed) or 0))
 				lastCollectAt = now
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
@@ -5911,7 +5938,9 @@ local function ControllerStep(dt)
 		-- Vuelo: velocidad real hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
 		local dir = delta / dist
 		local remaining = dist - CoinEngine.StopDistance
-		local v = math.min(currentSpeed, math.max(remaining, 0) * Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain))
+		local gain = Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain)
+		if CoinEngine.SoftBrake then gain = math.min(gain, CoinEngine.SoftBrakeGain) end
+		local v = math.min(currentSpeed, math.max(remaining, 0) * gain)
 		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		if v == v and flightVel then
 			flightVel.Velocity = dir * v
