@@ -853,7 +853,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 75, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -5006,13 +5006,13 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 100,        -- el slider manda; ya NO se recorta la velocidad para ganar estabilidad
+	BaseMaxSpeed = 45,         -- V3.3: tope 45 studs/s (A/B: 35 y 45 sin kick; 55 y 75-100 con kick)
 	RampTime = 0.25,           -- aceleracion corta (sin arranques bruscos)
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	MaxVerticalGap = 60,
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 100,
+	SafeMaxSpeed = 45,   -- V3.3: mismo tope que BaseMaxSpeed
 	SafeRampTime = 0.3,
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
@@ -5469,6 +5469,46 @@ local function ResetDiagnosticLog()
 	LogEvent("diagnostic-restarted")
 end
 
+-- V3.3: contador REAL de monedas del juego (indicador de la esquina inferior izquierda de MM2).
+-- Busca un TextLabel numerico visible en esa esquina de PlayerGui y lo lee. Si no lo encuentra, gc=-1.
+-- La ruta encontrada se registra una vez como evento "gc-path=..." para poder verificarla.
+local gcLabel, gcNextScan, gcPathLogged = nil, 0, nil
+local function ReadGameCoins(now)
+	if gcLabel and (not gcLabel.Parent or not gcLabel:IsDescendantOf(game)) then gcLabel = nil end
+	if not gcLabel and now >= gcNextScan then
+		gcNextScan = now + 3
+		pcall(function()
+			local pg = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
+			local cam = workspace.CurrentCamera
+			if not pg or not cam then return end
+			local vp = cam.ViewportSize
+			local best, bestScore
+			for _, o in ipairs(pg:GetDescendants()) do
+				if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible then
+					local txt = o.Text
+					if txt:match("^%s*%d+%s*$") or txt:match("^%s*%d+%s*/%s*%d+%s*$") then
+						local ap = o.AbsolutePosition
+						if ap.X < vp.X * 0.35 and ap.Y > vp.Y * 0.60 then
+							local score = ap.X + (vp.Y - ap.Y)   -- menor = mas cerca de la esquina inferior izquierda
+							if not bestScore or score < bestScore then best, bestScore = o, score end
+						end
+					end
+				end
+			end
+			gcLabel = best
+			if best and gcPathLogged ~= best then
+				gcPathLogged = best
+				LogEvent("gc-path=" .. best:GetFullName())
+			end
+		end)
+	end
+	if gcLabel then
+		local a = gcLabel.Text:match("^%s*(%d+)")
+		return a and tonumber(a) or -1
+	end
+	return -1
+end
+
 local function LogStep(now, dt, force)
 	if logFinalized and not force then return end
 	if not force and now < nextLogAt then return end
@@ -5493,7 +5533,7 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
@@ -5506,7 +5546,7 @@ local function LogStep(now, dt, force)
 		coinsCollectedTotal, tostring(roundActive), roundCollected,
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
 		tostring(batchPausing), math.max(0, pauseUntil - now),
-		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, table.concat(pendingEvents, ","))
+		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, ReadGameCoins(now), table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -9093,7 +9133,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 100, State.TweenSpeed, function(v) State.TweenSpeed = v end)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 45, State.TweenSpeed, function(v) State.TweenSpeed = v end)
 		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
