@@ -5049,7 +5049,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
+-- AUTO-FARM V3.8: recuperacion adaptativa sin parada por solapamiento\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
 -- ====================================================================
@@ -5085,7 +5085,7 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60; V3.8 adds solid-overlap fail-safe)
+	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60)
 	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
 	MaxAcceleration = 90,     -- limita cambios bruscos de velocidad/direccion por segundo^2
 	LastCommandVelocity = Vector3.zero,
@@ -5493,10 +5493,10 @@ local function GetCollectSettle(now, safe)
 end
 
 -- ---------------------------------------------------------------
--- REGISTRO DE DIAGNOSTICO + GUARDIA DE MOVIMIENTO
+-- REGISTRO DE DIAGNOSTICO + RECUPERACION ADAPTATIVA
 -- Guarda ~40 s de muestras en CelestialFarmLog.txt. Separa la velocidad ordenada por CH de la
--- velocidad fisica real. Si hay solapamiento con geometria solida persistente, detiene el AutoFarm
--- y restaura el estado normal del personaje; no intenta continuar atravesando la geometria.
+-- velocidad fisica real. Ante solapamiento persistente, reduce temporalmente la velocidad y cambia
+-- de objetivo sin detener el controlador ni poner la velocidad a cero.
 -- ---------------------------------------------------------------
 
 local logBuf, pendingEvents = {}, {}
@@ -5505,6 +5505,8 @@ local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
 local SOLID_OVERLAP_CONFIRM_TIME = 0.60
+local overlapSpeedCapUntil = 0
+local overlapRecoverySpeedCap = 36
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -6557,32 +6559,28 @@ local function ControllerStep(dt)
 	SetStatus("farming")
 	EnsureFlight(root, hum)
 
-	-- Safety guard: sustained overlap with solid map geometry means the character is still passing
-	-- through a wall/solid region. Stop instead of continuing the same trajectory into a server kick.
-	-- A short confirmation window avoids stopping on a single noisy overlap sample.
+	-- Recuperacion adaptativa: no apaga el Farm, no aplica velocidad cero y no introduce pausas.
+	-- Si el solapamiento persiste durante el movimiento, evita insistir con el mismo objetivo,
+	-- limita la velocidad durante un periodo corto y deja que el controlador seleccione otro objetivo.
 	if now >= nextSolidGuardCheck then
 		nextSolidGuardCheck = now + 0.12
 		if IsInsideSolid(root.Position) then
 			solidOverlapSince = solidOverlapSince or now
 			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
-				local targetDistance = CoinEngine.CurrentTarget and (CoinEngine.CurrentTarget.Position - root.Position).Magnitude or math.huge
+				local target = CoinEngine.CurrentTarget
+				local targetDistance = target and (target.Position - root.Position).Magnitude or math.huge
 				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
 				if actualSpeed >= 10 and targetDistance > 4 then
-					-- Fail-safe V3.8: repeated overlap with solid geometry is a hard stop.
-					-- Do not retry another target while the same unsafe movement mode is active.
-					LogEvent(string.format("solid-overlap-abort speed=%.1f toCoin=%.1f duration=%.2f", actualSpeed, targetDistance, now - solidOverlapSince))
-					State.FarmEnabled = false
-					currentSpeed = 0
-					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
-					CoinEngine.LastCommandVelocity = Vector3.zero
-					StopFlight()
-					RestoreCollisions()
-					SetStatus("paused: solid overlap")
-					ResetPath()
+					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f cap=%.1f", actualSpeed, targetDistance, overlapRecoverySpeedCap))
+					if target then CoinEngine.Blacklist[target] = now + 2.5 end
+					-- No resetear currentSpeed ni la velocidad física: el siguiente objetivo se procesa
+					-- en este mismo ciclo y ApplyStableFlightVelocity suaviza el cambio de dirección.
+					SetCurrent(nil, now)
+					overlapSpeedCapUntil = math.max(overlapSpeedCapUntil, now + 1.5)
 					solidOverlapSince = nil
-					return
 				else
-					LogEvent("solid-overlap-ignored-near-target-or-low-speed")
+					-- Cerca de una moneda o a baja velocidad puede ser un solapamiento de medición.
+					-- Confirmar de nuevo sin interrumpir el movimiento.
 					solidOverlapSince = now
 				end
 			end
@@ -6593,6 +6591,9 @@ local function ControllerStep(dt)
 
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	if now < overlapSpeedCapUntil then
+		speed = math.min(speed, overlapRecoverySpeedCap)
+	end
 	if CoinEngine.PingAdaptiveSpeed and cachedPingMs > CoinEngine.PingAdaptiveStart then
 		speed = math.min(speed, math.max(CoinEngine.PingAdaptiveMin, speed * CoinEngine.PingAdaptiveStart / cachedPingMs))
 	end
