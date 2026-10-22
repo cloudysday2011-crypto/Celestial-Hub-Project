@@ -5085,7 +5085,7 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60)
+	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60; V3.8 adds solid-overlap fail-safe)
 	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
 	MaxAcceleration = 90,     -- limita cambios bruscos de velocidad/direccion por segundo^2
 	LastCommandVelocity = Vector3.zero,
@@ -6568,16 +6568,17 @@ local function ControllerStep(dt)
 				local targetDistance = CoinEngine.CurrentTarget and (CoinEngine.CurrentTarget.Position - root.Position).Magnitude or math.huge
 				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
 				if actualSpeed >= 10 and targetDistance > 4 then
-					-- No cortar el farm por una sola muestra ni cuando ya se esta recogiendo.
-					-- Si hay solapamiento sostenido mientras se avanza rapido, abandonar ese objetivo,
-					-- frenar y dejar que la siguiente iteracion calcule una ruta distinta.
-					LogEvent(string.format("solid-overlap-recovery speed=%.1f toCoin=%.1f", actualSpeed, targetDistance))
-					if CoinEngine.CurrentTarget then CoinEngine.Blacklist[CoinEngine.CurrentTarget] = now + 2.5 end
-					SetCurrent(nil, now)
+					-- Fail-safe V3.8: repeated overlap with solid geometry is a hard stop.
+					-- Do not retry another target while the same unsafe movement mode is active.
+					LogEvent(string.format("solid-overlap-abort speed=%.1f toCoin=%.1f duration=%.2f", actualSpeed, targetDistance, now - solidOverlapSince))
+					State.FarmEnabled = false
 					currentSpeed = 0
 					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 					CoinEngine.LastCommandVelocity = Vector3.zero
-					pauseUntil = now + 0.35
+					StopFlight()
+					RestoreCollisions()
+					SetStatus("paused: solid overlap")
+					ResetPath()
 					solidOverlapSince = nil
 					return
 				else
