@@ -25,17 +25,20 @@ end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
--- Snapshot the prior session's reset log before any new diagnostic event can overwrite it.
+-- Recover only an unconsumed, explicitly classified game-reset incident.
+-- Older diagnostic files created by slider changes / deaths are deliberately ignored.
 _G.Celestial.PreviousFarmResetLogSnapshot = nil
 pcall(function()
-	if type(readfile) == "function" then
-		if type(isfile) ~= "function" or isfile("CelestialFarmResetLog.txt") then
-			local previous = readfile("CelestialFarmResetLog.txt")
-			if type(previous) == "string" and previous ~= "" then
-				_G.Celestial.PreviousFarmResetLogSnapshot = previous
-			end
-		end
+	if type(readfile) ~= "function" then return end
+	if type(isfile) == "function" and not isfile("CelestialFarmResetLog.txt") then return end
+	local previous = readfile("CelestialFarmResetLog.txt")
+	if type(previous) ~= "string" or previous == "" then return end
+	if not previous:find("CH-RESET-INCIDENT:", 1, true) then return end
+	local consumed = ""
+	if type(isfile) ~= "function" or isfile("CelestialFarmResetLogConsumed.txt") then
+		pcall(function() consumed = readfile("CelestialFarmResetLogConsumed.txt") or "" end)
 	end
+	if consumed ~= previous then _G.Celestial.PreviousFarmResetLogSnapshot = previous end
 end)
 
 if _G.Celestial.CrosshairCleanup then
@@ -5078,7 +5081,10 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 50,         -- V3.3: tope 50 studs/s (PRUEBA; 35 y 45 ok, 1 kick a 45, kicks a 55-100). Volver a 45 si hay kicks
+	BaseMaxSpeed = 50,         -- limite de velocidad solicitada
+	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
+	MaxAcceleration = 120,    -- limita cambios de velocidad/direccion por segundo^2
+	LastCommandVelocity = Vector3.zero,
 	RampTime = 0.25,           -- aceleracion corta (sin arranques bruscos)
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
@@ -5189,6 +5195,7 @@ local function StopFlight()
 		if hum then pcall(function() hum.PlatformStand = false end) end
 	end
 	flightOn = false
+	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
 	CoinEngine.NoclipWanted = false
 end
@@ -5215,6 +5222,32 @@ local function EnsureFlight(root, hum)
 	flightOn = true
 	_G.Celestial.FarmFlying = true
 	CoinEngine.NoclipWanted = true       -- atraviesa paredes mientras vuela / flota
+end
+
+-- Aplique una velocidad limitada en vertical y con aceleracion acotada. El log anterior
+-- mostraba cambios repetidos de vy=+/-49.9; el objetivo sigue siendo velocidad 50, pero
+-- CH ya no ordena inversiones bruscas ni una componente vertical de 50 studs/s.
+local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
+	if not flightVel or not direction then return end
+	local speed = math.max(0, tonumber(requestedSpeed) or 0)
+	local raw = direction * speed
+	local y = math.clamp(raw.Y, -CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+	local horizontal = Vector3.new(raw.X, 0, raw.Z)
+	local maxHorizontal = math.sqrt(math.max(0, speed * speed - y * y))
+	if horizontal.Magnitude > maxHorizontal and horizontal.Magnitude > 0 then
+		horizontal = horizontal.Unit * maxHorizontal
+	end
+	local targetVelocity = horizontal + Vector3.new(0, y, 0)
+	local previous = CoinEngine.LastCommandVelocity or Vector3.zero
+	local allowedChange = CoinEngine.MaxAcceleration * math.clamp(tonumber(dt) or 0, 0, 0.05)
+	local change = targetVelocity - previous
+	if change.Magnitude > allowedChange and allowedChange > 0 then
+		targetVelocity = previous + change.Unit * allowedChange
+	elseif allowedChange <= 0 then
+		targetVelocity = previous
+	end
+	flightVel.Velocity = targetVelocity
+	CoinEngine.LastCommandVelocity = targetVelocity
 end
 
 local function CoinNameMatches(obj)
@@ -5488,8 +5521,8 @@ local function HiResPush(now, dt, csMs)
 	local tgt = CoinEngine.CurrentTarget
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
-		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, currentSpeed,
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
+		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Y,
 		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
 		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
 		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
@@ -5617,11 +5650,11 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
-		currentSpeed,
+		(CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Y,
 		tgt and (tgt.Position - p).Magnitude or -1,
 		1 / frameDt, frameDt * 1000, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
@@ -5667,7 +5700,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 	end
 	if type(writefile) == "function" then
 		local parts = {
-			"Celestial Farm reset/speed diagnostics",
+			"Celestial Farm movement diagnostics (not a Reset Log)",
 			"event-count=" .. tostring(#farmDiagnosticEvents),
 			table.concat(farmDiagnosticEvents, "\n"),
 			"--- NORMAL LOG (recent samples) ---",
@@ -5675,7 +5708,23 @@ local function PersistFarmDiagnosticEvent(tag, character)
 			"--- HI-RES (recent frames) ---",
 			HiResDump(),
 		}
-		pcall(writefile, "CelestialFarmResetLog.txt", table.concat(parts, "\n"))
+		-- Slider changes, character lifecycle noise, deaths, and generic diagnostics never
+		-- create/overwrite the game-reset incident file.
+		pcall(writefile, "CelestialFarmDiagnostics.txt", table.concat(parts, "\n"))
+		local resetKind = tostring(tag):match("RESET%-CLASSIFICATION kind=([%w_%-]+)")
+		local noDeathEvidence = tostring(tag):find("source=NO_DEATH", 1, true) ~= nil
+		if noDeathEvidence and (resetKind == "GAME_OR_ROUND_RESET_SUSPECTED" or resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM") then
+			local resetParts = {
+				"CH-RESET-INCIDENT: " .. resetKind,
+				"classification=" .. resetKind,
+				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
+				"--- NORMAL LOG (recent samples) ---",
+				table.concat(logBuf, "\n"),
+				"--- HI-RES (recent frames) ---",
+				HiResDump(),
+			}
+			pcall(writefile, "CelestialFarmResetLog.txt", table.concat(resetParts, "\n"))
+		end
 	end
 end
 
@@ -5881,7 +5930,7 @@ ResetDiag.ClassifyDeath = function(character, humanoid)
 	}
 	ResetDiag.LastClassification = classification
 	PersistFarmDiagnosticEvent(
-		"RESET-CLASSIFICATION kind=" .. classification .. " confidence=" .. confidence
+		"RESET-CLASSIFICATION kind=" .. classification .. " source=HUMANOID_DIED confidence=" .. confidence
 			.. " evidence=" .. ResetDiag.Clean(evidence, 220)
 			.. " localRole=" .. tostring(roleSnapshot.localRole)
 			.. " round=" .. tostring(roleSnapshot.round)
@@ -5896,9 +5945,15 @@ ResetDiag.ClassifyNoDeathReset = function(removal, newCharacter)
 	if roundUi then
 		classification, confidence = "GAME_OR_ROUND_RESET_SUSPECTED", "MEDIUM"
 		evidence = "character-removed-without-Died;round-ui=" .. roundUi
+	elseif removal.Health and removal.Health > 0 and removal.FarmEnabled and removal.Noclip
+		and (tonumber(removal.Speed) or -1) >= 49.5 then
+		-- Stronger operational signature for the reported speed-50 failure. This is still
+		-- labelled LIKELY, not certain: Roblox does not expose a universal reset-cause API.
+		classification, confidence = "GAME_RESET_LIKELY_DURING_AUTOFARM", "MEDIUM"
+		evidence = "character-removed-alive;AutoFarm+noclip active;sliderSpeed>=49.5;no Humanoid.Died event"
 	elseif removal.Health and removal.Health > 0 and removal.FarmEnabled and removal.Noclip then
-		classification, confidence = "FORCED_OR_SERVER_RESET_DURING_AUTOFARM", "MEDIUM"
-		evidence = "character-removed-alive-while-farm-and-noclip-active;server-vs-manual-source-not-exposed"
+		classification, confidence = "FORCED_OR_SERVER_RESET_DURING_AUTOFARM", "LOW"
+		evidence = "character-removed-alive-while-farm-and-noclip-active;cause-ambiguous-not-saved-as-game-reset"
 	elseif removal.Health and removal.Health > 0 then
 		classification, confidence = "RESET_WITHOUT_DEATH_SOURCE_UNKNOWN", "LOW"
 		evidence = "character-removed-while-Humanoid-health-positive;could-be-game-server-or-manual-reset"
@@ -5908,7 +5963,7 @@ ResetDiag.ClassifyNoDeathReset = function(removal, newCharacter)
 	end
 	ResetDiag.LastClassification = classification
 	PersistFarmDiagnosticEvent(
-		"RESET-CLASSIFICATION kind=" .. classification .. " confidence=" .. confidence
+		"RESET-CLASSIFICATION kind=" .. classification .. " source=NO_DEATH confidence=" .. confidence
 			.. " evidence=" .. ResetDiag.Clean(evidence, 220)
 			.. " priorRound=" .. tostring(removal.RoundActive)
 			.. " priorFarm=" .. tostring(removal.FarmEnabled)
@@ -5927,7 +5982,8 @@ ResetDiag.Explain = function(classification)
 		POSSIBLE_MURDERER_KILL_UNCONFIRMED = "Posible asesinato del Murderer: inferido por los roles, no confirmado directamente.",
 		DEATH_CAUSE_UNKNOWN = "Se observó una muerte normal, pero no se encontró quién la causó.",
 		GAME_OR_ROUND_RESET_SUSPECTED = "El personaje reapareció sin evento Died y la interfaz sugiere un cambio de ronda/juego.",
-		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; el origen exacto no está expuesto.",
+		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio probable del juego/servidor: el personaje desapareció vivo con AutoFarm y noclip activos a velocidad 50, sin evento Died. Roblox no expone la causa exacta, así que no es una certeza absoluta.",
+		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; origen ambiguo, no se guarda como reinicio del juego.",
 		RESET_WITHOUT_DEATH_SOURCE_UNKNOWN = "El personaje desapareció vivo; no hay evidencia suficiente para separar reset manual y reset del servidor/juego.",
 		RESPAWN_WITHOUT_OBSERVED_DEATH = "Se detectó respawn, pero no se capturó una causa verificable.",
 	}
@@ -6047,23 +6103,29 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(
 	ResetDiag.WatchHumanoid(character)
 	local removal = ResetDiag.LastRemoval
 	if removal and (os.clock() - removal.At) <= 15 then
-		local loader = ShowResetLogLoadingGui()
 		task.spawn(function()
 			task.wait(0.35)
 			local classification, confidence, evidence
+			local noDeathResetCandidate = false
 			if ResetDiag.LastRemoval == removal and not removal.DeathObserved then
 				classification, confidence, evidence = ResetDiag.ClassifyNoDeathReset(removal, character)
+				noDeathResetCandidate = true
 			else
 				local death = ResetDiag.LastDeath
 				classification = death and death.Classification or "DEATH_CAUSE_UNKNOWN"
 				confidence = death and death.Confidence or "LOW"
-				evidence = death and "Humanoid.Died captured; see Reset Log for role/source details" or "Character respawned; direct death cause unavailable"
+				evidence = death and "Humanoid.Died captured; not a game-reset log candidate" or "Character respawned; direct death cause unavailable"
 				PersistFarmDiagnosticEvent("respawn-after-observed-death cause=" .. tostring(classification), character)
 			end
-			task.wait(1.15)
-			if loader then pcall(function() loader:Destroy() end) end
-			if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
-			if _G.Celestial.HubLoaded == true then ResetDiag.ShowResult(classification, confidence, evidence) end
+			local isGameResetCandidate = noDeathResetCandidate and (classification == "GAME_OR_ROUND_RESET_SUSPECTED"
+				or classification == "GAME_RESET_LIKELY_DURING_AUTOFARM")
+			if isGameResetCandidate then
+				local loader = ShowResetLogLoadingGui()
+				task.wait(1.15)
+				if loader then pcall(function() loader:Destroy() end) end
+				if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
+				if _G.Celestial.HubLoaded == true then ResetDiag.ShowResult(classification, confidence, evidence) end
+			end
 		end)
 	end
 	task.spawn(function()
@@ -6434,10 +6496,25 @@ local function ControllerStep(dt)
 		if IsInsideSolid(root.Position) then
 			solidOverlapSince = solidOverlapSince or now
 			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
-				-- Ya NO apaga el Auto-Farm (el sondeo daba falsos positivos, incluso con el personaje
-				-- quieto en el suelo). Solo se deja constancia en el log y se sigue farmeando.
-				LogEvent("solid-overlap-ignored")
-				solidOverlapSince = now   -- reinicia la ventana: como mucho 1 aviso cada 0.6 s
+				local targetDistance = CoinEngine.CurrentTarget and (CoinEngine.CurrentTarget.Position - root.Position).Magnitude or math.huge
+				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
+				if actualSpeed >= 10 and targetDistance > 4 then
+					-- No cortar el farm por una sola muestra ni cuando ya se esta recogiendo.
+					-- Si hay solapamiento sostenido mientras se avanza rapido, abandonar ese objetivo,
+					-- frenar y dejar que la siguiente iteracion calcule una ruta distinta.
+					LogEvent(string.format("solid-overlap-recovery speed=%.1f toCoin=%.1f", actualSpeed, targetDistance))
+					if CoinEngine.CurrentTarget then CoinEngine.Blacklist[CoinEngine.CurrentTarget] = now + 2.5 end
+					SetCurrent(nil, now)
+					currentSpeed = 0
+					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+					CoinEngine.LastCommandVelocity = Vector3.zero
+					pauseUntil = now + 0.35
+					solidOverlapSince = nil
+					return
+				else
+					LogEvent("solid-overlap-ignored-near-target-or-low-speed")
+					solidOverlapSince = now
+				end
 			end
 		else
 			solidOverlapSince = nil
@@ -6491,7 +6568,7 @@ local function ControllerStep(dt)
 				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
 				currentSpeed = math.min(currentSpeed, lastFlightV) * CoinEngine.SoftBrakeDecay
 				if currentSpeed > 1 and flightVel and dist > 0.001 then
-					flightVel.Velocity = (delta / dist) * currentSpeed
+					ApplyStableFlightVelocity(delta / dist, currentSpeed, dt)
 					velApplied = true
 				else
 					currentSpeed = 0
@@ -6542,7 +6619,7 @@ local function ControllerStep(dt)
 		lastFlightV = v
 		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		if v == v and flightVel then
-			flightVel.Velocity = dir * v
+			ApplyStableFlightVelocity(dir, v, dt)
 			velApplied = true
 		end
 		local horiz = Vector3.new(dir.X, 0, dir.Z)
@@ -6574,7 +6651,10 @@ local function SafeControllerStep(dt)
 	local csT0 = os.clock()
 	local ok = pcall(ControllerStep, dt)
 	local csMs = (os.clock() - csT0) * 1000     -- coste real de ControllerStep en este frame (diagnostico de tirones)
-	if flightVel and not velApplied then pcall(function() flightVel.Velocity = Vector3.zero end) end   -- sin orden: flota quieto
+	if flightVel and not velApplied then
+		pcall(function() flightVel.Velocity = Vector3.zero end) -- sin orden: flota quieto
+		CoinEngine.LastCommandVelocity = Vector3.zero
+	end
 	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt, csMs) end
 	if State.FarmEnabled then
 		local lsT0, lwT0 = os.clock(), tick()
@@ -6609,11 +6689,16 @@ CoinEngine.KickConn = game:GetService("GuiService").ErrorMessageChanged:Connect(
 	if not msg or msg == "" or logFinalized then return end
 	local cleanMessage = tostring(msg):gsub("[%c]+", " "):sub(1, 180)
 	local normalizedMessage = string.lower(cleanMessage)
-	if string.find(normalizedMessage, "invalid position", 1, true) then
+	local explicitKick = normalizedMessage:find("you were kicked", 1, true)
+		or normalizedMessage:find("kicked from this experience", 1, true)
+		or normalizedMessage:find("removed from the game", 1, true)
+		or normalizedMessage:find("invalid position", 1, true)
+	if explicitKick then
 		LogEvent("KICK: " .. cleanMessage)
 		pcall(LogStep, os.clock(), 0, true)
 		logFinalized = true
-		pcall(FlushLog, "invalid-position-final", true)
+		local kickReason = normalizedMessage:find("invalid position", 1, true) and "invalid-position-final" or ("kick-confirmed: " .. cleanMessage)
+		pcall(FlushLog, kickReason, true)
 		State.FarmEnabled = false
 		local setter = _G.Celestial.ToggleSetters and _G.Celestial.ToggleSetters["Auto Farm Coins"]
 		if type(setter) == "function" then pcall(setter, false) end
@@ -11902,6 +11987,61 @@ State.AntiFlingActive = true
 State.PowerDetectorActive = true
 
 
+-- Compact local rule-based analyzer. It does not pretend to be a cloud LLM; it extracts
+-- evidence from the log so a useful summary can be copied without sending thousands of lines.
+local function SummarizeFarmLog(raw, kind)
+	raw = tostring(raw or "")
+	local firstLine = raw:match("^([^\r\n]+)") or "sin encabezado"
+	local out = {"CH " .. tostring(kind or "LOG") .. " SUMMARY", "Evento: " .. firstLine}
+	local maxAbsVy, maxAbsCmdY, maxPhys, maxCmd, maxPing = 0, 0, 0, 0, 0
+	local solidCount, noclipCount, sampleCount, lastCoins = 0, 0, 0, "?"
+	local classification = string.upper(tostring(kind or "")) == "RESET"
+		and (raw:match("classification=([%w_%-]+)") or raw:match("kind=([%w_%-]+)")) or nil
+	for line in raw:gmatch("[^\r\n]+") do
+		local vy = tonumber(line:match("vy=([%-%.%d]+)"))
+		local cmdY = tonumber(line:match("cmdY=([%-%.%d]+)"))
+		local phys = tonumber(line:match("phys=([%-%.%d]+)"))
+		local cmd = tonumber(line:match("cmd=([%-%.%d]+)"))
+		local ping = tonumber(line:match("ping=([%-%.%d]+)"))
+		local coins = line:match("coins=([%-]?%d+)")
+		if vy then maxAbsVy = math.max(maxAbsVy, math.abs(vy)) end
+		if cmdY then maxAbsCmdY = math.max(maxAbsCmdY, math.abs(cmdY)) end
+		if phys then maxPhys = math.max(maxPhys, phys) end
+		if cmd then maxCmd = math.max(maxCmd, cmd) end
+		if ping then maxPing = math.max(maxPing, ping) end
+		if line:find("inSolid=true", 1, true) then solidCount = solidCount + 1 end
+		if line:find("noclip=true", 1, true) then noclipCount = noclipCount + 1 end
+		if line:find("sdt=", 1, true) then sampleCount = sampleCount + 1 end
+		if coins then lastCoins = coins end
+	end
+	if classification then out[#out + 1] = "Clasificación: " .. classification end
+	if sampleCount > 0 then
+		out[#out + 1] = string.format("Muestras=%d | cmd máx.=%.1f | física máx.=%.1f | |vy| física máx.=%.1f | |cmdY| máx.=%.1f", sampleCount, maxCmd, maxPhys, maxAbsVy, maxAbsCmdY)
+		out[#out + 1] = string.format("Solapamientos sólidos=%d | muestras con noclip=%d | ping máx. observado=%.0f ms | monedas=%s", solidCount, noclipCount, maxPing, lastCoins)
+	end
+	local lower = string.lower(raw)
+	if lower:find("invalid position", 1, true) or lower:find("invalid%-position%-final") then
+		local clues = {}
+		if maxCmd >= 49.5 then clues[#clues + 1] = "AutoFarm operaba cerca de velocidad 50" end
+		if maxAbsVy >= 35 then clues[#clues + 1] = "picos verticales altos" end
+		if solidCount >= 3 then clues[#clues + 1] = "solapamientos con geometría repetidos" end
+		out[#out + 1] = "Lectura probable: el servidor rechazó una trayectoria/posición del personaje. " .. (#clues > 0 and ("Indicios: " .. table.concat(clues, ", ") .. ".") or "No hay suficientes métricas para aislar la causa exacta.")
+	elseif classification == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
+		out[#out + 1] = "Lectura probable: el personaje desapareció vivo durante el farmeo a velocidad 50, sin muerte registrada; causa probable externa, no certeza absoluta."
+	elseif classification == "GAME_OR_ROUND_RESET_SUSPECTED" then
+		out[#out + 1] = "Lectura: hay indicios de cambio de ronda/juego junto al respawn."
+	end
+	out[#out + 1] = "Confianza: heurística local; el resumen no sustituye al log completo."
+	return table.concat(out, "\n"):sub(1, 1800)
+end
+
+local function IsUnconsumedKickLog(raw)
+	if type(raw) ~= "string" or raw == "" then return false end
+	local reason = raw:match("^reason:%s*([^\r\n]+)") or ""
+	local lower = string.lower(reason)
+	return lower:find("invalid%-position%-final") ~= nil or lower:find("kick%-confirmed") ~= nil or lower:find("kick:", 1, true) ~= nil
+end
+
 -- ====================================================================
 -- CELESTIAL FARM LOG RECOVERY (SAFE STARTUP DIAGNOSTICS)
 -- Recovers a log saved by a previous session and offers manual copying.
@@ -11916,10 +12056,21 @@ task.spawn(function()
 		if type(readfile) ~= "function" then return nil end
 		return readfile("CelestialFarmLog.txt")
 	end)
-	if not okRead or type(previousLog) ~= "string" or previousLog == "" then
+	if not okRead or not IsUnconsumedKickLog(previousLog) then
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
+	local consumedKick = ""
+	pcall(function()
+		if type(readfile) == "function" and (type(isfile) ~= "function" or isfile("CelestialFarmLogConsumed.txt")) then
+			consumedKick = readfile("CelestialFarmLogConsumed.txt") or ""
+		end
+	end)
+	if consumedKick == previousLog then
+		_G.Celestial.KickLogRecoveryQueued = false
+		return
+	end
+	local kickSummary = SummarizeFarmLog(previousLog, "KICK")
 
 	-- Wait for normal CH loading and full Hub UI construction to finish before showing the log loader.
 	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
@@ -11997,7 +12148,7 @@ task.spawn(function()
 	preview.Position = UDim2.new(0, 6, 0, 6)
 	preview.AutomaticSize = Enum.AutomaticSize.Y
 	preview.BackgroundTransparency = 1
-	preview.Text = previousLog
+	preview.Text = kickSummary
 	preview.TextColor3 = Color3.fromRGB(220, 220, 225)
 	preview.Font = Enum.Font.Code
 	preview.TextSize = 10
@@ -12015,7 +12166,7 @@ task.spawn(function()
 	copy.Position = UDim2.new(0, 10, 1, -42)
 	copy.BackgroundColor3 = Color3.fromRGB(65, 105, 190)
 	copy.BorderSizePixel = 0
-	copy.Text = "Copy Log"
+	copy.Text = "Copy Summary"
 	copy.TextColor3 = Color3.new(1, 1, 1)
 	copy.Font = Enum.Font.GothamBold
 	copy.TextSize = 13
@@ -12038,14 +12189,15 @@ task.spawn(function()
 	copy.Activated:Connect(function()
 		local clipboard = setclipboard or toclipboard or set_clipboard
 		if type(clipboard) == "function" then
-			local okCopy = pcall(clipboard, previousLog)
-			status.Text = okCopy and "Log copied to clipboard." or "Clipboard failed; use the preview or file."
+			local okCopy = pcall(clipboard, kickSummary)
+			status.Text = okCopy and "Resumen copiado. El log completo sigue en el archivo." or "Clipboard failed; el resumen aparece en pantalla."
 		else
-			status.Text = "Clipboard API unavailable; open CelestialFarmLog.txt manually."
+			status.Text = "Clipboard API unavailable; el resumen aparece en pantalla."
 		end
 	end)
 	close.Activated:Connect(function()
 		pcall(function() gui:Destroy() end)
+		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmLogConsumed.txt", previousLog) end end)
 		_G.Celestial.KickLogRecoveryQueued = false
 	end)
 end)
@@ -12054,6 +12206,7 @@ end)
 task.spawn(function()
 	local previousResetLog = _G.Celestial.PreviousFarmResetLogSnapshot
 	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
+	local resetSummary = SummarizeFarmLog(previousResetLog, "RESET")
 	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do task.wait(0.1) end
 	if _G.Celestial.HubLoadFailed then return end
 	while _G.Celestial.KickLogRecoveryQueued == true
@@ -12121,7 +12274,7 @@ task.spawn(function()
 	preview.Position = UDim2.new(0, 6, 0, 6)
 	preview.AutomaticSize = Enum.AutomaticSize.Y
 	preview.BackgroundTransparency = 1
-	preview.Text = previousResetLog
+	preview.Text = resetSummary
 	preview.TextColor3 = Color3.fromRGB(220, 220, 225)
 	preview.Font = Enum.Font.Code
 	preview.TextSize = 10
@@ -12137,7 +12290,7 @@ task.spawn(function()
 	copy.Position = UDim2.new(0, 10, 1, -42)
 	copy.BackgroundColor3 = Color3.fromRGB(65, 105, 190)
 	copy.BorderSizePixel = 0
-	copy.Text = "Copy Reset Log"
+	copy.Text = "Copy Summary"
 	copy.TextColor3 = Color3.new(1, 1, 1)
 	copy.Font = Enum.Font.GothamBold
 	copy.TextSize = 12
@@ -12160,13 +12313,16 @@ task.spawn(function()
 	copy.Activated:Connect(function()
 		local clipboard = setclipboard or toclipboard or set_clipboard
 		if type(clipboard) == "function" then
-			local okCopy = pcall(clipboard, previousResetLog)
-			status.Text = okCopy and "Reset log copied to clipboard." or "Clipboard failed; open CelestialFarmResetLog.txt."
+			local okCopy = pcall(clipboard, resetSummary)
+			status.Text = okCopy and "Resumen copiado. El log completo sigue en el archivo." or "Clipboard failed; el resumen aparece en pantalla."
 		else
-			status.Text = "Clipboard unavailable; open CelestialFarmResetLog.txt manually."
+			status.Text = "Clipboard unavailable; el resumen aparece en pantalla."
 		end
 	end)
-	close.Activated:Connect(function() pcall(function() gui:Destroy() end) end)
+	close.Activated:Connect(function()
+		pcall(function() gui:Destroy() end)
+		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmResetLogConsumed.txt", previousResetLog) end end)
+	end)
 end)
 
 print("✨ CELESTIAL FRAMEWORK V19.18.16 - MM2 / DUELS / SPIDER ESP + OBJECT ESP + SELF ESP ✨")
