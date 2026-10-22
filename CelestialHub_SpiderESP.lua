@@ -5085,17 +5085,17 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 50,         -- limite de velocidad solicitada
+	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60)
 	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
-	MaxAcceleration = 120,    -- limita cambios de velocidad/direccion por segundo^2
+	MaxAcceleration = 90,     -- limita cambios bruscos de velocidad/direccion por segundo^2
 	LastCommandVelocity = Vector3.zero,
-	RampTime = 0.25,           -- aceleracion corta (sin arranques bruscos)
+	RampTime = 0.35,           -- aceleracion progresiva para el rango ampliado hasta 60
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	MaxVerticalGap = 60,
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 50,   -- V3.3: mismo tope que BaseMaxSpeed
-	SafeRampTime = 0.3,
+	SafeMaxSpeed = 60,   -- V3.7: mismo tope que BaseMaxSpeed
+	SafeRampTime = 0.4,
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
 	SafeMaxVerticalGap = 60,
@@ -9822,7 +9822,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 50, State.TweenSpeed, function(v)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (60 max; server-side limits may still apply).", 10, 60, State.TweenSpeed, function(v)
 			local oldValue = State.TweenSpeed
 			State.TweenSpeed = v
 			local engine = _G.Celestial and _G.Celestial.CoinEngine
