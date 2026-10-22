@@ -4996,6 +4996,12 @@ if _G.Celestial.CoinFarmLoopThread then
 	pcall(function() task.cancel(_G.Celestial.CoinFarmLoopThread) end)
 	_G.Celestial.CoinFarmLoopThread = nil
 end
+if _G.Celestial.FarmResetDiagnosticConnections then
+	for _, connection in ipairs(_G.Celestial.FarmResetDiagnosticConnections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	_G.Celestial.FarmResetDiagnosticConnections = nil
+end
 
 local CoinEngine = {
 	Active = false,            -- conexiones de eventos abiertas
@@ -5568,6 +5574,89 @@ local function LogStep(now, dt, force)
 		FlushLog(force and "forced" or "periodic")
 	end
 end
+
+-- Diagnosticos extra: capturan respawns/reset del personaje y cambios de velocidad del slider.
+-- No alteran la velocidad ni el movimiento del AutoFarm.
+local farmDiagnosticEvents = {}
+local function PersistFarmDiagnosticEvent(tag, character)
+	local now = os.clock()
+	character = character or LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local hum = character and character:FindFirstChildOfClass("Humanoid")
+	local pos, vel = Vector3.zero, Vector3.zero
+	local stateText, platformStandText = "?", "?"
+	if root then pcall(function() pos = root.Position; vel = root.AssemblyLinearVelocity end) end
+	if hum then pcall(function() stateText = tostring(hum:GetState()); platformStandText = tostring(hum.PlatformStand) end) end
+	local eventLine = string.format(
+		"t=%.3f event=%s sliderSpeed=%.1f commandedSpeed=%.1f farm=%s safeMode=%s round=%s root=%s pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f,%.2f) phys=%.2f state=%s platformStand=%s noclip=%s ping=%.0f",
+		now, tostring(tag):gsub("[%c]", " "):sub(1, 180), tonumber(State.TweenSpeed) or -1,
+		currentSpeed, tostring(State.FarmEnabled), tostring(State.FarmSafeMode), tostring(roundActive),
+		tostring(root ~= nil), pos.X, pos.Y, pos.Z, vel.X, vel.Y, vel.Z, vel.Magnitude,
+		stateText, platformStandText, tostring(noclipOn), cachedPingMs)
+	farmDiagnosticEvents[#farmDiagnosticEvents + 1] = eventLine
+	while #farmDiagnosticEvents > 50 do table.remove(farmDiagnosticEvents, 1) end
+	if not logFinalized then
+		-- Dejar que LogStep registre el evento en el siguiente frame; no hacer flush doble durante el reset.
+		LogEvent("DIAG:" .. tostring(tag):gsub("[%c]", " "):sub(1, 120))
+	end
+	if type(writefile) == "function" then
+		local parts = {
+			"Celestial Farm reset/speed diagnostics",
+			"event-count=" .. tostring(#farmDiagnosticEvents),
+			table.concat(farmDiagnosticEvents, "\n"),
+			"--- NORMAL LOG (recent samples) ---",
+			table.concat(logBuf, "\n"),
+			"--- HI-RES (recent frames) ---",
+			HiResDump(),
+		}
+		pcall(writefile, "CelestialFarmResetLog.txt", table.concat(parts, "\n"))
+	end
+end
+
+CoinEngine.RecordSpeedChange = function(oldValue, newValue)
+	local oldSpeed, newSpeed = tonumber(oldValue) or -1, tonumber(newValue) or -1
+	-- No escribir archivos durante todo el arrastre del slider: solo guardamos al entrar/salir de 50.
+	if newSpeed >= 49.5 or oldSpeed >= 49.5 then
+		PersistFarmDiagnosticEvent(string.format("speed-slider-change old=%.1f new=%.1f", oldSpeed, newSpeed), LocalPlayer.Character)
+	else
+		LogEvent(string.format("speed-slider-change old=%.1f new=%.1f", oldSpeed, newSpeed))
+	end
+end
+
+local farmResetDiagnosticConnections = {}
+_G.Celestial.FarmResetDiagnosticConnections = farmResetDiagnosticConnections
+local function WatchFarmDiagnosticHumanoid(character)
+	if not character then return end
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		task.spawn(function()
+			local ok, found = pcall(function() return character:WaitForChild("Humanoid", 8) end)
+			if ok then hum = found end
+			if hum and hum:IsA("Humanoid") then
+				table.insert(farmResetDiagnosticConnections, hum.Died:Connect(function()
+					PersistFarmDiagnosticEvent("humanoid-died", character)
+				end))
+			end
+		end)
+		return
+	end
+	table.insert(farmResetDiagnosticConnections, hum.Died:Connect(function()
+		PersistFarmDiagnosticEvent("humanoid-died", character)
+	end))
+end
+
+table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterRemoving:Connect(function(character)
+	PersistFarmDiagnosticEvent("character-removing", character)
+end))
+table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(function(character)
+	PersistFarmDiagnosticEvent("character-added", character)
+	WatchFarmDiagnosticHumanoid(character)
+	task.spawn(function()
+		local ok, root = pcall(function() return character:WaitForChild("HumanoidRootPart", 8) end)
+		if ok and root then PersistFarmDiagnosticEvent("character-added-root-ready", character) end
+	end)
+end))
+WatchFarmDiagnosticHumanoid(LocalPlayer.Character)
 
 local function StopFarmForSafety(reason)
 	if logFinalized then return end
@@ -9164,7 +9253,14 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 50, State.TweenSpeed, function(v) State.TweenSpeed = v end)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (Safe Mode does NOT reduce it).", 10, 50, State.TweenSpeed, function(v)
+			local oldValue = State.TweenSpeed
+			State.TweenSpeed = v
+			local engine = _G.Celestial and _G.Celestial.CoinEngine
+			if engine and engine.RecordSpeedChange and oldValue ~= v then
+				pcall(engine.RecordSpeedChange, oldValue, v)
+			end
+		end)
 		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
