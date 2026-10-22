@@ -5029,7 +5029,8 @@ local CoinEngine = {
 	SoftBrake = true,            -- frenada progresiva: no pasar de 45 a 0 studs/s en un solo frame al llegar a la moneda
 	SoftBrakeGain = 8,           -- ganancia de frenado al acercarse con SoftBrake (menor = frena desde mas lejos)
 	SoftBrakeDecay = 0.5,        -- factor por frame de la velocidad al llegar (0.5 = la mitad cada frame)
-	PingSettle = true,           -- espera previa a recoger = ping + margen (antes: ping/2 + 0.02)
+	PingSettle = false,          -- espera previa a recoger = ping + margen (antes: ping/2 + 0.02). OFF: en el log V3 costo ~35% de monedas/s sin mejora demostrada
+	DiagNoCollect = false,       -- SOLO DIAGNOSTICO: vuela y frena igual pero NO llama a firetouchinterest (no recoge monedas reales)
 	PingSettleMargin = 0.05,
 	PingSettleMax = 0.30,
 	-- ===== DETECTOR DE RONDA =====
@@ -5066,6 +5067,7 @@ local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
 local currentSpeed = 0
+local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
 local coinsSinceRest = 0
 local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
@@ -5648,10 +5650,13 @@ local function CollectCoin(root, coin, now)
 		LogEvent("touch-api-unavailable")
 		return false
 	end
-	local ok = pcall(function()
-		firetouchinterest(root, coin, 0)
-		firetouchinterest(root, coin, 1)
-	end)
+	local ok = true
+	if not CoinEngine.DiagNoCollect then
+		ok = pcall(function()
+			firetouchinterest(root, coin, 0)
+			firetouchinterest(root, coin, 1)
+		end)
+	end
 	if not ok then
 		LogEvent("touch-api-failed")
 		return false
@@ -5895,7 +5900,7 @@ local function ControllerStep(dt)
 			lastProgress = now
 			if CoinEngine.SoftBrake then
 				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
-				currentSpeed = currentSpeed * CoinEngine.SoftBrakeDecay
+				currentSpeed = math.min(currentSpeed, lastFlightV) * CoinEngine.SoftBrakeDecay
 				if currentSpeed > 1 and flightVel and dist > 0.001 then
 					flightVel.Velocity = (delta / dist) * currentSpeed
 					velApplied = true
@@ -5909,10 +5914,10 @@ local function ControllerStep(dt)
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
-				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d",
+				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d dn=%d",
 					dist, root.AssemblyLinearVelocity.Magnitude, now - arriveAt, now - lastCollectAt, settle,
 					target.Position.Y - rootPos.Y, CoinEngine.SoftBrake and 1 or 0, CoinEngine.PingSettle and 1 or 0,
-					math.floor(tonumber(State.TweenSpeed) or 0))
+					math.floor(tonumber(State.TweenSpeed) or 0), CoinEngine.DiagNoCollect and 1 or 0)
 				lastCollectAt = now
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
@@ -5941,6 +5946,7 @@ local function ControllerStep(dt)
 		local gain = Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain)
 		if CoinEngine.SoftBrake then gain = math.min(gain, CoinEngine.SoftBrakeGain) end
 		local v = math.min(currentSpeed, math.max(remaining, 0) * gain)
+		lastFlightV = v
 		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		if v == v and flightVel then
 			flightVel.Velocity = dir * v
