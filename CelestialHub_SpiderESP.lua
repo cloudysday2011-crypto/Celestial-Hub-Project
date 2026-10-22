@@ -25,6 +25,18 @@ end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
+-- Snapshot the prior session's reset log before any new diagnostic event can overwrite it.
+_G.Celestial.PreviousFarmResetLogSnapshot = nil
+pcall(function()
+	if type(readfile) == "function" then
+		if type(isfile) ~= "function" or isfile("CelestialFarmResetLog.txt") then
+			local previous = readfile("CelestialFarmResetLog.txt")
+			if type(previous) == "string" and previous ~= "" then
+				_G.Celestial.PreviousFarmResetLogSnapshot = previous
+			end
+		end
+	end
+end)
 
 if _G.Celestial.CrosshairCleanup then
 	pcall(_G.Celestial.CrosshairCleanup)
@@ -798,6 +810,60 @@ local function ShowKickLogLoadingGui()
 	text.Parent = mainFrame
 
 	_G.Celestial.KickLogLoadingGui = scanGui
+	task.spawn(function()
+		while scanGui.Parent do
+			task.wait(0.02)
+			image.Rotation = (image.Rotation + 5) % 360
+		end
+	end)
+	return scanGui
+end
+
+-- Same spinner and timing as the Hub/Kick loaders, dedicated to previous reset-cause logs.
+local function ShowResetLogLoadingGui()
+	local oldLoader = CoreGui:FindFirstChild("CelestialResetLogLoadingGui")
+	if oldLoader then pcall(function() oldLoader:Destroy() end) end
+
+	local scanGui = Instance.new("ScreenGui")
+	scanGui.Name = "CelestialResetLogLoadingGui"
+	scanGui.ResetOnSpawn = false
+	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	scanGui.IgnoreGuiInset = true
+	scanGui.Parent = CoreGui
+
+	local mainFrame = Instance.new("Frame")
+	mainFrame.Name = "ScanningFrame"
+	mainFrame.Size = UDim2.new(0, 300, 0, 192)
+	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	mainFrame.BackgroundTransparency = 0.25
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Parent = scanGui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 16)
+	corner.Parent = mainFrame
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "ScanImage"
+	image.Size = UDim2.new(0, 140, 0, 140)
+	image.Position = UDim2.new(0.5, -70, 0, 10)
+	image.BackgroundTransparency = 1
+	image.Image = "rbxassetid://91431616848054"
+	image.ScaleType = Enum.ScaleType.Fit
+	image.Parent = mainFrame
+
+	local text = Instance.new("TextLabel")
+	text.Name = "ScanText"
+	text.Size = UDim2.new(1, -20, 0, 25)
+	text.Position = UDim2.new(0, 10, 1, -32)
+	text.BackgroundTransparency = 1
+	text.Text = "Loading Reset Log..."
+	text.TextColor3 = Color3.fromRGB(255, 255, 255)
+	text.Font = Enum.Font.GothamBold
+	text.TextSize = 18
+	text.Parent = mainFrame
+
+	_G.Celestial.ResetLogLoadingGui = scanGui
 	task.spawn(function()
 		while scanGui.Parent do
 			task.wait(0.02)
@@ -5625,38 +5691,387 @@ end
 
 local farmResetDiagnosticConnections = {}
 _G.Celestial.FarmResetDiagnosticConnections = farmResetDiagnosticConnections
-local function WatchFarmDiagnosticHumanoid(character)
+
+-- Reset attribution is deliberately evidence-based. A respawn alone does not prove whether the
+-- user reset, the game/server reset the character, or a player killed them.
+local ResetDiag = {
+	LastRemoval = nil,
+	LastDeath = nil,
+	LastClassification = nil,
+	WatchedHumanoids = setmetatable({}, {__mode = "k"}),
+}
+
+ResetDiag.Clean = function(value, maxLen)
+	return tostring(value or "?"):gsub("[%c|]", " "):sub(1, maxLen or 180)
+end
+
+ResetDiag.RoleForName = function(name, roleSnapshot)
+	name = tostring(name or "")
+	if name == "" then return "UNKNOWN" end
+	if name == (roleSnapshot and roleSnapshot.murderer or State.MurdererName) then return "MURDERER" end
+	if name == (roleSnapshot and roleSnapshot.sheriff or State.SheriffName) then return "SHERIFF" end
+	if name == (roleSnapshot and roleSnapshot.hero or State.HeroName) then return "HERO" end
+	local player = Players:FindFirstChild(name)
+	if player and player.Team then
+		local teamName = string.lower(player.Team.Name)
+		if teamName:find("murder", 1, true) then return "MURDERER" end
+		if teamName:find("sheriff", 1, true) then return "SHERIFF" end
+	end
+	return "PLAYER_ROLE_UNKNOWN"
+end
+
+ResetDiag.ResolvePlayer = function(value)
+	if typeof(value) == "Instance" then
+		if value:IsA("Player") then return value end
+		local model = value:IsA("Model") and value or value:FindFirstAncestorOfClass("Model")
+		if model then
+			local ok, player = pcall(function() return Players:GetPlayerFromCharacter(model) end)
+			if ok and player then return player end
+		end
+		local current = Players:GetPlayerFromCharacter(LocalPlayer.Character)
+		if current and value == current.Character then return current end
+	elseif type(value) == "string" then
+		local raw = value:gsub("^%s+", ""):gsub("%s+$", "")
+		for _, player in ipairs(Players:GetPlayers()) do
+			if string.lower(player.Name) == string.lower(raw)
+				or string.lower(player.DisplayName) == string.lower(raw) then return player end
+		end
+	end
+	return nil
+end
+
+ResetDiag.ReadKillerTag = function(character, humanoid)
+	local markerNames = {
+		creator = true, killer = true, killername = true, attacker = true, attackername = true,
+		lastdamager = true, damager = true, killcredit = true, damageowner = true,
+		killedby = true, lastattacker = true,
+	}
+	local roots = {}
+	if humanoid then roots[#roots + 1] = humanoid end
+	if character then roots[#roots + 1] = character end
+	for _, root in ipairs(roots) do
+		local okDesc, descendants = pcall(function() return root:GetDescendants() end)
+		if okDesc and descendants then
+			for index, obj in ipairs(descendants) do
+				if index > 500 then break end
+				local normalizedName = string.lower(obj.Name or ""):gsub("[^%w]", "")
+				if markerNames[normalizedName] then
+					local value
+					if obj:IsA("ObjectValue") then
+						pcall(function() value = obj.Value end)
+					elseif obj:IsA("StringValue") then
+						pcall(function() value = obj.Value end)
+					end
+					local player = ResetDiag.ResolvePlayer(value)
+					if player and player ~= LocalPlayer then
+						return player, "tag:" .. obj:GetFullName()
+					end
+				end
+				if obj.GetAttributes then
+					local okAttrs, attrs = pcall(function() return obj:GetAttributes() end)
+					if okAttrs and attrs then
+						for attrName, attrValue in pairs(attrs) do
+							local n = string.lower(tostring(attrName)):gsub("[^%w]", "")
+						if markerNames[n] then
+							local player = ResetDiag.ResolvePlayer(attrValue)
+							if player and player ~= LocalPlayer then
+								return player, "attribute:" .. n
+							end
+						end
+						end
+					end
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+ResetDiag.ReadDeathUiKiller = function()
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return nil, nil end
+	local okDesc, descendants = pcall(function() return playerGui:GetDescendants() end)
+	if not okDesc or not descendants then return nil, nil end
+	for index, obj in ipairs(descendants) do
+		if index > 1800 then break end
+		if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.Visible then
+			local text = string.lower(tostring(obj.Text or ""))
+			local indicatesDeath = text:find("killed by", 1, true) or text:find("shot by", 1, true)
+				or text:find("murdered by", 1, true) or text:find("eliminated by", 1, true)
+				or text:find("te mató", 1, true) or text:find("asesinado por", 1, true)
+				or text:find("matado por", 1, true) or text:find("te disparó", 1, true)
+			if indicatesDeath then
+				for _, player in ipairs(Players:GetPlayers()) do
+					if player ~= LocalPlayer and (text:find(string.lower(player.Name), 1, true)
+						or text:find(string.lower(player.DisplayName), 1, true)) then
+						return player, "death-ui:" .. ResetDiag.Clean(obj:GetFullName(), 100)
+					end
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+ResetDiag.ReadRoundUiEvidence = function()
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return nil end
+	local okDesc, descendants = pcall(function() return playerGui:GetDescendants() end)
+	if not okDesc or not descendants then return nil end
+	for index, obj in ipairs(descendants) do
+		if index > 1400 then break end
+		if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+			local text = string.lower(tostring(obj.Text or ""))
+			if text:find("intermission", 1, true) or text:find("waiting for players", 1, true)
+				or text:find("waiting for more players", 1, true) or text:find("round over", 1, true)
+				or text:find("game over", 1, true) or text:find("voting for", 1, true)
+				or text:find("esperando jugadores", 1, true) or text:find("fin de la ronda", 1, true)
+				or text:find("partida terminada", 1, true) then
+				return ResetDiag.Clean(text, 100)
+			end
+		end
+	end
+	return nil
+end
+
+ResetDiag.ClassifyDeath = function(character, humanoid)
+	local roleSnapshot = {
+		murderer = State.MurdererName, sheriff = State.SheriffName, hero = State.HeroName,
+		localRole = ResetDiag.RoleForName(LocalPlayer.Name), round = roundActive,
+		farm = State.FarmEnabled, speed = tonumber(State.TweenSpeed) or -1,
+	}
+	local killer, source = ResetDiag.ReadKillerTag(character, humanoid)
+	if not killer then killer, source = ResetDiag.ReadDeathUiKiller() end
+	local classification, confidence, evidence = "DEATH_CAUSE_UNKNOWN", "LOW", "Humanoid.Died observed; no killer source exposed"
+	if killer then
+		local killerRole = ResetDiag.RoleForName(killer.Name, roleSnapshot)
+		if killerRole == "MURDERER" then
+			classification, confidence = "KILLED_BY_MURDERER", "HIGH"
+		elseif killerRole == "SHERIFF" then
+			classification, confidence = "SHOT_BY_SHERIFF", "HIGH"
+		elseif killerRole == "HERO" then
+			classification, confidence = "SHOT_BY_HERO", "HIGH"
+		else
+			classification, confidence = "KILLED_BY_IDENTIFIED_PLAYER", "HIGH"
+		end
+		evidence = "attacker=" .. killer.Name .. ";role=" .. killerRole .. ";source=" .. tostring(source)
+	else
+		-- If the round/lobby changed and no attacker source exists, prefer a round-reset diagnosis
+		-- over guessing that a murderer or sheriff caused the death.
+		local roundUi = ResetDiag.ReadRoundUiEvidence()
+		if roundUi and not roleSnapshot.round then
+			classification, confidence = "GAME_OR_ROUND_RESET_SUSPECTED", "MEDIUM"
+			evidence = "Humanoid.Died without attacker source; round-ui=" .. roundUi
+		-- Role-based causes are explicitly marked as hypotheses, never as confirmed attribution.
+		elseif roleSnapshot.localRole == "MURDERER" and roleSnapshot.sheriff ~= "" then
+			classification, confidence = "POSSIBLE_SHERIFF_SHOT_UNCONFIRMED", "LOW"
+			evidence = "local-player-was-murderer;sheriff-known=" .. roleSnapshot.sheriff .. ";no-killer-tag-or-death-ui"
+		elseif roleSnapshot.murderer ~= "" and roleSnapshot.murderer ~= LocalPlayer.Name then
+			classification, confidence = "POSSIBLE_MURDERER_KILL_UNCONFIRMED", "LOW"
+			evidence = "murderer-known=" .. roleSnapshot.murderer .. ";no-killer-tag-or-death-ui"
+		else
+			local health = -1
+			pcall(function() health = humanoid and humanoid.Health or -1 end)
+			if health <= 0 then evidence = "Humanoid health reached zero; attacker attribution unavailable" end
+		end
+	end
+	ResetDiag.LastDeath = {
+		At = os.clock(), Character = character, Classification = classification,
+		Confidence = confidence, RoleSnapshot = roleSnapshot,
+	}
+	ResetDiag.LastClassification = classification
+	PersistFarmDiagnosticEvent(
+		"RESET-CLASSIFICATION kind=" .. classification .. " confidence=" .. confidence
+			.. " evidence=" .. ResetDiag.Clean(evidence, 220)
+			.. " localRole=" .. tostring(roleSnapshot.localRole)
+			.. " round=" .. tostring(roleSnapshot.round)
+			.. " farm=" .. tostring(roleSnapshot.farm)
+			.. " speed=" .. tostring(roleSnapshot.speed), character)
+end
+
+ResetDiag.ClassifyNoDeathReset = function(removal, newCharacter)
+	if not removal or removal.DeathObserved then return end
+	local roundUi = ResetDiag.ReadRoundUiEvidence()
+	local classification, confidence, evidence
+	if roundUi then
+		classification, confidence = "GAME_OR_ROUND_RESET_SUSPECTED", "MEDIUM"
+		evidence = "character-removed-without-Died;round-ui=" .. roundUi
+	elseif removal.Health and removal.Health > 0 and removal.FarmEnabled and removal.Noclip then
+		classification, confidence = "FORCED_OR_SERVER_RESET_DURING_AUTOFARM", "MEDIUM"
+		evidence = "character-removed-alive-while-farm-and-noclip-active;server-vs-manual-source-not-exposed"
+	elseif removal.Health and removal.Health > 0 then
+		classification, confidence = "RESET_WITHOUT_DEATH_SOURCE_UNKNOWN", "LOW"
+		evidence = "character-removed-while-Humanoid-health-positive;could-be-game-server-or-manual-reset"
+	else
+		classification, confidence = "RESPAWN_WITHOUT_OBSERVED_DEATH", "LOW"
+		evidence = "CharacterRemoving/Added observed but no Humanoid.Died event was captured"
+	end
+	ResetDiag.LastClassification = classification
+	PersistFarmDiagnosticEvent(
+		"RESET-CLASSIFICATION kind=" .. classification .. " confidence=" .. confidence
+			.. " evidence=" .. ResetDiag.Clean(evidence, 220)
+			.. " priorRound=" .. tostring(removal.RoundActive)
+			.. " priorFarm=" .. tostring(removal.FarmEnabled)
+			.. " priorSpeed=" .. tostring(removal.Speed)
+			.. " priorPos=" .. tostring(removal.Position), newCharacter or removal.Character)
+	return classification, confidence, evidence
+end
+
+ResetDiag.Explain = function(classification)
+	local explanations = {
+		KILLED_BY_MURDERER = "Un registro de atacante o la interfaz identificó al Murderer.",
+		SHOT_BY_SHERIFF = "Un registro de atacante o la interfaz identificó al Sheriff.",
+		SHOT_BY_HERO = "Un registro de atacante o la interfaz identificó al Héroe que llevaba el arma.",
+		KILLED_BY_IDENTIFIED_PLAYER = "Se identificó al atacante, pero CH no pudo confirmar su rol.",
+		POSSIBLE_SHERIFF_SHOT_UNCONFIRMED = "Posible disparo del Sheriff: inferido por los roles, no confirmado directamente.",
+		POSSIBLE_MURDERER_KILL_UNCONFIRMED = "Posible asesinato del Murderer: inferido por los roles, no confirmado directamente.",
+		DEATH_CAUSE_UNKNOWN = "Se observó una muerte normal, pero no se encontró quién la causó.",
+		GAME_OR_ROUND_RESET_SUSPECTED = "El personaje reapareció sin evento Died y la interfaz sugiere un cambio de ronda/juego.",
+		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; el origen exacto no está expuesto.",
+		RESET_WITHOUT_DEATH_SOURCE_UNKNOWN = "El personaje desapareció vivo; no hay evidencia suficiente para separar reset manual y reset del servidor/juego.",
+		RESPAWN_WITHOUT_OBSERVED_DEATH = "Se detectó respawn, pero no se capturó una causa verificable.",
+	}
+	return explanations[classification] or "Causa no concluyente; consulta el archivo CelestialFarmResetLog.txt."
+end
+
+ResetDiag.ShowResult = function(classification, confidence, evidence)
+	pcall(function()
+		local old = CoreGui:FindFirstChild("CelestialResetCauseResult")
+		if old then old:Destroy() end
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "CelestialResetCauseResult"
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		gui.Parent = CoreGui
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(0, 340, 0, 230)
+		frame.Position = UDim2.new(0.5, -170, 0.5, -115)
+		frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+		frame.BorderSizePixel = 0
+		frame.Parent = gui
+		Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+		local title = Instance.new("TextLabel")
+		title.Size = UDim2.new(1, -20, 0, 30)
+		title.Position = UDim2.new(0, 10, 0, 8)
+		title.BackgroundTransparency = 1
+		title.Text = "Diagnóstico del reinicio"
+		title.TextColor3 = Color3.fromRGB(255, 255, 255)
+		title.Font = Enum.Font.GothamBold
+		title.TextSize = 16
+		title.Parent = frame
+		local body = Instance.new("TextLabel")
+		body.Size = UDim2.new(1, -20, 0, 130)
+		body.Position = UDim2.new(0, 10, 0, 42)
+		body.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+		body.BackgroundTransparency = 0.15
+		body.BorderSizePixel = 0
+		body.Text = "Resultado: " .. tostring(classification)
+			.. "\nConfianza: " .. tostring(confidence)
+			.. "\n\n" .. ResetDiag.Explain(classification)
+			.. "\n\nEvidencia: " .. ResetDiag.Clean(evidence, 240)
+		body.TextColor3 = Color3.fromRGB(220, 220, 225)
+		body.Font = Enum.Font.Code
+		body.TextSize = 11
+		body.TextWrapped = true
+		body.TextXAlignment = Enum.TextXAlignment.Left
+		body.TextYAlignment = Enum.TextYAlignment.Top
+		body.Parent = frame
+		Instance.new("UICorner", body).CornerRadius = UDim.new(0, 6)
+		local close = Instance.new("TextButton")
+		close.Size = UDim2.new(1, -20, 0, 30)
+		close.Position = UDim2.new(0, 10, 1, -40)
+		close.BackgroundColor3 = Color3.fromRGB(65, 65, 72)
+		close.BorderSizePixel = 0
+		close.Text = "Cerrar"
+		close.TextColor3 = Color3.new(1, 1, 1)
+		close.Font = Enum.Font.GothamBold
+		close.TextSize = 13
+		close.Parent = frame
+		Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
+		close.Activated:Connect(function() pcall(function() gui:Destroy() end) end)
+	end)
+end
+
+ResetDiag.WatchHumanoid = function(character)
 	if not character then return end
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	if not hum then
 		task.spawn(function()
 			local ok, found = pcall(function() return character:WaitForChild("Humanoid", 8) end)
 			if ok then hum = found end
-			if hum and hum:IsA("Humanoid") then
+			if hum and hum:IsA("Humanoid") and not ResetDiag.WatchedHumanoids[hum] then
+				ResetDiag.WatchedHumanoids[hum] = true
 				table.insert(farmResetDiagnosticConnections, hum.Died:Connect(function()
-					PersistFarmDiagnosticEvent("humanoid-died", character)
+					ResetDiag.ClassifyDeath(character, hum)
 				end))
 			end
 		end)
 		return
 	end
+	if ResetDiag.WatchedHumanoids[hum] then return end
+	ResetDiag.WatchedHumanoids[hum] = true
 	table.insert(farmResetDiagnosticConnections, hum.Died:Connect(function()
-		PersistFarmDiagnosticEvent("humanoid-died", character)
+		ResetDiag.ClassifyDeath(character, hum)
 	end))
 end
 
 table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterRemoving:Connect(function(character)
-	PersistFarmDiagnosticEvent("character-removing", character)
+	local hum = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local health, position = -1, "unknown"
+	pcall(function() if hum then health = hum.Health end end)
+	pcall(function() if root then position = string.format("(%.1f,%.1f,%.1f)", root.Position.X, root.Position.Y, root.Position.Z) end end)
+	local lastDeath = ResetDiag.LastDeath
+	local deathObserved = lastDeath and lastDeath.Character == character and (os.clock() - lastDeath.At) <= 3 or false
+	if not deathObserved and hum and health <= 0 then
+		-- Sometimes CharacterRemoving wins the race against Died; grab any still-present killer evidence now.
+		pcall(ResetDiag.ClassifyDeath, character, hum)
+		deathObserved = true
+	end
+	ResetDiag.LastRemoval = {
+		At = os.clock(), Character = character, Health = health, Position = position,
+		DeathObserved = deathObserved, RoundActive = roundActive, FarmEnabled = State.FarmEnabled,
+		Noclip = noclipOn, Speed = tonumber(State.TweenSpeed) or -1,
+	}
+	PersistFarmDiagnosticEvent(
+		"character-removing health=" .. tostring(health)
+			.. " deathObserved=" .. tostring(deathObserved)
+			.. " round=" .. tostring(roundActive)
+			.. " farm=" .. tostring(State.FarmEnabled)
+			.. " noclip=" .. tostring(noclipOn), character)
 end))
+
 table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(function(character)
 	PersistFarmDiagnosticEvent("character-added", character)
-	WatchFarmDiagnosticHumanoid(character)
+	ResetDiag.WatchHumanoid(character)
+	local removal = ResetDiag.LastRemoval
+	if removal and (os.clock() - removal.At) <= 15 then
+		local loader = ShowResetLogLoadingGui()
+		task.spawn(function()
+			task.wait(0.35)
+			local classification, confidence, evidence
+			if ResetDiag.LastRemoval == removal and not removal.DeathObserved then
+				classification, confidence, evidence = ResetDiag.ClassifyNoDeathReset(removal, character)
+			else
+				local death = ResetDiag.LastDeath
+				classification = death and death.Classification or "DEATH_CAUSE_UNKNOWN"
+				confidence = death and death.Confidence or "LOW"
+				evidence = death and "Humanoid.Died captured; see Reset Log for role/source details" or "Character respawned; direct death cause unavailable"
+				PersistFarmDiagnosticEvent("respawn-after-observed-death cause=" .. tostring(classification), character)
+			end
+			task.wait(1.15)
+			if loader then pcall(function() loader:Destroy() end) end
+			if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
+			if _G.Celestial.HubLoaded == true then ResetDiag.ShowResult(classification, confidence, evidence) end
+		end)
+	end
 	task.spawn(function()
 		local ok, root = pcall(function() return character:WaitForChild("HumanoidRootPart", 8) end)
 		if ok and root then PersistFarmDiagnosticEvent("character-added-root-ready", character) end
 	end)
 end))
-WatchFarmDiagnosticHumanoid(LocalPlayer.Character)
+ResetDiag.WatchHumanoid(LocalPlayer.Character)
 
 local function StopFarmForSafety(reason)
 	if logFinalized then return end
@@ -11492,6 +11907,7 @@ State.PowerDetectorActive = true
 -- Recovers a log saved by a previous session and offers manual copying.
 -- This does not attempt to bypass a kick or automatically rejoin servers.
 -- ====================================================================
+_G.Celestial.KickLogRecoveryQueued = true
 task.spawn(function()
 	local okRead, previousLog = pcall(function()
 		if type(isfile) == "function" and not isfile("CelestialFarmLog.txt") then
@@ -11501,6 +11917,7 @@ task.spawn(function()
 		return readfile("CelestialFarmLog.txt")
 	end)
 	if not okRead or type(previousLog) ~= "string" or previousLog == "" then
+		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
 
@@ -11508,7 +11925,10 @@ task.spawn(function()
 	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
 		task.wait(0.1)
 	end
-	if _G.Celestial.HubLoadFailed then return end
+	if _G.Celestial.HubLoadFailed then
+		_G.Celestial.KickLogRecoveryQueued = false
+		return
+	end
 
 	local loadingGui = ShowKickLogLoadingGui()
 	task.wait(1.5)
@@ -11626,7 +12046,127 @@ task.spawn(function()
 	end)
 	close.Activated:Connect(function()
 		pcall(function() gui:Destroy() end)
+		_G.Celestial.KickLogRecoveryQueued = false
 	end)
+end)
+
+-- Recover the previous Reset Log after Kick Log is dismissed, using the same spinner animation.
+task.spawn(function()
+	local previousResetLog = _G.Celestial.PreviousFarmResetLogSnapshot
+	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
+	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do task.wait(0.1) end
+	if _G.Celestial.HubLoadFailed then return end
+	while _G.Celestial.KickLogRecoveryQueued == true
+		or CoreGui:FindFirstChild("CelestialKickLogLoadingGui")
+		or CoreGui:FindFirstChild("CelestialFarmLogRecovery") do
+		task.wait(0.2)
+	end
+
+	local loadingGui = ShowResetLogLoadingGui()
+	task.wait(1.5)
+	if loadingGui then pcall(function() loadingGui:Destroy() end) end
+	if _G.Celestial.ResetLogLoadingGui == loadingGui then _G.Celestial.ResetLogLoadingGui = nil end
+
+	local oldGui = CoreGui:FindFirstChild("CelestialFarmResetLogRecovery")
+	if oldGui then pcall(function() oldGui:Destroy() end) end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "CelestialFarmResetLogRecovery"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = CoreGui
+
+	local frame = Instance.new("Frame")
+	frame.Name = "ResetLogFrame"
+	frame.Size = UDim2.new(0, 340, 0, 250)
+	frame.Position = UDim2.new(0.5, -170, 0.5, -125)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -20, 0, 32)
+	title.Position = UDim2.new(0, 10, 0, 8)
+	title.BackgroundTransparency = 1
+	title.Text = "Reset Log"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.Parent = frame
+
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, -20, 0, 22)
+	status.Position = UDim2.new(0, 10, 0, 42)
+	status.BackgroundTransparency = 1
+	status.Text = "Previous reset diagnosis loaded."
+	status.TextColor3 = Color3.fromRGB(190, 190, 200)
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 11
+	status.Parent = frame
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Name = "ResetLogPreview"
+	scroll.Size = UDim2.new(1, -20, 0, 130)
+	scroll.Position = UDim2.new(0, 10, 0, 68)
+	scroll.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 5
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scroll.Parent = frame
+	Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
+
+	local preview = Instance.new("TextLabel")
+	preview.Size = UDim2.new(1, -12, 0, 0)
+	preview.Position = UDim2.new(0, 6, 0, 6)
+	preview.AutomaticSize = Enum.AutomaticSize.Y
+	preview.BackgroundTransparency = 1
+	preview.Text = previousResetLog
+	preview.TextColor3 = Color3.fromRGB(220, 220, 225)
+	preview.Font = Enum.Font.Code
+	preview.TextSize = 10
+	preview.TextXAlignment = Enum.TextXAlignment.Left
+	preview.TextYAlignment = Enum.TextYAlignment.Top
+	preview.TextWrapped = true
+	preview.Parent = scroll
+	task.defer(function() scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12) end)
+
+	local copy = Instance.new("TextButton")
+	copy.Name = "CopyResetLog"
+	copy.Size = UDim2.new(0.62, -8, 0, 32)
+	copy.Position = UDim2.new(0, 10, 1, -42)
+	copy.BackgroundColor3 = Color3.fromRGB(65, 105, 190)
+	copy.BorderSizePixel = 0
+	copy.Text = "Copy Reset Log"
+	copy.TextColor3 = Color3.new(1, 1, 1)
+	copy.Font = Enum.Font.GothamBold
+	copy.TextSize = 12
+	copy.Parent = frame
+	Instance.new("UICorner", copy).CornerRadius = UDim.new(0, 7)
+
+	local close = Instance.new("TextButton")
+	close.Name = "CloseResetLog"
+	close.Size = UDim2.new(0.38, -12, 0, 32)
+	close.Position = UDim2.new(0.62, 2, 1, -42)
+	close.BackgroundColor3 = Color3.fromRGB(65, 65, 72)
+	close.BorderSizePixel = 0
+	close.Text = "Close"
+	close.TextColor3 = Color3.new(1, 1, 1)
+	close.Font = Enum.Font.GothamBold
+	close.TextSize = 13
+	close.Parent = frame
+	Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
+
+	copy.Activated:Connect(function()
+		local clipboard = setclipboard or toclipboard or set_clipboard
+		if type(clipboard) == "function" then
+			local okCopy = pcall(clipboard, previousResetLog)
+			status.Text = okCopy and "Reset log copied to clipboard." or "Clipboard failed; open CelestialFarmResetLog.txt."
+		else
+			status.Text = "Clipboard unavailable; open CelestialFarmResetLog.txt manually."
+		end
+	end)
+	close.Activated:Connect(function() pcall(function() gui:Destroy() end) end)
 end)
 
 print("✨ CELESTIAL FRAMEWORK V19.18.16 - MM2 / DUELS / SPIDER ESP + OBJECT ESP + SELF ESP ✨")
