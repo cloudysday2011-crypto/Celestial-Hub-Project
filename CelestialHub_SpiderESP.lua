@@ -5041,6 +5041,9 @@ local CoinEngine = {
 	RoundEndDebounce = 3.0,      -- sin armas en ningun inventario durante este tiempo = ronda terminada
 	SettleMin = 0.03,          -- espera minima al llegar a la moneda (el servidor ve tu posicion con retraso)
 	SettleMax = 0.15,
+	PingAdaptiveSpeed = true,  -- V3.3 (HIPOTESIS): con ping alto el servidor ve tu posicion mas atrasada; se reduce la velocidad. false = desactivar
+	PingAdaptiveStart = 150,   -- ms de ping a partir de los que se reduce (velocidad * 150/ping)
+	PingAdaptiveMin = 20,      -- velocidad minima (studs/s) aunque el ping sea enorme
 	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
@@ -5373,7 +5376,7 @@ end
 -- Con PingSettle: espera al menos un ping completo + margen para que el servidor te vea ya parado
 -- junto a la moneda antes del toque. Sin el interruptor devuelve el valor original.
 local function GetCollectSettle(now, safe)
-	local base = safe and GetSettleTime(now) or 0.03
+	local base = GetSettleTime(now)   -- V3.3: la espera sigue al ping tambien sin Safe Mode (log: settle=0.03 fijo con ping 175-273 antes del kick)
 	if not CoinEngine.PingSettle then return base end
 	if not safe then GetSettleTime(now) end   -- refresca cachedPingMs tambien fuera de Safe Mode
 	local want = cachedPingMs / 1000 + CoinEngine.PingSettleMargin
@@ -5470,43 +5473,52 @@ local function ResetDiagnosticLog()
 end
 
 -- V3.3: contador REAL de monedas del juego (indicador de la esquina inferior izquierda de MM2).
--- Busca un TextLabel numerico visible en esa esquina de PlayerGui y lo lee. Si no lo encuentra, gc=-1.
--- La ruta encontrada se registra una vez como evento "gc-path=..." para poder verificarla.
-local gcLabel, gcNextScan, gcPathLogged = nil, 0, nil
-local function ReadGameCoins(now)
-	if gcLabel and (not gcLabel.Parent or not gcLabel:IsDescendantOf(game)) then gcLabel = nil end
-	if not gcLabel and now >= gcNextScan then
-		gcNextScan = now + 3
+-- Candidatos = textos numericos visibles en esa esquina de PlayerGui. Se elige el que CAMBIA de valor
+-- (el contador real cambia al recoger; un texto fijo como el "125" del log anterior no). Sin candidatos: -1.
+-- Al aparecer candidatos nuevos se registra el evento "gc-cands=ruta:texto|..." para verificarlos.
+CoinEngine.GcCands = {}
+CoinEngine.GcNextScan = 0
+function CoinEngine.ReadGameCoins(now)
+	local cands = CoinEngine.GcCands
+	if now >= CoinEngine.GcNextScan then
+		CoinEngine.GcNextScan = now + 5
 		pcall(function()
 			local pg = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
 			local cam = workspace.CurrentCamera
 			if not pg or not cam then return end
 			local vp = cam.ViewportSize
-			local best, bestScore
+			local added, count = {}, 0
+			for _, c in pairs(cands) do count += 1 end
 			for _, o in ipairs(pg:GetDescendants()) do
-				if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible then
+				if count >= 8 then break end
+				if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Visible and not cands[o] then
 					local txt = o.Text
 					if txt:match("^%s*%d+%s*$") or txt:match("^%s*%d+%s*/%s*%d+%s*$") then
 						local ap = o.AbsolutePosition
 						if ap.X < vp.X * 0.35 and ap.Y > vp.Y * 0.60 then
-							local score = ap.X + (vp.Y - ap.Y)   -- menor = mas cerca de la esquina inferior izquierda
-							if not bestScore or score < bestScore then best, bestScore = o, score end
+							cands[o] = {last = tonumber(txt:match("^%s*(%d+)")) or -1, changes = 0}
+							count += 1
+							added[#added + 1] = o:GetFullName() .. ":" .. txt
 						end
 					end
 				end
 			end
-			gcLabel = best
-			if best and gcPathLogged ~= best then
-				gcPathLogged = best
-				LogEvent("gc-path=" .. best:GetFullName())
-			end
+			if #added > 0 then LogEvent("gc-cands=" .. table.concat(added, "|")) end
 		end)
 	end
-	if gcLabel then
-		local a = gcLabel.Text:match("^%s*(%d+)")
-		return a and tonumber(a) or -1
+	local best, bestChanges = -1, -1
+	for lbl, c in pairs(cands) do
+		if lbl.Parent then
+			local n = tonumber(lbl.Text:match("^%s*(%d+)"))
+			if n then
+				if n ~= c.last then c.changes += 1; c.last = n end
+				if c.changes > bestChanges then best, bestChanges = n, c.changes end
+			end
+		else
+			cands[lbl] = nil
+		end
 	end
-	return -1
+	return best
 end
 
 local function LogStep(now, dt, force)
@@ -5546,7 +5558,7 @@ local function LogStep(now, dt, force)
 		coinsCollectedTotal, tostring(roundActive), roundCollected,
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
 		tostring(batchPausing), math.max(0, pauseUntil - now),
-		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, ReadGameCoins(now), table.concat(pendingEvents, ","))
+		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -5728,6 +5740,21 @@ local function WeaponsAssigned(includeDroppedGun)
 	return false
 end
 
+-- V3.3: limpieza al terminar cada ronda. Registra cuantas entradas habia (para comprobar si algo se acumulaba)
+-- y vacia las tablas que se reconstruyen solas. NO toca CoinCache (las monedas de la ronda siguiente ya pueden
+-- existir) ni el registro de diagnostico.
+function CoinEngine.CleanupRoundCaches()
+	local nb, na, ng = 0, 0, 0
+	for _ in pairs(CoinEngine.Blacklist) do nb += 1 end
+	for _ in pairs(CoinEngine.Attempts) do na += 1 end
+	for _ in pairs(CoinEngine.GroundOk) do ng += 1 end
+	table.clear(CoinEngine.Blacklist)
+	table.clear(CoinEngine.Attempts)
+	table.clear(CoinEngine.GroundOk)
+	CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
+	LogEvent(string.format("round-cleanup bl=%d att=%d gnd=%d cache=%d", nb, na, ng, CoinEngine.CoinCount))
+end
+
 local function UpdateRound(now)
 	if now < nextRoundCheck then return end
 	nextRoundCheck = now + 0.25
@@ -5755,6 +5782,7 @@ local function UpdateRound(now)
 			ResetRoundCounters()
 			ResetPath()
 			LogEvent("round-end")
+			CoinEngine.CleanupRoundCaches()
 		end
 	end
 end
@@ -5914,6 +5942,9 @@ local function ControllerStep(dt)
 
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	if CoinEngine.PingAdaptiveSpeed and cachedPingMs > CoinEngine.PingAdaptiveStart then
+		speed = math.min(speed, math.max(CoinEngine.PingAdaptiveMin, speed * CoinEngine.PingAdaptiveStart / cachedPingMs))
+	end
 	dt = math.clamp(dt, 0, 0.05)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual
@@ -5968,10 +5999,10 @@ local function ControllerStep(dt)
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
-				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d dn=%d",
+				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d dn=%d sf=%d",
 					dist, root.AssemblyLinearVelocity.Magnitude, now - arriveAt, now - lastCollectAt, settle,
 					target.Position.Y - rootPos.Y, CoinEngine.SoftBrake and 1 or 0, CoinEngine.PingSettle and 1 or 0,
-					math.floor(tonumber(State.TweenSpeed) or 0), CoinEngine.DiagNoCollect and 1 or 0)
+					math.floor(tonumber(State.TweenSpeed) or 0), CoinEngine.DiagNoCollect and 1 or 0, safe and 1 or 0)
 				lastCollectAt = now
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
