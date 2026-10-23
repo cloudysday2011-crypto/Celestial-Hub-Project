@@ -1,7 +1,7 @@
--- V3.20: V3.18 80-speed movement + threat-aware routing, with Auto-Farm noclip removed so physical collisions remain active.
--- V3.20 stability note: keeps the slider range and requested-speed ceiling at 80.
--- Auto-Farm no longer forces CanCollide=false; the existing solid-overlap guard can reroute
--- when a path is obstructed. This is not a guarantee against server-side movement rejection.
+-- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
+-- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
+-- Auto-Farm noclip remains disabled; collision bypass and server-validation evasion are not enabled.
+-- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -5206,7 +5206,7 @@ local CoinEngine = {
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
-	-- V3.20: threat-aware routing shares the existing movement controller; it never writes CFrame.
+	-- V3.22: threat-aware routing shares the existing movement controller; it never writes CFrame.
 	ThreatResponse = {
 		Enabled = true,
 		EnterDistance = 15,       -- same red-zone distance shown by the Dangerometer
@@ -5222,6 +5222,12 @@ local CoinEngine = {
 		NextRouteCheckAt = 0,
 		LastSeenAt = 0,
 		LastDistance = math.huge,
+		-- V3.22: explicit self-role guard; never route away from the local player.
+		LocalMurderer = false,
+		LocalMurdererSafe = false,
+		LocalMurdererSafeLogged = false,
+		NextSelfRoleScanAt = 0,
+		SelfRoleScanInterval = 0.25,
 	},
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
 	BaseMaxSpeed = 80,         -- V3.14: conserva el tope original del slider
@@ -5272,7 +5278,7 @@ local CoinEngine = {
 	PingAdaptiveSpeed = false, -- V3.14: compatibilidad heredada; el ping ya no reduce la velocidad objetivo
 	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
 	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
-	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
+	NoclipWanted = false,      -- V3.22: Auto-Farm conserva las colisiones fisicas
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
@@ -5375,7 +5381,7 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	CoinEngine.NoclipWanted = false      -- V3.20: Auto-Farm conserva las colisiones físicas
+	CoinEngine.NoclipWanted = false      -- V3.22: Auto-Farm conserva las colisiones físicas
 end
 
 -- Estabilidad adaptativa V3.14.
@@ -5673,6 +5679,10 @@ local function Deactivate()
 	CoinEngine.ThreatResponse.NextRouteCheckAt = 0
 	CoinEngine.ThreatResponse.LastSeenAt = 0
 	CoinEngine.ThreatResponse.LastDistance = math.huge
+	CoinEngine.ThreatResponse.LocalMurderer = false
+	CoinEngine.ThreatResponse.LocalMurdererSafe = false
+	CoinEngine.ThreatResponse.LocalMurdererSafeLogged = false
+	CoinEngine.ThreatResponse.NextSelfRoleScanAt = 0
 	weaponsSince, noWeaponsSince = nil, nil
 	ResetRoundCounters()
 	StopFlight()
@@ -5826,7 +5836,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.20 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5909,6 +5919,13 @@ local function LogStep(now, dt, force)
 	if not root then return end
 	local p = root.Position
 	local tgt = CoinEngine.CurrentTarget
+	local targetPos = (tgt and tgt.Parent) and tgt.Position or Vector3.new(-1, -1, -1)
+	local targetName = (tgt and tgt.Parent) and tostring(tgt.Name):gsub("%s+", "_"):gsub("[^%w_%-]", "") or "none"
+	local threatState = CoinEngine.ThreatResponse or {}
+	local threatDistance = tonumber(threatState.LastDistance) or -1
+	if threatDistance == math.huge or threatDistance ~= threatDistance then threatDistance = -1 end
+	local threatActiveFlag = threatState.Active and 1 or 0
+	local selfMurdererFlag = threatState.LocalMurderer and 1 or 0
 	local sampleDt = lastLogAt and math.max(now - lastLogAt, 0) or 0
 	local sampleDelta = lastLogPos and (p - lastLogPos).Magnitude or -1
 	-- Si el intervalo es muy corto (muestra forzada justo despues de otra), la division amplifica el
@@ -5928,12 +5945,13 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
 		commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1,
+		targetPos.X, targetPos.Y, targetPos.Z, targetName, threatDistance, threatActiveFlag, selfMurdererFlag,
 		1 / frameDt, frameDt * 1000, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
 		hum and tostring(hum.PlatformStand) or "?",
@@ -5994,7 +6012,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 4 | script-version=3.20 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
+				"log-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -6620,8 +6638,55 @@ local function PickNearest(fromPos, exclude, now)
 	return nil
 end
 
+-- V3.22: identify the local player's Murderer role from authoritative local script signals.
+-- Cached briefly to avoid scanning tools/inventory every movement frame.
+CoinEngine.DetectLocalMurderer = function(now)
+	local threat = CoinEngine.ThreatResponse
+	if now < (threat.NextSelfRoleScanAt or 0) then
+		return threat.LocalMurderer == true
+	end
+	threat.NextSelfRoleScanAt = now + (threat.SelfRoleScanInterval or 0.25)
+
+	local isMurderer = false
+	local localName = LocalPlayer and LocalPlayer.Name or ""
+	local stateName = tostring(State.MurdererName or "")
+	if localName ~= "" and stateName == localName then
+		isMurderer = true
+	end
+
+	if not isMurderer then
+		local ok, role = pcall(GetPlayerTeam, LocalPlayer)
+		if ok and role == "MURDERER" then isMurderer = true end
+	end
+
+	if not isMurderer then
+		local detector = _G.Celestial and _G.Celestial.PowerDetector
+		if detector and detector.CurrentPlayer == LocalPlayer then
+			local detectorState = string.lower(tostring(detector.CurrentState or ""))
+			if detectorState:find("you are the murderer", 1, true)
+				or detectorState:find("local murderer", 1, true) then
+				isMurderer = true
+			end
+		end
+	end
+
+	-- Inventory is only a fallback during an active round and in a murder game mode.
+	-- Requiring a knife without a gun reduces false positives from unrelated tools.
+	if not isMurderer and roundActive then
+		local mode = string.upper(tostring(_G.Celestial.GameMode or "MM2"))
+		local murderMode = mode == "MM2" or mode:find("MURDER", 1, true) ~= nil
+		if murderMode then
+			local ok, hasKnife, hasGun = pcall(CheckPlayerInventory, LocalPlayer)
+			if ok and hasKnife == true and hasGun ~= true then isMurderer = true end
+		end
+	end
+
+	threat.LocalMurderer = isMurderer
+	return isMurderer
+end
+
 -- ---------------------------------------------------------------
--- V3.20: MURDER THREAT RESPONSE / DANGEROMETER ROLE SHARING
+-- V3.22: MURDER THREAT RESPONSE / DANGEROMETER ROLE SHARING
 -- Detects the Murderer using the role scanner used by the Dangerometer, then
 -- redirects coin selection through the same movement engine (no CFrame teleport).
 -- ---------------------------------------------------------------
@@ -6769,6 +6834,25 @@ end
 local function UpdateThreatResponse(root, now)
 	local threat = CoinEngine.ThreatResponse
 	if not threat.Enabled or not root then return nil, math.huge end
+
+	-- If the local player is confirmed as Murderer, do not classify them as their own danger.
+	-- Clear any stale threat route and return to the normal coin selector.
+	if CoinEngine.DetectLocalMurderer(now) then
+		threat.Active = false
+		threat.Murderer = nil
+		threat.CachedMurderer = nil
+		threat.LastDistance = math.huge
+		threat.LastSeenAt = now
+		threat.LocalMurdererSafe = true
+		if not threat.LocalMurdererSafeLogged then
+			threat.LocalMurdererSafeLogged = true
+			return "self-murderer-safe", math.huge
+		end
+		return nil, math.huge
+	end
+	threat.LocalMurdererSafe = false
+	threat.LocalMurdererSafeLogged = false
+
 	local wasActive = threat.Active
 	local murderer = ResolveFarmMurderer(now)
 	local murderRoot = murderer and GetRoot(murderer)
@@ -6954,7 +7038,7 @@ local function ControllerStep(dt)
 
 	local now = os.clock()
 	local rawDt = dt
-	CoinEngine.NoclipWanted = false     -- V3.20: no desactiva colisiones durante el Auto-Farm
+	CoinEngine.NoclipWanted = false     -- V3.22: no desactiva colisiones durante el Auto-Farm
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -7056,7 +7140,7 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- V3.20: update the Dangerometer-backed Murderer distance and temporarily favor safer coins.
+	-- V3.22: update the Dangerometer-backed Murderer distance and temporarily favor safer coins.
 	local threatTransition, threatDistance = UpdateThreatResponse(root, now)
 	if threatTransition == "entered" then
 		local saferCoin = PickThreatCoin(root.Position, nil, now)
@@ -7065,10 +7149,14 @@ local function ControllerStep(dt)
 		local separation = saferCoin and murderRoot and (saferCoin.Position - murderRoot.Position).Magnitude or -1
 		LogEvent(string.format("murder-threat-response entered dist=%.1f targetSep=%.1f target=%s",
 			threatDistance, separation, saferCoin and saferCoin:GetFullName() or "none"))
-	elseif threatTransition == "released" then
-		-- Drop the temporary route; the normal nearest-coin selector takes over immediately.
+	elseif threatTransition == "released" or threatTransition == "self-murderer-safe" then
+		-- Drop the temporary route; normal nearest-coin routing takes over immediately.
 		SetCurrent(nil, now)
-		LogEvent("murder-threat-response released normal-routing=1")
+		if threatTransition == "self-murderer-safe" then
+			LogEvent("murder-threat-response self-role-safe=1 local-is-murderer=1 normal-routing=1")
+		else
+			LogEvent("murder-threat-response released normal-routing=1")
+		end
 	end
 	local threat = CoinEngine.ThreatResponse
 	if threat.Active and now >= threat.NextRouteCheckAt then
@@ -12859,7 +12947,7 @@ local function SummarizeFarmLog(raw, kind)
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.20",
+		"CH " .. kind .. " SUMMARY | analizador=3.21",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
