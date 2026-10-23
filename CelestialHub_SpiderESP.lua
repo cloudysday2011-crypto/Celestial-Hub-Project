@@ -1,4 +1,4 @@
--- V3.15: measured-data log analyzer, load-ready log UI, smoothed adaptive steering; speed ceiling remains 80.
+-- V3.16: separated telemetry windows, evidence-based summaries, Hub-first log recovery and render-confirmed loaders; speed ceiling remains 80.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -26,25 +26,9 @@ end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
--- Recover only an unconsumed, explicitly classified game-reset incident.
--- Older diagnostic files created by slider changes / deaths are deliberately ignored.
+-- Reset-log recovery intentionally does not read files here. It runs only after the
+-- Hub startup screen/UI has finished, so the order is Hub -> Loading Reset Log -> content.
 _G.Celestial.PreviousFarmResetLogSnapshot = nil
-pcall(function()
-	if type(readfile) ~= "function" then return end
-	if type(isfile) == "function" and not isfile("CelestialFarmResetLog.txt") then return end
-	local previous = readfile("CelestialFarmResetLog.txt")
-	if type(previous) ~= "string" or previous == "" then return end
-	if not previous:find("CH-RESET-INCIDENT:", 1, true) then return end
-	-- V3.4/V3.5 could mislabel a natural round-end/lobby transition as a game reset.
-	-- Never recover those older ambiguous records as a Reset Log.
-	if previous:find("GAME_OR_ROUND_RESET_SUSPECTED", 1, true)
-		or previous:find("NORMAL_ROUND_TRANSITION", 1, true) then return end
-	local consumed = ""
-	if type(isfile) ~= "function" or isfile("CelestialFarmResetLogConsumed.txt") then
-		pcall(function() consumed = readfile("CelestialFarmResetLogConsumed.txt") or "" end)
-	end
-	if consumed ~= previous then _G.Celestial.PreviousFarmResetLogSnapshot = previous end
-end)
 
 if _G.Celestial.CrosshairCleanup then
 	pcall(_G.Celestial.CrosshairCleanup)
@@ -881,6 +865,68 @@ local function ShowResetLogLoadingGui()
 		end
 	end)
 	return scanGui
+end
+
+-- Log UI lifecycle: no diagnostic loader may appear over the Hub startup screen.
+local function WaitForHubStartupComplete()
+	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
+		task.wait(0.05)
+	end
+	if _G.Celestial.HubLoaded ~= true or _G.Celestial.HubLoadFailed == true then return false end
+	-- HubLoaded is set after UI construction; also wait for the exact startup loader to be gone.
+	while true do
+		local registered = _G.Celestial.ScanGui
+		local visible = CoreGui:FindFirstChild("CelestialScanGui")
+		local registeredVisible = registered and registered.Parent ~= nil
+		local guiVisible = visible and visible.Parent ~= nil
+		if not registeredVisible and not guiVisible then break end
+		if _G.Celestial.HubLoadFailed == true then return false end
+		task.wait(0.05)
+	end
+	-- Allow one layout/render turn after the startup loader vanishes.
+	pcall(function() RunService.RenderStepped:Wait() end)
+	return true
+end
+
+-- Keep a log loader alive until its actual content has nonzero geometry and stays stable
+-- for several rendered frames. This replaces brittle one-second / two-frame timing guesses.
+local function WaitForLogContentRendered(screenGui, contentObject, scrollObject)
+	if not screenGui or not contentObject then return false end
+	local previousX, previousY, previousCanvas = -1, -1, -1
+	local stableFrames = 0
+	while screenGui.Parent do
+		local stepped = pcall(function() RunService.RenderStepped:Wait() end)
+		if not stepped then task.wait(0.03) end
+		if not screenGui.Parent then return false end
+		if contentObject.Parent then
+			local size = contentObject.AbsoluteSize
+			local textBoundsY = 0
+			pcall(function() textBoundsY = contentObject.TextBounds.Y end)
+			local height = math.max(size.Y, textBoundsY)
+			local canvasY = height + math.max(0, contentObject.Position.Y.Offset) + 12
+			if scrollObject and scrollObject.Parent then
+				pcall(function() scrollObject.CanvasSize = UDim2.new(0, 0, 0, math.ceil(canvasY)) end)
+			end
+			local canvasHeight = canvasY
+			if scrollObject and scrollObject.Parent then
+				pcall(function() canvasHeight = scrollObject.CanvasSize.Y.Offset end)
+			end
+			if size.X > 0 and height > 0
+				and math.abs(size.X - previousX) < 1
+				and math.abs(height - previousY) < 1
+				and math.abs(canvasHeight - previousCanvas) < 1 then
+				stableFrames += 1
+			else
+				stableFrames = 0
+			end
+			previousX, previousY, previousCanvas = size.X, height, canvasHeight
+			if stableFrames >= 3 then return true end
+		else
+			stableFrames = 0
+			task.wait(0.03)
+		end
+	end
+	return false
 end
 
 -- ====================================================================
@@ -5643,7 +5689,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 2 | script-version=3.15 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 3 | script-version=3.16 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5808,8 +5854,11 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
+				"log-schema: 3 | script-version=3.16 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
+				"--- DIAGNOSTIC EVENT TIMELINE ---",
+				table.concat(farmDiagnosticEvents, "\n"),
 				"--- NORMAL LOG (recent samples) ---",
 				table.concat(logBuf, "\n"),
 				"--- HI-RES (recent frames) ---",
@@ -6139,7 +6188,7 @@ ResetDiag.Explain = function(classification)
 		DEATH_CAUSE_UNKNOWN = "Se observó una muerte normal, pero no se encontró quién la causó.",
 		NORMAL_ROUND_TRANSITION = "El juego terminó la ronda y devolvió al personaje al lobby. Es un proceso normal; no genera Reset Log.",
 		GAME_OR_ROUND_RESET_SUSPECTED = "Clasificación antigua/ambigua; no se debe recuperar como incidente de Reset Log.",
-		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio probable del juego/servidor: el personaje desapareció vivo con AutoFarm y noclip activos y el slider registrado era de al menos 49.5. Roblox no expone la causa exacta, así que no es una certeza absoluta.",
+		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio posible durante AutoFarm: el personaje desapareció vivo con AutoFarm y noclip activos y el slider registrado era de al menos 49.5. Ese umbral es solo un indicio de contexto, no demuestra que la velocidad causara el reset; Roblox no expone aquí la causa interna exacta.",
 		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; origen ambiguo, no se guarda como reinicio del juego.",
 		RESET_WITHOUT_DEATH_SOURCE_UNKNOWN = "El personaje desapareció vivo; no hay evidencia suficiente para separar reset manual y reset del servidor/juego.",
 		RESPAWN_WITHOUT_OBSERVED_DEATH = "Se detectó respawn, pero no se capturó una causa verificable.",
@@ -6277,15 +6326,21 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(
 			local isGameResetCandidate = noDeathResetCandidate
 				and classification == "GAME_RESET_LIKELY_DURING_AUTOFARM"
 			if isGameResetCandidate then
+				-- Character events can arrive while CH is still booting. Never overlay this loader
+				-- on "Loading Celestial Hub..."; wait for the Hub and startup screen first.
+				if not WaitForHubStartupComplete() then return end
 				local loader = ShowResetLogLoadingGui()
-				if _G.Celestial.HubLoaded == true then
+				local showOk = pcall(function()
 					ResetDiag.ShowResult(classification, confidence, evidence)
-				end
-				-- Keep the spinner above the result until the result panel has actually rendered.
-				pcall(function()
-					RunService.RenderStepped:Wait()
-					RunService.RenderStepped:Wait()
 				end)
+				local resultGui = CoreGui:FindFirstChild("CelestialResetCauseResult")
+				local resultFrame = resultGui and resultGui:FindFirstChildWhichIsA("Frame", true)
+				if showOk and resultGui and resultFrame then
+					pcall(WaitForLogContentRendered, resultGui, resultFrame, nil)
+				else
+					-- If creation failed, do not strand the spinner; let one render turn expose the error state.
+					pcall(function() RunService.RenderStepped:Wait() end)
+				end
 				if loader then pcall(function() loader:Destroy() end) end
 				if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
 			end
@@ -12229,64 +12284,103 @@ State.PowerDetectorActive = true
 local function SummarizeFarmLog(raw, kind)
 	raw = tostring(raw or "")
 	kind = string.upper(tostring(kind or "LOG"))
-	local reason = raw:match("reason:%s*([^\r\n]+)") or (raw:match("^([^\r\n]+)") or "sin encabezado")
+	local firstLine = raw:match("^([^\r\n]+)") or "sin encabezado"
+	local reason = raw:match("reason:%s*([^\r\n]+)")
+		or raw:match("CH%-RESET%-INCIDENT:%s*([^\r\n]+)") or firstLine
 	local schema = raw:match("log%-schema:%s*([^\r\n]+)") or "legacy / sin versión de esquema"
+	local scriptVersion = raw:match("script%-version=([^%s|]+)") or "no declarado"
 	local classification = kind == "RESET"
 		and (raw:match("classification=([%w_%-]+)") or raw:match("kind=([%w_%-]+)")) or nil
 	local function num(line, key)
 		return tonumber(line:match("%f[%w_]" .. key .. "=([%-]?[%d%.]+)"))
 	end
 	local function truth(line, key)
-		local v = line:match("%f[%w_]" .. key .. "=(%w+)")
-		return v == "true"
+		return line:match("%f[%w_]" .. key .. "=(%w+)") == "true"
 	end
 	local function pct(a, b)
 		return b > 0 and (100 * a / b) or 0
 	end
-	local function occurrences(haystack, needle)
-		local count, cursor = 0, 1
-		while true do
-			local at = haystack:find(needle, cursor, true)
-			if not at then break end
-			count += 1
-			cursor = at + #needle
+	local function push(stats, value)
+		if value ~= nil and value == value then
+			stats.values[#stats.values + 1] = value
+			stats.sum = stats.sum + value
+			stats.min = math.min(stats.min, value)
+			stats.max = math.max(stats.max, value)
 		end
-		return count
+	end
+	local function newStats()
+		return { values = {}, sum = 0, min = math.huge, max = -math.huge }
+	end
+	local function statsLine(label, stats, unit, decimals)
+		if #stats.values == 0 then return label .. ": no disponible" end
+		local average = stats.sum / #stats.values
+		local fmt = "%0." .. tostring(decimals or 1) .. "f"
+		return string.format(label .. ": mín./prom./máx.=" .. fmt .. "/" .. fmt .. "/" .. fmt .. " " .. unit .. " (%d lecturas)",
+			stats.min, average, stats.max, #stats.values)
+	end
+	local function percentile(values, p)
+		if #values == 0 then return nil end
+		local sorted = table.clone(values)
+		table.sort(sorted)
+		local ix = math.max(1, math.min(#sorted, math.ceil(#sorted * p)))
+		return sorted[ix]
+	end
+	local function fmtMaybe(value, decimals, unit)
+		if value == nil or value == math.huge or value == -math.huge then return "no disponible" end
+		return string.format("%0." .. tostring(decimals or 1) .. "f%s", value, unit or "")
 	end
 	local data = {
-		regular = 0, hires = 0, cmdMax = 0, physMax = 0, cmdYMax = 0, vyMax = 0,
-		sliderMax = nil, sliderMin = nil, pingMin = math.huge, pingMax = 0, pingSum = 0, pingN = 0,
-		fpsMin = math.huge, fpsMax = 0, fpsSum = 0, fpsN = 0, lowFps = 0,
-		solid = 0, noclip = 0, platform = 0, sampleTimeMin = math.huge, sampleTimeMax = -math.huge,
-		stepMax = 0, sampleSpeedMax = 0, nearCoinMin = math.huge, coinLast = "?", gameCoinLast = "?",
-		riskSum = 0, riskMax = 0, riskN = 0, steerMin = math.huge, steerMax = 0, steerN = 0,
-		physOverCmd = 0, stateCounts = {}, legacyNoSlider = false,
+		regular = 0, hires = 0,
+		cmdMax = 0, physMax = 0, cmdYMax = 0, vyMax = 0,
+		normalCmdMax = 0, normalPhysMax = 0, normalCmdYMax = 0, normalVyMax = 0,
+		hiresCmdMax = 0, hiresPhysMax = 0, hiresCmdYMax = 0, hiresVyMax = 0,
+		sliderMax = nil, sliderMin = nil,
+		regularPing = newStats(), hiresPing = newStats(),
+		regularFps = newStats(), hiresInferredFps = newStats(),
+		regularLowFps = 0, hiresLowFps = 0, hiresVeryLowFps = 0,
+		solid = 0, noclip = 0, platform = 0,
+		normalTimeMin = math.huge, normalTimeMax = -math.huge,
+		hiresTimeMin = math.huge, hiresTimeMax = -math.huge,
+		hiresDtSum = 0, hiresDtCount = 0, hiresDtMax = 0,
+		normalGapMax = 0, normalGapOver500 = 0,
+		stepMax = 0, sampleSpeedMax = 0, nearCoinMin = math.huge,
+		hiStepMax = 0, hiSpeedMax = 0, hiStepOver5 = 0, hiSpeedOver100 = 0,
+		coinLast = "?", gameCoinLast = "?",
+		riskSum = 0, riskMax = 0, riskN = 0, steerMin = math.huge, steerMax = -math.huge, steerN = 0,
+		physOverCmd = 0, normalOverCmd = 0, hiresOverCmd = 0, stateCounts = {}, normalMissingPing = 0, normalMissingFps = 0,
+		lastHiPos = nil, lastHiT = nil, declaredMetrics = nil,
 	}
+	data.declaredMetrics = schema:match("metrics=([^\r\n]+)")
 	local inHires = false
 	for line in raw:gmatch("[^\r\n]+") do
-		if line:find("--- HI-RES:", 1, true) then
+		if line:find("--- HI-RES:", 1, true) or line:find("--- HI-RES (recent frames) ---", 1, true) then
 			inHires = true
 		elseif line:find(" sdt=", 1, true) then
 			data.regular += 1
 			local t = num(line, "t")
-			if t then data.sampleTimeMin = math.min(data.sampleTimeMin, t); data.sampleTimeMax = math.max(data.sampleTimeMax, t) end
+			if t then data.normalTimeMin = math.min(data.normalTimeMin, t); data.normalTimeMax = math.max(data.normalTimeMax, t) end
+			local sdt = num(line, "sdt")
+			if sdt and sdt >= 0 then
+				data.normalGapMax = math.max(data.normalGapMax, sdt)
+				if sdt > 0.5 then data.normalGapOver500 += 1 end
+			end
 			local cmd, phys = num(line, "cmd"), num(line, "phys")
 			local vy, cmdY, ping, fps = num(line, "vy"), num(line, "cmdY"), num(line, "ping"), num(line, "fps")
 			local slider, step, sampleSpd, toCoin = num(line, "slider"), num(line, "step"), num(line, "sampleSpd"), num(line, "toCoin")
 			local risk, steer = num(line, "risk"), num(line, "steer")
-			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)) end
-			if phys then data.physMax = math.max(data.physMax, math.abs(phys)) end
-			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)) end
-			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)) end
+			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)); data.normalCmdMax = math.max(data.normalCmdMax, math.abs(cmd)) end
+			if phys then data.physMax = math.max(data.physMax, math.abs(phys)); data.normalPhysMax = math.max(data.normalPhysMax, math.abs(phys)) end
+			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)); data.normalVyMax = math.max(data.normalVyMax, math.abs(vy)) end
+			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)); data.normalCmdYMax = math.max(data.normalCmdYMax, math.abs(cmdY)) end
 			if slider then data.sliderMax = data.sliderMax and math.max(data.sliderMax, slider) or slider; data.sliderMin = data.sliderMin and math.min(data.sliderMin, slider) or slider end
-			if ping then data.pingMin = math.min(data.pingMin, ping); data.pingMax = math.max(data.pingMax, ping); data.pingSum += ping; data.pingN += 1 end
-			if fps then data.fpsMin = math.min(data.fpsMin, fps); data.fpsMax = math.max(data.fpsMax, fps); data.fpsSum += fps; data.fpsN += 1; if fps < 25 then data.lowFps += 1 end end
-			if step then data.stepMax = math.max(data.stepMax, math.abs(step)) end
-			if sampleSpd then data.sampleSpeedMax = math.max(data.sampleSpeedMax, math.abs(sampleSpd)) end
+			if ping then push(data.regularPing, ping) else data.normalMissingPing += 1 end
+			if fps and fps > 0 then push(data.regularFps, fps); if fps < 25 then data.regularLowFps += 1 end else data.normalMissingFps += 1 end
+			if step and step >= 0 then data.stepMax = math.max(data.stepMax, step) end
+			if sampleSpd and sampleSpd >= 0 then data.sampleSpeedMax = math.max(data.sampleSpeedMax, sampleSpd) end
 			if toCoin and toCoin >= 0 then data.nearCoinMin = math.min(data.nearCoinMin, toCoin) end
 			if risk then data.riskMax = math.max(data.riskMax, risk); data.riskSum += risk; data.riskN += 1 end
 			if steer then data.steerMin = math.min(data.steerMin, steer); data.steerMax = math.max(data.steerMax, steer); data.steerN += 1 end
-			if cmd and phys and phys > cmd + 15 then data.physOverCmd += 1 end
+			if cmd and phys and math.abs(phys) - math.abs(cmd) > 15 then data.physOverCmd += 1; data.normalOverCmd += 1 end
 			if truth(line, "inSolid") then data.solid += 1 end
 			if truth(line, "noclip") then data.noclip += 1 end
 			if truth(line, "platformStand") then data.platform += 1 end
@@ -12298,94 +12392,153 @@ local function SummarizeFarmLog(raw, kind)
 		elseif inHires and line:match("%f[%w_]dt=[%-]?[%d%.]+ms") and line:find("pos=", 1, true) then
 			data.hires += 1
 			local t = num(line, "t")
-			if t then data.sampleTimeMin = math.min(data.sampleTimeMin, t); data.sampleTimeMax = math.max(data.sampleTimeMax, t) end
+			if t then data.hiresTimeMin = math.min(data.hiresTimeMin, t); data.hiresTimeMax = math.max(data.hiresTimeMax, t) end
 			local cmd, phys, cmdY, ping = num(line, "cmd"), num(line, "phys"), num(line, "cmdY"), num(line, "ping")
 			local vy = tonumber(line:match("vel=%([^,]+,([%-]?[%d%.]+),"))
 			local dtMs = tonumber(line:match("%f[%w_]dt=([%-]?[%d%.]+)ms"))
-			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)) end
-			if phys then data.physMax = math.max(data.physMax, math.abs(phys)) end
-			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)) end
-			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)) end
-			if ping then data.pingMin = math.min(data.pingMin, ping); data.pingMax = math.max(data.pingMax, ping); data.pingSum += ping; data.pingN += 1 end
+			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)); data.hiresCmdMax = math.max(data.hiresCmdMax, math.abs(cmd)) end
+			if phys then data.physMax = math.max(data.physMax, math.abs(phys)); data.hiresPhysMax = math.max(data.hiresPhysMax, math.abs(phys)) end
+			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)); data.hiresCmdYMax = math.max(data.hiresCmdYMax, math.abs(cmdY)) end
+			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)); data.hiresVyMax = math.max(data.hiresVyMax, math.abs(vy)) end
+			if ping then push(data.hiresPing, ping) end
 			if dtMs and dtMs > 0 then
-				local fps = 1000 / dtMs
-				data.fpsMin = math.min(data.fpsMin, fps); data.fpsMax = math.max(data.fpsMax, fps); data.fpsSum += fps; data.fpsN += 1
-				if fps < 25 then data.lowFps += 1 end
+				data.hiresDtSum += dtMs / 1000
+				data.hiresDtCount += 1
+				data.hiresDtMax = math.max(data.hiresDtMax, dtMs)
+				local inferredFps = 1000 / dtMs
+				push(data.hiresInferredFps, inferredFps)
+				if inferredFps < 25 then data.hiresLowFps += 1 end
+				if inferredFps < 10 then data.hiresVeryLowFps += 1 end
 			end
-			if cmd and phys and phys > cmd + 15 then data.physOverCmd += 1 end
+			if cmd and phys and math.abs(phys) - math.abs(cmd) > 15 then data.physOverCmd += 1; data.hiresOverCmd += 1 end
+			local px, py, pz = line:match("pos=%(([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)%)")
+			px, py, pz = tonumber(px), tonumber(py), tonumber(pz)
+			if px and py and pz then
+				local currentPos = {x = px, y = py, z = pz}
+				if data.lastHiPos then
+					local dx, dy, dz = px - data.lastHiPos.x, py - data.lastHiPos.y, pz - data.lastHiPos.z
+					local delta = math.sqrt(dx * dx + dy * dy + dz * dz)
+					data.hiStepMax = math.max(data.hiStepMax, delta)
+					if delta > 5 then data.hiStepOver5 += 1 end
+					if dtMs and dtMs > 0 then
+						local speed = delta / (dtMs / 1000)
+						data.hiSpeedMax = math.max(data.hiSpeedMax, speed)
+						if speed > 100 then data.hiSpeedOver100 += 1 end
+					end
+				end
+				data.lastHiPos = currentPos
+			end
 		end
 	end
-	-- Legacy logs can have sliderSpeed only in diagnostic event records, not in each sample.
+	-- Legacy logs can declare sliderSpeed only in event records instead of normal sample rows.
 	for value in raw:gmatch("sliderSpeed=([%-]?[%d%.]+)") do
 		local n = tonumber(value)
 		if n then data.sliderMax = data.sliderMax and math.max(data.sliderMax, n) or n; data.sliderMin = data.sliderMin and math.min(data.sliderMin, n) or n end
 	end
-	if data.regular == 0 and data.hires == 0 then data.legacyNoSlider = true end
-	local total = data.regular
-	local duration = (data.sampleTimeMax > data.sampleTimeMin and data.sampleTimeMin < math.huge) and (data.sampleTimeMax - data.sampleTimeMin) or nil
+	local normalDuration = (data.normalTimeMax > data.normalTimeMin and data.normalTimeMin < math.huge)
+		and (data.normalTimeMax - data.normalTimeMin) or nil
+	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
+		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.15",
+		"CH " .. kind .. " SUMMARY | analizador=3.16",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
+		"Versión del script registrada: " .. scriptVersion,
 	}
 	if classification then out[#out + 1] = "Clasificación del incidente: " .. classification end
-	out[#out + 1] = string.format("Cobertura: muestras normales=%d | frames HI-RES=%d | duración observada=%s",
-		data.regular, data.hires, duration and string.format("%.2f s", duration) or "no calculable")
+	out[#out + 1] = string.format("Cobertura: muestras normales=%d (%s) | frames HI-RES=%d (%s) | suma de dt HI-RES=%s",
+		data.regular, normalDuration and string.format("%.2f s", normalDuration) or "duración no calculable",
+		data.hires, hiresDuration and string.format("ventana %.2f s", hiresDuration) or "ventana no calculable",
+		data.hiresDtCount > 0 and string.format("%.2f s en %d intervalos", data.hiresDtSum, data.hiresDtCount) or "no disponible")
 	if data.regular > 0 or data.hires > 0 then
-		out[#out + 1] = string.format("Velocidad: slider máx. observado=%s | comando máx.=%.1f | física máx.=%.1f | pico físico-comando >15=%d muestras",
-			data.sliderMax and string.format("%.1f", data.sliderMax) or "no registrado por muestra", data.cmdMax, data.physMax, data.physOverCmd)
-		out[#out + 1] = string.format("Vertical: |vy| físico máx.=%.1f | |cmdY| máx.=%.1f | desplazamiento por muestra máx.=%.2f | sampleSpd máx.=%.1f",
-			data.vyMax, data.cmdYMax, data.stepMax, data.sampleSpeedMax)
-		if data.pingN > 0 then
-			out[#out + 1] = string.format("Red: ping mín./prom./máx.=%.0f/%.0f/%.0f ms (%d lecturas)", data.pingMin, data.pingSum / data.pingN, data.pingMax, data.pingN)
-		else
-			out[#out + 1] = "Red: ping no disponible en las muestras analizadas."
+		out[#out + 1] = string.format("Velocidad: slider observado mín./máx.=%s/%s | comando máximo=%.1f | física máxima=%.1f | muestras con diferencia física-comando >15=%.0f",
+			fmtMaybe(data.sliderMin, 1), fmtMaybe(data.sliderMax, 1), data.cmdMax, data.physMax, data.physOverCmd)
+		out[#out + 1] = string.format("Picos por fuente: NORMAL cmd/phys=%.1f/%.1f | HI-RES cmd/phys=%.1f/%.1f | diferencia física-comando >15: normal=%d, HI-RES=%d",
+			data.normalCmdMax, data.normalPhysMax, data.hiresCmdMax, data.hiresPhysMax, data.normalOverCmd, data.hiresOverCmd)
+		out[#out + 1] = string.format("Vertical por fuente: NORMAL |vy|/|cmdY|=%.1f/%.1f | HI-RES |vy|/|cmdY|=%.1f/%.1f | paso normal máx.=%.2f studs | sampleSpd máx.=%.1f",
+			data.normalVyMax, data.normalCmdYMax, data.hiresVyMax, data.hiresCmdYMax, data.stepMax, data.sampleSpeedMax)
+		out[#out + 1] = string.format("Posición HI-RES: salto máx. entre frames=%.2f studs | velocidad inferida por delta/dt máx.=%.1f | saltos >5 studs=%d | intervalos >100 studs/s=%d",
+			data.hiStepMax, data.hiSpeedMax, data.hiStepOver5, data.hiSpeedOver100)
+		out[#out + 1] = statsLine("Red NORMAL (ping medido)", data.regularPing, "ms", 0)
+		out[#out + 1] = statsLine("Red HI-RES (ping medido)", data.hiresPing, "ms", 0)
+		out[#out + 1] = string.format("Cobertura del ping: NORMAL sin lectura=%d/%d | HI-RES sin lectura=%d/%d",
+			math.max(0, data.regular - #data.regularPing.values), data.regular,
+			math.max(0, data.hires - #data.hiresPing.values), data.hires)
+		if #data.regularPing.values > 0 then
+			local p95 = percentile(data.regularPing.values, 0.95)
+			out[#out + 1] = "Red NORMAL p95 estimado=" .. fmtMaybe(p95, 0, " ms") .. " (percentil de las lecturas guardadas; no es ping continuo)"
 		end
-		if data.fpsN > 0 then
-			out[#out + 1] = string.format("Render: FPS mín./prom./máx.=%.1f/%.1f/%.1f | lecturas <25 FPS=%d",
-				data.fpsMin, data.fpsSum / data.fpsN, data.fpsMax, data.lowFps)
+		out[#out + 1] = statsLine("Render NORMAL (FPS guardados)", data.regularFps, "FPS", 1)
+		if #data.regularFps.values > 0 then
+			out[#out + 1] = string.format("Render NORMAL: lecturas <25 FPS=%d/%d (%.1f%%); lecturas sin FPS=%d",
+				data.regularLowFps, #data.regularFps.values, pct(data.regularLowFps, #data.regularFps.values), data.normalMissingFps)
 		end
-		out[#out + 1] = string.format("Estado: inSolid=%d/%d (%.1f%%) | noclip=%d/%d (%.1f%%) | PlatformStand=%d/%d (%.1f%%)",
-			data.solid, total, pct(data.solid, total), data.noclip, total, pct(data.noclip, total), data.platform, total, pct(data.platform, total))
-		out[#out + 1] = "Monedas: contador interno final=" .. data.coinLast .. " | contador UI observado final=" .. data.gameCoinLast .. (data.gameCoinLast == "-1" and " (contador no detectado)" or "")
+		out[#out + 1] = statsLine("Intervalo HI-RES convertido a FPS (estimación, no contador de render)", data.hiresInferredFps, "FPS", 1)
+		if #data.hiresInferredFps.values > 0 then
+			out[#out + 1] = string.format("HI-RES: intervalos equivalentes a <25 FPS=%d/%d (%.1f%%) | <10 FPS=%d | dt máximo=%.1f ms",
+				data.hiresLowFps, #data.hiresInferredFps.values, pct(data.hiresLowFps, #data.hiresInferredFps.values), data.hiresVeryLowFps, data.hiresDtMax)
+		end
+		out[#out + 1] = string.format("Estado (muestras normales): inSolid=%d/%d (%.1f%%) | noclip=%d/%d (%.1f%%) | PlatformStand=%d/%d (%.1f%%)",
+			data.solid, data.regular, pct(data.solid, data.regular), data.noclip, data.regular, pct(data.noclip, data.regular), data.platform, data.regular, pct(data.platform, data.regular))
+		out[#out + 1] = string.format("Tiempos de muestreo: intervalo normal máximo=%.3f s | intervalos normales >0.5 s=%d", data.normalGapMax, data.normalGapOver500)
+		out[#out + 1] = "Monedas: contador interno final=" .. data.coinLast .. " | contador UI observado final=" .. data.gameCoinLast
+			.. " (fuentes distintas; no asumir que son equivalentes ni restarlas sin validar cómo se actualizan)"
+		if data.gameCoinLast == "-1" then out[#out + 1] = "Contador UI: -1 indica que el detector no encontró una lectura válida, no un saldo negativo." end
 		if data.nearCoinMin < math.huge then out[#out + 1] = string.format("Aproximación: menor distancia a objetivo registrada=%.2f studs", data.nearCoinMin) end
-		if data.riskN > 0 then out[#out + 1] = string.format("Control adaptable: riesgo prom./máx.=%.2f/%.2f | steer mín./máx.=%.2f/%.2f",
-			data.riskSum / data.riskN, data.riskMax, data.steerMin, data.steerMax) end
+		if data.riskN > 0 then out[#out + 1] = string.format("Control adaptable: riesgo promedio/máximo=%.3f/%.3f | steer mínimo/máximo=%.3f/%.3f (%d lecturas)",
+			data.riskSum / data.riskN, data.riskMax, data.steerMin, data.steerMax, data.steerN) end
 		local mostCommon, mostCount = nil, 0
 		for state, count in pairs(data.stateCounts) do if count > mostCount then mostCommon, mostCount = state, count end end
-		if mostCommon then out[#out + 1] = string.format("Estado Humanoid más frecuente: %s (%d muestras)", mostCommon, mostCount) end
+		if mostCommon then out[#out + 1] = string.format("Estado Humanoid más frecuente: %s (%d/%d muestras normales)", mostCommon, mostCount, data.regular) end
 	end
 	local lower = string.lower(raw)
 	local isInvalidPosition = lower:find("invalid position", 1, true) ~= nil or lower:find("invalid-position-final", 1, true) ~= nil
 	if isInvalidPosition then
 		local clues = {}
-		if data.cmdMax >= 70 then clues[#clues + 1] = string.format("se registró comando >=70 (máx. %.1f; no es una suposición de velocidad 50)", data.cmdMax)
-		elseif data.cmdMax > 0 then clues[#clues + 1] = string.format("máximo de comando observado %.1f", data.cmdMax) end
+		if data.cmdMax >= 70 then clues[#clues + 1] = string.format("comando de movimiento alto medido (máx. %.1f)", data.cmdMax)
+		elseif data.cmdMax > 0 then clues[#clues + 1] = string.format("comando máximo medido %.1f", data.cmdMax) end
 		if data.vyMax >= 35 then clues[#clues + 1] = string.format("pico vertical físico alto (%.1f)", data.vyMax) end
-		if total > 0 and pct(data.solid, total) >= 5 then clues[#clues + 1] = string.format("solapamiento con sólidos en %.1f%% de muestras", pct(data.solid, total)) end
-		if total > 0 and pct(data.noclip, total) >= 50 then clues[#clues + 1] = string.format("noclip activo en %.1f%% de muestras", pct(data.noclip, total)) end
-		if data.pingMax >= 150 then clues[#clues + 1] = string.format("latencia observada alta (máx. %.0f ms)", data.pingMax) end
-		if data.lowFps > 0 then clues[#clues + 1] = string.format("hubo %d lecturas por debajo de 25 FPS", data.lowFps) end
-		out[#out + 1] = "Lectura basada en medidas: el archivo registra invalid-position-final; eso confirma el evento, no la causa única. " .. (#clues > 0 and ("Indicios concurrentes: " .. table.concat(clues, "; ") .. ".") or "No hay métricas suficientes para separar las causas.")
-		out[#out + 1] = "No inferir causalidad solo por coincidencia: ping, noclip y solapamientos pueden coexistir sin que este log demuestre cuál disparó la validación del servidor."
+		if data.regular > 0 and pct(data.solid, data.regular) >= 5 then clues[#clues + 1] = string.format("solapamiento con sólidos en %.1f%% de muestras normales", pct(data.solid, data.regular)) end
+		if data.regular > 0 and pct(data.noclip, data.regular) >= 50 then clues[#clues + 1] = string.format("noclip registrado en %.1f%% de muestras normales", pct(data.noclip, data.regular)) end
+		if data.regularPing.max >= 150 or data.hiresPing.max >= 150 then clues[#clues + 1] = "se registraron lecturas de ping >=150 ms" end
+		if data.regularLowFps > 0 or data.hiresLowFps > 0 then
+			clues[#clues + 1] = string.format("lecturas lentas registradas: %d FPS normales <25 y %d intervalos HI-RES equivalentes a <25 FPS", data.regularLowFps, data.hiresLowFps)
+		end
+		if data.hiStepOver5 > 0 then clues[#clues + 1] = string.format("%d transiciones HI-RES superaron 5 studs entre posiciones guardadas", data.hiStepOver5) end
+		out[#out + 1] = "Lectura basada en medidas: el archivo registra invalid-position-final; eso confirma el evento, no la causa única. "
+			.. (#clues > 0 and ("Indicios concurrentes: " .. table.concat(clues, "; ") .. ".") or "No hay métricas suficientes para separar las causas.")
+		out[#out + 1] = "Limitación causal: ninguna métrica de este archivo revela la regla interna que rechazó la posición. Los indicadores son correlaciones temporales, no prueba de qué disparó el kick."
 	elseif classification == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
-		out[#out + 1] = "Lectura: las muestras se clasificaron como posible reset durante el farmeo; revisa los eventos de respawn y ronda del log completo. No es una causa confirmada."
+		out[#out + 1] = "Lectura: la telemetría clasificó el evento como posible reset durante el farmeo; revisa la secuencia de CharacterRemoving/CharacterAdded y la ronda. No confirma el origen en servidor/juego."
 	elseif classification == "NORMAL_ROUND_TRANSITION" then
 		out[#out + 1] = "Lectura: el registro clasifica el evento como transición normal de ronda, no como reset anómalo."
 	end
+	local function countText(token)
+		local count, cursor = 0, 1
+		while true do
+			local at = raw:find(token, cursor, true)
+			if not at then break end
+			count += 1
+			cursor = at + #token
+		end
+		return count
+	end
 	local eventCounts = {
-		["solid-overlap-reroute"] = occurrences(raw, "solid-overlap-reroute"),
-		["target-stale"] = occurrences(raw, "target-stale"),
-		["server-moved-us"] = occurrences(raw, "server-moved-us"),
-		["coin-collected"] = occurrences(raw, "coin-collected"),
+		["solid-overlap-reroute"] = countText("solid-overlap-reroute"),
+		["target-stale"] = countText("target-stale"),
+		["server-moved-us"] = countText("server-moved-us"),
+		["coin-collected"] = countText("coin-collected"),
+		["safety-stop"] = countText("SAFETY-STOP"),
 	}
 	local events = {}
 	for name, count in pairs(eventCounts) do if count > 0 then events[#events + 1] = name .. "=" .. count end end
 	table.sort(events)
-	if #events > 0 then out[#out + 1] = "Eventos de interés (ocurrencias en texto, no siempre eventos únicos): " .. table.concat(events, " | ") end
-	out[#out + 1] = "Calidad: las métricas usan solo campos presentes; los logs antiguos carecen de algunas lecturas. El log completo conserva el contexto y los frames HI-RES."
-	out[#out + 1] = "Confianza: análisis local basado en telemetría; no tiene acceso a la razón interna del servidor."
-	return table.concat(out, "\n"):sub(1, 6500)
+	if #events > 0 then out[#out + 1] = "Eventos de interés (ocurrencias en texto, pueden repetirse entre ventanas): " .. table.concat(events, " | ") end
+	if data.declaredMetrics then out[#out + 1] = "Métricas declaradas por el emisor: " .. data.declaredMetrics end
+	out[#out + 1] = "Método: ping/FPS de muestras normales y lecturas HI-RES se informan por separado; dt solo permite estimar la cadencia de esos frames, no verificar los FPS del contador gráfico."
+	out[#out + 1] = "Calidad: solo se calculan campos presentes. Las muestras normales son espaciadas; HI-RES conserva una ventana reciente y no representa necesariamente todo el incidente."
+	out[#out + 1] = "Confianza: análisis local de telemetría; no tiene acceso a la razón interna del servidor."
+	return table.concat(out, "\n"):sub(1, 9000)
 end
 
 local function CopyFarmTextToClipboard(value)
@@ -12430,10 +12583,13 @@ end
 -- ====================================================================
 _G.Celestial.KickLogRecoveryQueued = true
 task.spawn(function()
+	-- Strict order: startup label/UI finishes first, then read/analyze the previous Kick Log.
+	if not WaitForHubStartupComplete() then
+		_G.Celestial.KickLogRecoveryQueued = false
+		return
+	end
 	local okRead, previousLog = pcall(function()
-		if type(isfile) == "function" and not isfile("CelestialFarmLog.txt") then
-			return nil
-		end
+		if type(isfile) == "function" and not isfile("CelestialFarmLog.txt") then return nil end
 		if type(readfile) ~= "function" then return nil end
 		return readfile("CelestialFarmLog.txt")
 	end)
@@ -12451,15 +12607,6 @@ task.spawn(function()
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
-	-- Wait for normal CH loading and full Hub UI construction to finish before showing the log loader.
-	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
-		task.wait(0.1)
-	end
-	if _G.Celestial.HubLoadFailed then
-		_G.Celestial.KickLogRecoveryQueued = false
-		return
-	end
-
 	local loadingGui = ShowKickLogLoadingGui()
 	local kickSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
 	task.spawn(function()
@@ -12469,6 +12616,7 @@ task.spawn(function()
 	end)
 	while not summaryDone do task.wait() end
 
+	local panelBuildOk, panelBuildError = pcall(function()
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 
@@ -12581,28 +12729,46 @@ task.spawn(function()
 		_G.Celestial.KickLogRecoveryQueued = false
 	end)
 
-	-- The spinner covers the panel until the summary, controls and scroll canvas are actually built.
-	pcall(function()
-		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
-		RunService.RenderStepped:Wait()
-		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
-		RunService.RenderStepped:Wait()
+	-- Do not dismiss the spinner until the diagnosis text has stable rendered geometry.
+	WaitForLogContentRendered(gui, preview, scroll)
 	end)
+	if not panelBuildOk then warn("[Celestial] Kick Log panel build failed: " .. tostring(panelBuildError)) end
 	if loadingGui then pcall(function() loadingGui:Destroy() end) end
 	if _G.Celestial.KickLogLoadingGui == loadingGui then _G.Celestial.KickLogLoadingGui = nil end
+	_G.Celestial.KickLogRecoveryQueued = false
 end)
 
 -- Recover the previous Reset Log after Kick Log is dismissed, using the same spinner animation.
 task.spawn(function()
-	local previousResetLog = _G.Celestial.PreviousFarmResetLogSnapshot
-	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
-	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do task.wait(0.1) end
-	if _G.Celestial.HubLoadFailed then return end
+	-- Reset Log content is read only after Hub startup is complete, not at script entry.
+	if not WaitForHubStartupComplete() then return end
 	while _G.Celestial.KickLogRecoveryQueued == true
 		or CoreGui:FindFirstChild("CelestialKickLogLoadingGui")
-		or CoreGui:FindFirstChild("CelestialFarmLogRecovery") do
-		task.wait(0.2)
+		or CoreGui:FindFirstChild("CelestialFarmLogRecovery")
+		or CoreGui:FindFirstChild("CelestialResetCauseResult")
+		or CoreGui:FindFirstChild("CelestialResetLogLoadingGui") do
+		task.wait(0.1)
 	end
+	local previousResetLog = nil
+	local okResetRead, resetValue = pcall(function()
+		if type(readfile) ~= "function" then return nil end
+		if type(isfile) == "function" and not isfile("CelestialFarmResetLog.txt") then return nil end
+		return readfile("CelestialFarmResetLog.txt")
+	end)
+	if okResetRead and type(resetValue) == "string" and resetValue ~= ""
+		and resetValue:find("CH-RESET-INCIDENT:", 1, true)
+		and not resetValue:find("GAME_OR_ROUND_RESET_SUSPECTED", 1, true)
+		and not resetValue:find("NORMAL_ROUND_TRANSITION", 1, true) then
+		local consumedReset = ""
+		pcall(function()
+			if type(readfile) == "function" and (type(isfile) ~= "function" or isfile("CelestialFarmResetLogConsumed.txt")) then
+				consumedReset = readfile("CelestialFarmResetLogConsumed.txt") or ""
+			end
+		end)
+		if consumedReset ~= resetValue then previousResetLog = resetValue end
+	end
+	_G.Celestial.PreviousFarmResetLogSnapshot = previousResetLog
+	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
 
 	local loadingGui = ShowResetLogLoadingGui()
 	local resetSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
@@ -12613,6 +12779,7 @@ task.spawn(function()
 	end)
 	while not summaryDone do task.wait() end
 
+	local panelBuildOk, panelBuildError = pcall(function()
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmResetLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 	local gui = Instance.new("ScreenGui")
@@ -12728,13 +12895,10 @@ task.spawn(function()
 		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmResetLogConsumed.txt", previousResetLog) end end)
 	end)
 
-	-- As with Kick Log, wait for Roblox to render the populated preview before closing the loader.
-	pcall(function()
-		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
-		RunService.RenderStepped:Wait()
-		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
-		RunService.RenderStepped:Wait()
+	-- Hold the Reset loader until AutomaticSize, text bounds and scroll canvas are stable.
+	WaitForLogContentRendered(gui, preview, scroll)
 	end)
+	if not panelBuildOk then warn("[Celestial] Reset Log panel build failed: " .. tostring(panelBuildError)) end
 	if loadingGui then pcall(function() loadingGui:Destroy() end) end
 	if _G.Celestial.ResetLogLoadingGui == loadingGui then _G.Celestial.ResetLogLoadingGui = nil end
 end)
