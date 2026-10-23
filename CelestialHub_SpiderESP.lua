@@ -1,4 +1,7 @@
--- V3.18: V3.17 stability + threat-aware coin routing when the Murderer approaches (movement-only, no position teleport).
+-- V3.20: V3.18 80-speed movement + threat-aware routing, with Auto-Farm noclip removed so physical collisions remain active.
+-- V3.20 stability note: keeps the slider range and requested-speed ceiling at 80.
+-- Auto-Farm no longer forces CanCollide=false; the existing solid-overlap guard can reroute
+-- when a path is obstructed. This is not a guarantee against server-side movement rejection.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -5203,7 +5206,7 @@ local CoinEngine = {
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
-	-- V3.18: threat-aware routing shares the existing movement controller; it never writes CFrame.
+	-- V3.20: threat-aware routing shares the existing movement controller; it never writes CFrame.
 	ThreatResponse = {
 		Enabled = true,
 		EnterDistance = 15,       -- same red-zone distance shown by the Dangerometer
@@ -5372,7 +5375,7 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	CoinEngine.NoclipWanted = true       -- atraviesa paredes mientras vuela / flota
+	CoinEngine.NoclipWanted = false      -- V3.20: Auto-Farm conserva las colisiones físicas
 end
 
 -- Estabilidad adaptativa V3.14.
@@ -5823,7 +5826,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.18 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.20 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5991,7 +5994,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 4 | script-version=3.18 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
+				"log-schema: 4 | script-version=3.20 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -6618,7 +6621,7 @@ local function PickNearest(fromPos, exclude, now)
 end
 
 -- ---------------------------------------------------------------
--- V3.18: MURDER THREAT RESPONSE / DANGEROMETER ROLE SHARING
+-- V3.20: MURDER THREAT RESPONSE / DANGEROMETER ROLE SHARING
 -- Detects the Murderer using the role scanner used by the Dangerometer, then
 -- redirects coin selection through the same movement engine (no CFrame teleport).
 -- ---------------------------------------------------------------
@@ -6951,7 +6954,7 @@ local function ControllerStep(dt)
 
 	local now = os.clock()
 	local rawDt = dt
-	CoinEngine.NoclipWanted = flightOn     -- mientras se vuela (o se flota en una pausa) se atraviesa la geometria
+	CoinEngine.NoclipWanted = false     -- V3.20: no desactiva colisiones durante el Auto-Farm
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -7053,7 +7056,7 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- V3.18: update the Dangerometer-backed Murderer distance and temporarily favor safer coins.
+	-- V3.20: update the Dangerometer-backed Murderer distance and temporarily favor safer coins.
 	local threatTransition, threatDistance = UpdateThreatResponse(root, now)
 	if threatTransition == "entered" then
 		local saferCoin = PickThreatCoin(root.Position, nil, now)
@@ -12856,7 +12859,7 @@ local function SummarizeFarmLog(raw, kind)
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.18",
+		"CH " .. kind .. " SUMMARY | analizador=3.20",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
