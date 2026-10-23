@@ -5792,7 +5792,7 @@ local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
 local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
-local SOLID_OVERLAP_CONFIRM_TIME = 0.60
+local SOLID_OVERLAP_CONFIRM_TIME = 0.24
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -7264,16 +7264,19 @@ local function ControllerStep(dt)
 	local speed = sliderSpeed
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-	-- El log vio 58/360 intervalos HI-RES equivalentes a <25 FPS y picos de dt de 86.9 ms.
-	-- Se mantiene un margen temporal despues de cada tiron para evitar alternar 55/80 entre frames.
+	-- El ultimo LOG mostro dt maximo de 63.7 ms: no alcanzo el umbral critico anterior de 65 ms.
+	-- Ahora el sobre reacciona en tres niveles y mantiene cada reduccion brevemente para evitar oscilaciones.
 	local holdUntil = tonumber(CoinEngine.SpeedSafetyHoldUntil) or 0
 	local holdCap = tonumber(CoinEngine.SpeedSafetyHoldCap) or 80
-	if sampleDt >= 0.065 then
-		holdCap = math.min(holdCap, 55)
+	if sampleDt >= 0.055 then
+		holdCap = math.min(holdCap, 54)
 		holdUntil = math.max(holdUntil, now + 0.45)
 	elseif sampleDt >= 0.040 then
-		holdCap = now < holdUntil and math.min(holdCap, 68) or 68
-		holdUntil = math.max(holdUntil, now + 0.30)
+		holdCap = now < holdUntil and math.min(holdCap, 62) or 62
+		holdUntil = math.max(holdUntil, now + 0.35)
+	elseif sampleDt >= 0.030 then
+		holdCap = now < holdUntil and math.min(holdCap, 72) or 72
+		holdUntil = math.max(holdUntil, now + 0.25)
 	end
 	if now >= holdUntil then
 		holdCap = 80
@@ -7283,9 +7286,9 @@ local function ControllerStep(dt)
 	end
 	CoinEngine.SpeedSafetyHoldUntil = holdUntil
 	CoinEngine.SpeedSafetyHoldCap = holdCap
-	-- Dentro de geometria solida el NoClip sigue funcionando, pero se reduce temporalmente el impulso.
-	if solidOverlapActive and speed > 52 then
-		speed = 52
+	-- Dentro de geometria solida el NoClip sigue funcionando, pero se recorta antes y con mayor margen.
+	if solidOverlapActive and speed > 44 then
+		speed = 44
 		safetyReason = safetyReason == "normal" and "solid-overlap" or (safetyReason .. "+solid")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
