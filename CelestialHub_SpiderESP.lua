@@ -1,4 +1,4 @@
--- V3.16: separated telemetry windows, evidence-based summaries, Hub-first log recovery and render-confirmed loaders; speed ceiling remains 80.
+-- V3.17: serialized log lifecycle, covered render-confirmed loaders, command-acceleration smoothing, and explicit mismatch telemetry; speed ceiling remains 80.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -29,6 +29,8 @@ _G.Celestial.HubLoadFailed = false
 -- Reset-log recovery intentionally does not read files here. It runs only after the
 -- Hub startup screen/UI has finished, so the order is Hub -> Loading Reset Log -> content.
 _G.Celestial.PreviousFarmResetLogSnapshot = nil
+_G.Celestial.LogLifecycleBusy = false
+_G.Celestial.LogLifecycleOwner = nil
 
 if _G.Celestial.CrosshairCleanup then
 	pcall(_G.Celestial.CrosshairCleanup)
@@ -770,8 +772,21 @@ local function ShowKickLogLoadingGui()
 	scanGui.IgnoreGuiInset = true
 	scanGui.Parent = CoreGui
 
+	-- Full-screen backdrop prevents a partly-built Kick/Reset panel from peeking
+	-- around the smaller spinner window. The log is revealed only after layout settles.
+	local backdrop = Instance.new("Frame")
+	backdrop.Name = "LoadingBackdrop"
+	backdrop.Size = UDim2.fromScale(1, 1)
+	backdrop.Position = UDim2.fromScale(0, 0)
+	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
+	backdrop.BackgroundTransparency = 0
+	backdrop.BorderSizePixel = 0
+	backdrop.ZIndex = 1
+	backdrop.Parent = scanGui
+
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "ScanningFrame"
+	mainFrame.ZIndex = 2
 	mainFrame.Size = UDim2.new(0, 300, 0, 192)
 	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
 	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
@@ -784,6 +799,7 @@ local function ShowKickLogLoadingGui()
 
 	local image = Instance.new("ImageLabel")
 	image.Name = "ScanImage"
+	image.ZIndex = 3
 	image.Size = UDim2.new(0, 140, 0, 140)
 	image.Position = UDim2.new(0.5, -70, 0, 10)
 	image.BackgroundTransparency = 1
@@ -793,6 +809,7 @@ local function ShowKickLogLoadingGui()
 
 	local text = Instance.new("TextLabel")
 	text.Name = "ScanText"
+	text.ZIndex = 3
 	text.Size = UDim2.new(1, -20, 0, 25)
 	text.Position = UDim2.new(0, 10, 1, -32)
 	text.BackgroundTransparency = 1
@@ -825,8 +842,21 @@ local function ShowResetLogLoadingGui()
 	scanGui.IgnoreGuiInset = true
 	scanGui.Parent = CoreGui
 
+	-- Full-screen backdrop prevents a partly-built Kick/Reset panel from peeking
+	-- around the smaller spinner window. The log is revealed only after layout settles.
+	local backdrop = Instance.new("Frame")
+	backdrop.Name = "LoadingBackdrop"
+	backdrop.Size = UDim2.fromScale(1, 1)
+	backdrop.Position = UDim2.fromScale(0, 0)
+	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
+	backdrop.BackgroundTransparency = 0
+	backdrop.BorderSizePixel = 0
+	backdrop.ZIndex = 1
+	backdrop.Parent = scanGui
+
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "ScanningFrame"
+	mainFrame.ZIndex = 2
 	mainFrame.Size = UDim2.new(0, 300, 0, 192)
 	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
 	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
@@ -839,6 +869,7 @@ local function ShowResetLogLoadingGui()
 
 	local image = Instance.new("ImageLabel")
 	image.Name = "ScanImage"
+	image.ZIndex = 3
 	image.Size = UDim2.new(0, 140, 0, 140)
 	image.Position = UDim2.new(0.5, -70, 0, 10)
 	image.BackgroundTransparency = 1
@@ -848,6 +879,7 @@ local function ShowResetLogLoadingGui()
 
 	local text = Instance.new("TextLabel")
 	text.Name = "ScanText"
+	text.ZIndex = 3
 	text.Size = UDim2.new(1, -20, 0, 25)
 	text.Position = UDim2.new(0, 10, 1, -32)
 	text.BackgroundTransparency = 1
@@ -883,44 +915,82 @@ local function WaitForHubStartupComplete()
 		if _G.Celestial.HubLoadFailed == true then return false end
 		task.wait(0.05)
 	end
-	-- Allow one layout/render turn after the startup loader vanishes.
-	pcall(function() RunService.RenderStepped:Wait() end)
+	-- Allow two render turns after the Hub startup screen vanishes.
+	pcall(function() RunService.RenderStepped:Wait(); RunService.RenderStepped:Wait() end)
 	return true
+end
+
+-- Only one diagnostic animation/window may own the screen at a time.
+local function AcquireLogLifecycleSlot(owner)
+	while _G.Celestial.LogLifecycleBusy == true do task.wait(0.05) end
+	_G.Celestial.LogLifecycleBusy = true
+	_G.Celestial.LogLifecycleOwner = owner
+	return true
+end
+
+local function ReleaseLogLifecycleSlot(owner)
+	if _G.Celestial.LogLifecycleOwner == owner then
+		_G.Celestial.LogLifecycleOwner = nil
+		_G.Celestial.LogLifecycleBusy = false
+	end
+end
+
+local function DestroyLogLoadingGui(loader, globalKey)
+	if loader then pcall(function() loader:Destroy() end) end
+	if globalKey and _G.Celestial[globalKey] == loader then _G.Celestial[globalKey] = nil end
 end
 
 -- Keep a log loader alive until its actual content has nonzero geometry and stays stable
 -- for several rendered frames. This replaces brittle one-second / two-frame timing guesses.
-local function WaitForLogContentRendered(screenGui, contentObject, scrollObject)
+local function WaitForLogContentRendered(screenGui, contentObject, scrollObject, expectedText, minStableFrames)
 	if not screenGui or not contentObject then return false end
-	local previousX, previousY, previousCanvas = -1, -1, -1
+	local previousX, previousY, previousTextY, previousCanvas, previousTextLength = -1, -1, -1, -1, -1
 	local stableFrames = 0
+	local startedAt = os.clock()
+	local requiredFrames = math.clamp(math.floor(tonumber(minStableFrames) or 8), 6, 18)
+	-- No se usa un timeout como señal de carga: si el panel tarda, el loader permanece.
 	while screenGui.Parent do
 		local stepped = pcall(function() RunService.RenderStepped:Wait() end)
 		if not stepped then task.wait(0.03) end
 		if not screenGui.Parent then return false end
 		if contentObject.Parent then
 			local size = contentObject.AbsoluteSize
-			local textBoundsY = 0
-			pcall(function() textBoundsY = contentObject.TextBounds.Y end)
+			local textBoundsX, textBoundsY, currentText = 0, 0, ""
+			pcall(function()
+				textBoundsX, textBoundsY = contentObject.TextBounds.X, contentObject.TextBounds.Y
+				currentText = contentObject.Text or ""
+			end)
 			local height = math.max(size.Y, textBoundsY)
 			local canvasY = height + math.max(0, contentObject.Position.Y.Offset) + 12
 			if scrollObject and scrollObject.Parent then
 				pcall(function() scrollObject.CanvasSize = UDim2.new(0, 0, 0, math.ceil(canvasY)) end)
 			end
 			local canvasHeight = canvasY
+			local scrollWidth = size.X
 			if scrollObject and scrollObject.Parent then
-				pcall(function() canvasHeight = scrollObject.CanvasSize.Y.Offset end)
+				pcall(function()
+					canvasHeight = scrollObject.CanvasSize.Y.Offset
+					scrollWidth = scrollObject.AbsoluteSize.X
+				end)
 			end
-			if size.X > 0 and height > 0
+			local expectedMatches = expectedText == nil or currentText == expectedText
+			local textMeasured = (#currentText == 0) or (textBoundsY > 0 and textBoundsX > 0)
+			local canvasReady = not scrollObject or not scrollObject.Parent
+				or (scrollWidth > 0 and canvasHeight >= math.ceil(canvasY))
+			local layoutReady = size.X > 0 and height > 0 and expectedMatches and textMeasured and canvasReady
+			local currentTextLength = #currentText
+			if layoutReady
 				and math.abs(size.X - previousX) < 1
 				and math.abs(height - previousY) < 1
-				and math.abs(canvasHeight - previousCanvas) < 1 then
+				and math.abs(textBoundsY - previousTextY) < 1
+				and math.abs(canvasHeight - previousCanvas) < 1
+				and currentTextLength == previousTextLength then
 				stableFrames += 1
 			else
 				stableFrames = 0
 			end
-			previousX, previousY, previousCanvas = size.X, height, canvasHeight
-			if stableFrames >= 3 then return true end
+			previousX, previousY, previousTextY, previousCanvas, previousTextLength = size.X, height, textBoundsY, canvasHeight, currentTextLength
+			if stableFrames >= requiredFrames and (os.clock() - startedAt) >= 0.20 then return true end
 		else
 			stableFrames = 0
 			task.wait(0.03)
@@ -5138,7 +5208,10 @@ local CoinEngine = {
 	MaxVerticalVelocity = 12, -- limita la orden vertical sin reducir el tope configurado
 	MaxAcceleration = 72,     -- se usa para calcular el frenado de aproximacion a la moneda
 	LastCommandVelocity = Vector3.zero,
-	AdaptiveStability = true, -- adapta la direccion con ping, FPS y velocidad fisica; no impone un tope dinamico
+	AdaptiveStability = true, -- adapta direccion y cambios de velocidad; no impone un tope dinamico
+	CommandAcceleration = 150, -- limita cambios bruscos de la velocidad ordenada; no limita la velocidad final
+	RiskCommandAccelerationFloor = 80, -- aceleracion minima cuando ping/FPS/desajuste empeoran
+	NearTargetAccelerationMultiplier = 1.75, -- frena/ajusta con rapidez en el contacto de la moneda
 	RampTime = 0.55,           -- rampa original de aceleracion para el rango 70-80
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
@@ -5308,9 +5381,18 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 
 	local ping = math.clamp(tonumber(cachedPingMs) or 80, 0, 1000)
 	local physicalSpeed = math.max(0, tonumber(requestedSpeed) or 0)
+	local physicalVertical = 0
 	local char = LocalPlayer and LocalPlayer.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if root then pcall(function() physicalSpeed = root.AssemblyLinearVelocity.Magnitude end) end
+	if root then pcall(function()
+		local physicalVelocity = root.AssemblyLinearVelocity
+		physicalSpeed = physicalVelocity.Magnitude
+		physicalVertical = physicalVelocity.Y
+	end) end
+	local previousCommand = CoinEngine.LastCommandVelocity or Vector3.zero
+	local magnitudeGap = math.abs(physicalSpeed - previousCommand.Magnitude)
+	local verticalGap = math.abs(physicalVertical - previousCommand.Y)
+	local motionMismatchLoad = math.clamp((math.max(magnitudeGap, verticalGap) - 8) / 24, 0, 1)
 	local speedSignal = math.max(physicalSpeed, tonumber(requestedSpeed) or 0)
 
 	-- EMA removes one-frame FPS/ping spikes from the steering decision, while measurements remain
@@ -5328,7 +5410,8 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 	local pingLoad = math.clamp((adaptivePingEmaMs - 55) / 190, 0, 1)
 	local fpsLoad = math.clamp((48 - adaptiveFPSEma) / 28, 0, 1)
 	local speedLoad = math.clamp((math.max(speedSignal, adaptiveSpeedEma) - 45) / 45, 0, 1)
-	local risk = math.clamp(pingLoad * 0.36 + fpsLoad * 0.34 + speedLoad * 0.30, 0, 1)
+	-- A sustained physics/command mismatch increases smoothing demand as well as ping/FPS stress.
+	local risk = math.clamp(pingLoad * 0.30 + fpsLoad * 0.25 + speedLoad * 0.20 + motionMismatchLoad * 0.25, 0, 1)
 
 	-- Higher speed asks for more look-ahead (direction filtering), not a lower velocity cap.
 	-- The response stays bounded so steering does not remain stuck pointing at an old coin.
@@ -5381,6 +5464,29 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 	local horizontalBudget = math.sqrt(math.max(0, speed * speed - y * y))
 	local horizontal = horizontalDirection and horizontalDirection * horizontalBudget or Vector3.zero
 	local targetVelocity = horizontal + Vector3.new(0, y, 0)
+
+	-- Slew-limit the command vector, not its eventual magnitude. This reduces one-frame
+	-- jumps between velocity vectors while preserving the configured max speed of 80.
+	if CoinEngine.AdaptiveStability then
+		local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 1 / 30)
+		local baseAccel = tonumber(CoinEngine.CommandAcceleration) or 150
+		local floorAccel = tonumber(CoinEngine.RiskCommandAccelerationFloor) or 80
+		local risk = math.clamp(tonumber(adaptiveRiskScore) or 0, 0, 1)
+		local commandAccel = math.max(floorAccel, baseAccel - (baseAccel - floorAccel) * risk)
+		local activeTarget = CoinEngine.CurrentTarget
+		local root = GetRoot()
+		if activeTarget and root then
+			local gap = (activeTarget.Position - root.Position).Magnitude
+			if gap <= (CoinEngine.PickupDistance + 2) then
+				commandAccel *= tonumber(CoinEngine.NearTargetAccelerationMultiplier) or 1.75
+			end
+		end
+		local deltaVelocity = targetVelocity - previous
+		local allowedDelta = commandAccel * frameDt
+		if deltaVelocity.Magnitude > allowedDelta and allowedDelta > 0 then
+			targetVelocity = previous + deltaVelocity.Unit * allowedDelta
+		end
+	end
 	flightVel.Velocity = targetVelocity
 	CoinEngine.LastCommandVelocity = targetVelocity
 end
@@ -5643,6 +5749,7 @@ local SOLID_OVERLAP_CONFIRM_TIME = 0.60
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
 local nextLogPingAt = 0
+local motionMismatchFrames, nextMotionMismatchLogAt = 0, 0
 
 -- Buffer de ALTA RESOLUCION: una linea por frame (~6 s a 60 FPS) en un anillo de tamaño fijo.
 -- Solo se vuelca al archivo cuando ocurre el kick / safety-stop, para ver que paso frame a frame
@@ -5657,10 +5764,13 @@ local function HiResPush(now, dt, csMs)
 	if not root then return end
 	local p, v = root.Position, root.AssemblyLinearVelocity
 	local tgt = CoinEngine.CurrentTarget
+	local commandedVelocity = CoinEngine.LastCommandVelocity or Vector3.zero
+	local commandGap = math.abs(v.Magnitude - commandedVelocity.Magnitude)
+	local verticalGap = math.abs(v.Y - commandedVelocity.Y)
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
-		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Y,
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
+		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
 		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
 		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
@@ -5689,7 +5799,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 3 | script-version=3.16 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.17 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5779,6 +5889,9 @@ local function LogStep(now, dt, force)
 	local sampleSpeed = (sampleDelta >= 0 and sampleDt >= 0.10) and (sampleDelta / sampleDt) or -1
 	local physicalVelocity = root.AssemblyLinearVelocity
 	local physicalSpeed = physicalVelocity.Magnitude
+	local commandedVelocity = CoinEngine.LastCommandVelocity or Vector3.zero
+	local commandGap = math.abs(physicalSpeed - commandedVelocity.Magnitude)
+	local verticalGap = math.abs(physicalVelocity.Y - commandedVelocity.Y)
 	-- Ping: antes solo se refrescaba al llegar a una moneda (GetSettleTime) y podia quedar viejo/80 por defecto.
 	if now >= nextLogPingAt then
 		nextLogPingAt = now + 0.5
@@ -5788,11 +5901,11 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
-		(CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude, (CoinEngine.LastCommandVelocity or Vector3.zero).Y,
+		commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1,
 		1 / frameDt, frameDt * 1000, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
@@ -5854,7 +5967,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 3 | script-version=3.16 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
+				"log-schema: 4 | script-version=3.17 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -6223,6 +6336,7 @@ ResetDiag.ShowResult = function(classification, confidence, evidence)
 		title.TextSize = 16
 		title.Parent = frame
 		local body = Instance.new("TextLabel")
+		body.Name = "ResultBody"
 		body.Size = UDim2.new(1, -20, 0, 130)
 		body.Position = UDim2.new(0, 10, 0, 42)
 		body.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
@@ -6251,7 +6365,8 @@ ResetDiag.ShowResult = function(classification, confidence, evidence)
 		close.TextSize = 13
 		close.Parent = frame
 		Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
-		close.Activated:Connect(function() pcall(function() gui:Destroy() end) end)
+		close.Activated:Connect(function() pcall(function() gui:Destroy() end); ReleaseLogLifecycleSlot("LIVE_RESET") end)
+		gui.Destroying:Connect(function() ReleaseLogLifecycleSlot("LIVE_RESET") end)
 	end)
 end
 
@@ -6329,20 +6444,27 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(
 				-- Character events can arrive while CH is still booting. Never overlay this loader
 				-- on "Loading Celestial Hub..."; wait for the Hub and startup screen first.
 				if not WaitForHubStartupComplete() then return end
+				AcquireLogLifecycleSlot("LIVE_RESET")
 				local loader = ShowResetLogLoadingGui()
 				local showOk = pcall(function()
 					ResetDiag.ShowResult(classification, confidence, evidence)
 				end)
 				local resultGui = CoreGui:FindFirstChild("CelestialResetCauseResult")
-				local resultFrame = resultGui and resultGui:FindFirstChildWhichIsA("Frame", true)
-				if showOk and resultGui and resultFrame then
-					pcall(WaitForLogContentRendered, resultGui, resultFrame, nil)
+				local resultBody = resultGui and resultGui:FindFirstChild("ResultBody", true)
+				local rendered = false
+				if showOk and resultGui and resultBody then
+					local renderCallOk, result = pcall(WaitForLogContentRendered, resultGui, resultBody, nil, nil, 8)
+					rendered = renderCallOk and result == true
 				else
-					-- If creation failed, do not strand the spinner; let one render turn expose the error state.
+					-- If creation failed, release the slot rather than leaving a permanent spinner.
 					pcall(function() RunService.RenderStepped:Wait() end)
 				end
-				if loader then pcall(function() loader:Destroy() end) end
-				if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
+				DestroyLogLoadingGui(loader, "ResetLogLoadingGui")
+				if not (showOk and resultGui and resultBody) then
+					ReleaseLogLifecycleSlot("LIVE_RESET")
+				elseif not rendered then
+					warn("[Celestial] Reset diagnosis text layout did not stabilize within the loading window.")
+				end
 			end
 		end)
 	end
@@ -6680,8 +6802,9 @@ local function ControllerStep(dt)
 	-- desde otro punto del mundo. El movimiento ahora es fisico: un salto de posicion NO viene de nosotros.
 	if lastSetPos then
 		local jump = (root.Position - lastSetPos).Magnitude
-		if jump > math.max(10, currentSpeed * math.max(rawDt, 0.02) * 2.5 + 6) then
-			LogEvent("server-moved-us")
+		local expectedStep = math.max(10, currentSpeed * math.max(rawDt, 0.02) * 2.5 + 6)
+		if jump > expectedStep then
+			LogEvent(string.format("server-moved-us jump=%.2f threshold=%.2f speed=%.1f dt=%.3f pos=(%.1f,%.1f,%.1f)", jump, expectedStep, currentSpeed, rawDt, root.Position.X, root.Position.Y, root.Position.Z))
 			ResetPath()
 			pauseUntil = now + 1.5
 			return
@@ -6943,6 +7066,25 @@ local function SafeControllerStep(dt)
 	local csT0 = os.clock()
 	local ok = pcall(ControllerStep, dt)
 	local csMs = (os.clock() - csT0) * 1000     -- coste real de ControllerStep en este frame (diagnostico de tirones)
+	if State.FarmEnabled and not logFinalized then
+		local root = GetRoot()
+		if root then
+			local physical = root.AssemblyLinearVelocity
+			local command = CoinEngine.LastCommandVelocity or Vector3.zero
+			local magnitudeGap = math.abs(physical.Magnitude - command.Magnitude)
+			local verticalGap = math.abs(physical.Y - command.Y)
+			if magnitudeGap > 15 or verticalGap > 15 then
+				motionMismatchFrames += 1
+				if motionMismatchFrames >= 2 and os.clock() >= nextMotionMismatchLogAt then
+					nextMotionMismatchLogAt = os.clock() + 0.75
+					LogEvent(string.format("motion-discrepancy magGap=%.1f vyGap=%.1f phys=%.1f cmd=%.1f vy=%.1f cmdY=%.1f ping=%.0f fps=%.1f risk=%.2f",
+						magnitudeGap, verticalGap, physical.Magnitude, command.Magnitude, physical.Y, command.Y, cachedPingMs, adaptiveFPS, adaptiveRiskScore))
+				end
+			else
+				motionMismatchFrames = 0
+			end
+		end
+	end
 	if flightVel and not velApplied then
 		pcall(function() flightVel.Velocity = Vector3.zero end) -- sin orden: flota quieto
 		CoinEngine.LastCommandVelocity = Vector3.zero
@@ -12348,6 +12490,8 @@ local function SummarizeFarmLog(raw, kind)
 		coinLast = "?", gameCoinLast = "?",
 		riskSum = 0, riskMax = 0, riskN = 0, steerMin = math.huge, steerMax = -math.huge, steerN = 0,
 		physOverCmd = 0, normalOverCmd = 0, hiresOverCmd = 0, stateCounts = {}, normalMissingPing = 0, normalMissingFps = 0,
+		normalCmdGapSum = 0, normalCmdGapMax = 0, normalCmdGapN = 0, normalVGapSum = 0, normalVGapMax = 0, normalVGapN = 0,
+		hiresCmdGapSum = 0, hiresCmdGapMax = 0, hiresCmdGapN = 0, hiresVGapSum = 0, hiresVGapMax = 0, hiresVGapN = 0,
 		lastHiPos = nil, lastHiT = nil, declaredMetrics = nil,
 	}
 	data.declaredMetrics = schema:match("metrics=([^\r\n]+)")
@@ -12366,6 +12510,11 @@ local function SummarizeFarmLog(raw, kind)
 			end
 			local cmd, phys = num(line, "cmd"), num(line, "phys")
 			local vy, cmdY, ping, fps = num(line, "vy"), num(line, "cmdY"), num(line, "ping"), num(line, "fps")
+			local cmdGap, vyGap = num(line, "cmdGap"), num(line, "vyGap")
+			if cmdGap == nil and cmd ~= nil and phys ~= nil then cmdGap = math.abs(math.abs(phys) - math.abs(cmd)) end
+			if vyGap == nil and vy ~= nil and cmdY ~= nil then vyGap = math.abs(vy - cmdY) end
+			if cmdGap ~= nil then data.normalCmdGapSum += cmdGap; data.normalCmdGapMax = math.max(data.normalCmdGapMax, cmdGap); data.normalCmdGapN += 1 end
+			if vyGap ~= nil then data.normalVGapSum += vyGap; data.normalVGapMax = math.max(data.normalVGapMax, vyGap); data.normalVGapN += 1 end
 			local slider, step, sampleSpd, toCoin = num(line, "slider"), num(line, "step"), num(line, "sampleSpd"), num(line, "toCoin")
 			local risk, steer = num(line, "risk"), num(line, "steer")
 			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)); data.normalCmdMax = math.max(data.normalCmdMax, math.abs(cmd)) end
@@ -12380,7 +12529,7 @@ local function SummarizeFarmLog(raw, kind)
 			if toCoin and toCoin >= 0 then data.nearCoinMin = math.min(data.nearCoinMin, toCoin) end
 			if risk then data.riskMax = math.max(data.riskMax, risk); data.riskSum += risk; data.riskN += 1 end
 			if steer then data.steerMin = math.min(data.steerMin, steer); data.steerMax = math.max(data.steerMax, steer); data.steerN += 1 end
-			if cmd and phys and math.abs(phys) - math.abs(cmd) > 15 then data.physOverCmd += 1; data.normalOverCmd += 1 end
+			if cmd and phys and math.abs(math.abs(phys) - math.abs(cmd)) > 15 then data.physOverCmd += 1; data.normalOverCmd += 1 end
 			if truth(line, "inSolid") then data.solid += 1 end
 			if truth(line, "noclip") then data.noclip += 1 end
 			if truth(line, "platformStand") then data.platform += 1 end
@@ -12395,6 +12544,11 @@ local function SummarizeFarmLog(raw, kind)
 			if t then data.hiresTimeMin = math.min(data.hiresTimeMin, t); data.hiresTimeMax = math.max(data.hiresTimeMax, t) end
 			local cmd, phys, cmdY, ping = num(line, "cmd"), num(line, "phys"), num(line, "cmdY"), num(line, "ping")
 			local vy = tonumber(line:match("vel=%([^,]+,([%-]?[%d%.]+),"))
+			local cmdGap, vyGap = num(line, "cmdGap"), num(line, "vyGap")
+			if cmdGap == nil and cmd ~= nil and phys ~= nil then cmdGap = math.abs(math.abs(phys) - math.abs(cmd)) end
+			if vyGap == nil and vy ~= nil and cmdY ~= nil then vyGap = math.abs(vy - cmdY) end
+			if cmdGap ~= nil then data.hiresCmdGapSum += cmdGap; data.hiresCmdGapMax = math.max(data.hiresCmdGapMax, cmdGap); data.hiresCmdGapN += 1 end
+			if vyGap ~= nil then data.hiresVGapSum += vyGap; data.hiresVGapMax = math.max(data.hiresVGapMax, vyGap); data.hiresVGapN += 1 end
 			local dtMs = tonumber(line:match("%f[%w_]dt=([%-]?[%d%.]+)ms"))
 			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)); data.hiresCmdMax = math.max(data.hiresCmdMax, math.abs(cmd)) end
 			if phys then data.physMax = math.max(data.physMax, math.abs(phys)); data.hiresPhysMax = math.max(data.hiresPhysMax, math.abs(phys)) end
@@ -12410,7 +12564,7 @@ local function SummarizeFarmLog(raw, kind)
 				if inferredFps < 25 then data.hiresLowFps += 1 end
 				if inferredFps < 10 then data.hiresVeryLowFps += 1 end
 			end
-			if cmd and phys and math.abs(phys) - math.abs(cmd) > 15 then data.physOverCmd += 1; data.hiresOverCmd += 1 end
+			if cmd and phys and math.abs(math.abs(phys) - math.abs(cmd)) > 15 then data.physOverCmd += 1; data.hiresOverCmd += 1 end
 			local px, py, pz = line:match("pos=%(([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)%)")
 			px, py, pz = tonumber(px), tonumber(py), tonumber(pz)
 			if px and py and pz then
@@ -12440,7 +12594,7 @@ local function SummarizeFarmLog(raw, kind)
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.16",
+		"CH " .. kind .. " SUMMARY | analizador=3.17",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
@@ -12451,10 +12605,16 @@ local function SummarizeFarmLog(raw, kind)
 		data.hires, hiresDuration and string.format("ventana %.2f s", hiresDuration) or "ventana no calculable",
 		data.hiresDtCount > 0 and string.format("%.2f s en %d intervalos", data.hiresDtSum, data.hiresDtCount) or "no disponible")
 	if data.regular > 0 or data.hires > 0 then
-		out[#out + 1] = string.format("Velocidad: slider observado mín./máx.=%s/%s | comando máximo=%.1f | física máxima=%.1f | muestras con diferencia física-comando >15=%.0f",
+		out[#out + 1] = string.format("Velocidad: slider observado mín./máx.=%s/%s | comando máximo=%.1f | física máxima=%.1f | muestras con diferencia absoluta de magnitud |phys-cmd| >15=%.0f",
 			fmtMaybe(data.sliderMin, 1), fmtMaybe(data.sliderMax, 1), data.cmdMax, data.physMax, data.physOverCmd)
-		out[#out + 1] = string.format("Picos por fuente: NORMAL cmd/phys=%.1f/%.1f | HI-RES cmd/phys=%.1f/%.1f | diferencia física-comando >15: normal=%d, HI-RES=%d",
+		out[#out + 1] = string.format("Picos por fuente: NORMAL cmd/phys=%.1f/%.1f | HI-RES cmd/phys=%.1f/%.1f | diferencia absoluta de magnitud >15: normal=%d, HI-RES=%d",
 			data.normalCmdMax, data.normalPhysMax, data.hiresCmdMax, data.hiresPhysMax, data.normalOverCmd, data.hiresOverCmd)
+		out[#out + 1] = string.format("Desajuste NORMAL: |phys-cmd| prom./máx.=%.2f/%.2f (%d lecturas) | |vy-cmdY| prom./máx.=%.2f/%.2f (%d lecturas)",
+			data.normalCmdGapN > 0 and data.normalCmdGapSum / data.normalCmdGapN or 0, data.normalCmdGapMax, data.normalCmdGapN,
+			data.normalVGapN > 0 and data.normalVGapSum / data.normalVGapN or 0, data.normalVGapMax, data.normalVGapN)
+		out[#out + 1] = string.format("Desajuste HI-RES: |phys-cmd| prom./máx.=%.2f/%.2f (%d lecturas) | |vy-cmdY| prom./máx.=%.2f/%.2f (%d lecturas)",
+			data.hiresCmdGapN > 0 and data.hiresCmdGapSum / data.hiresCmdGapN or 0, data.hiresCmdGapMax, data.hiresCmdGapN,
+			data.hiresVGapN > 0 and data.hiresVGapSum / data.hiresVGapN or 0, data.hiresVGapMax, data.hiresVGapN)
 		out[#out + 1] = string.format("Vertical por fuente: NORMAL |vy|/|cmdY|=%.1f/%.1f | HI-RES |vy|/|cmdY|=%.1f/%.1f | paso normal máx.=%.2f studs | sampleSpd máx.=%.1f",
 			data.normalVyMax, data.normalCmdYMax, data.hiresVyMax, data.hiresCmdYMax, data.stepMax, data.sampleSpeedMax)
 		out[#out + 1] = string.format("Posición HI-RES: salto máx. entre frames=%.2f studs | velocidad inferida por delta/dt máx.=%.1f | saltos >5 studs=%d | intervalos >100 studs/s=%d",
@@ -12527,6 +12687,7 @@ local function SummarizeFarmLog(raw, kind)
 		["solid-overlap-reroute"] = countText("solid-overlap-reroute"),
 		["target-stale"] = countText("target-stale"),
 		["server-moved-us"] = countText("server-moved-us"),
+		["motion-discrepancy"] = countText("motion-discrepancy"),
 		["coin-collected"] = countText("coin-collected"),
 		["safety-stop"] = countText("SAFETY-STOP"),
 	}
@@ -12583,17 +12744,29 @@ end
 -- ====================================================================
 _G.Celestial.KickLogRecoveryQueued = true
 task.spawn(function()
-	-- Strict order: startup label/UI finishes first, then read/analyze the previous Kick Log.
+	-- Hub must finish first. Then reserve the screen and run every potentially slow log operation under the spinner.
 	if not WaitForHubStartupComplete() then
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
-	local okRead, previousLog = pcall(function()
-		if type(isfile) == "function" and not isfile("CelestialFarmLog.txt") then return nil end
-		if type(readfile) ~= "function" then return nil end
-		return readfile("CelestialFarmLog.txt")
-	end)
+	if type(readfile) ~= "function" then
+		_G.Celestial.KickLogRecoveryQueued = false
+		return
+	end
+	AcquireLogLifecycleSlot("KICK_RECOVERY")
+	if type(isfile) == "function" then
+		local existsOk, exists = pcall(isfile, "CelestialFarmLog.txt")
+		if not existsOk or not exists then
+			ReleaseLogLifecycleSlot("KICK_RECOVERY")
+			_G.Celestial.KickLogRecoveryQueued = false
+			return
+		end
+	end
+	local loadingGui = ShowKickLogLoadingGui()
+	local okRead, previousLog = pcall(readfile, "CelestialFarmLog.txt")
 	if not okRead or not IsUnconsumedKickLog(previousLog) then
+		DestroyLogLoadingGui(loadingGui, "KickLogLoadingGui")
+		ReleaseLogLifecycleSlot("KICK_RECOVERY")
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
@@ -12604,10 +12777,11 @@ task.spawn(function()
 		end
 	end)
 	if consumedKick == previousLog then
+		DestroyLogLoadingGui(loadingGui, "KickLogLoadingGui")
+		ReleaseLogLifecycleSlot("KICK_RECOVERY")
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
-	local loadingGui = ShowKickLogLoadingGui()
 	local kickSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
 	task.spawn(function()
 		local okSummary, result = pcall(SummarizeFarmLog, previousLog, "KICK")
@@ -12616,11 +12790,13 @@ task.spawn(function()
 	end)
 	while not summaryDone do task.wait() end
 
+	local recoveryGui, recoveryFrame, recoveryStatus, kickContentRendered = nil, nil, nil, false
 	local panelBuildOk, panelBuildError = pcall(function()
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 
 	local gui = Instance.new("ScreenGui")
+	recoveryGui = gui
 	gui.Name = "CelestialFarmLogRecovery"
 	gui.DisplayOrder = 100
 	gui.ResetOnSpawn = false
@@ -12629,6 +12805,7 @@ task.spawn(function()
 	gui.Parent = CoreGui
 
 	local frame = Instance.new("Frame")
+	recoveryFrame = frame
 	frame.Name = "LogFrame"
 	frame.Size = UDim2.new(0, 340, 0, 250)
 	frame.Position = UDim2.new(0.5, -170, 0.5, -125)
@@ -12648,6 +12825,7 @@ task.spawn(function()
 	title.Parent = frame
 
 	local status = Instance.new("TextLabel")
+	recoveryStatus = status
 	status.Size = UDim2.new(1, -20, 0, 22)
 	status.Position = UDim2.new(0, 10, 0, 42)
 	status.BackgroundTransparency = 1
@@ -12727,20 +12905,23 @@ task.spawn(function()
 		pcall(function() gui:Destroy() end)
 		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmLogConsumed.txt", previousLog) end end)
 		_G.Celestial.KickLogRecoveryQueued = false
+		ReleaseLogLifecycleSlot("KICK_RECOVERY")
 	end)
+	gui.Destroying:Connect(function() ReleaseLogLifecycleSlot("KICK_RECOVERY") end)
 
-	-- Do not dismiss the spinner until the diagnosis text has stable rendered geometry.
-	WaitForLogContentRendered(gui, preview, scroll)
+	-- Compare exact text and canvas geometry over multiple rendered frames before revealing the window.
+	kickContentRendered = WaitForLogContentRendered(gui, preview, scroll, kickSummary, 8)
+	if not kickContentRendered then recoveryStatus.Text = "El texto no estabilizó su diseño a tiempo; el resumen sigue disponible y el archivo conserva el log completo." end
 	end)
 	if not panelBuildOk then warn("[Celestial] Kick Log panel build failed: " .. tostring(panelBuildError)) end
-	if loadingGui then pcall(function() loadingGui:Destroy() end) end
-	if _G.Celestial.KickLogLoadingGui == loadingGui then _G.Celestial.KickLogLoadingGui = nil end
+	DestroyLogLoadingGui(loadingGui, "KickLogLoadingGui")
+	if not panelBuildOk then ReleaseLogLifecycleSlot("KICK_RECOVERY") end
 	_G.Celestial.KickLogRecoveryQueued = false
 end)
 
 -- Recover the previous Reset Log after Kick Log is dismissed, using the same spinner animation.
 task.spawn(function()
-	-- Reset Log content is read only after Hub startup is complete, not at script entry.
+	-- Wait for Hub and any earlier Kick/Reset window before opening another diagnostic loader.
 	if not WaitForHubStartupComplete() then return end
 	while _G.Celestial.KickLogRecoveryQueued == true
 		or CoreGui:FindFirstChild("CelestialKickLogLoadingGui")
@@ -12749,12 +12930,18 @@ task.spawn(function()
 		or CoreGui:FindFirstChild("CelestialResetLogLoadingGui") do
 		task.wait(0.1)
 	end
+	if type(readfile) ~= "function" then return end
+	AcquireLogLifecycleSlot("RESET_RECOVERY")
+	if type(isfile) == "function" then
+		local existsOk, exists = pcall(isfile, "CelestialFarmResetLog.txt")
+		if not existsOk or not exists then
+			ReleaseLogLifecycleSlot("RESET_RECOVERY")
+			return
+		end
+	end
+	local loadingGui = ShowResetLogLoadingGui()
 	local previousResetLog = nil
-	local okResetRead, resetValue = pcall(function()
-		if type(readfile) ~= "function" then return nil end
-		if type(isfile) == "function" and not isfile("CelestialFarmResetLog.txt") then return nil end
-		return readfile("CelestialFarmResetLog.txt")
-	end)
+	local okResetRead, resetValue = pcall(readfile, "CelestialFarmResetLog.txt")
 	if okResetRead and type(resetValue) == "string" and resetValue ~= ""
 		and resetValue:find("CH-RESET-INCIDENT:", 1, true)
 		and not resetValue:find("GAME_OR_ROUND_RESET_SUSPECTED", 1, true)
@@ -12768,9 +12955,11 @@ task.spawn(function()
 		if consumedReset ~= resetValue then previousResetLog = resetValue end
 	end
 	_G.Celestial.PreviousFarmResetLogSnapshot = previousResetLog
-	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
-
-	local loadingGui = ShowResetLogLoadingGui()
+	if type(previousResetLog) ~= "string" or previousResetLog == "" then
+		DestroyLogLoadingGui(loadingGui, "ResetLogLoadingGui")
+		ReleaseLogLifecycleSlot("RESET_RECOVERY")
+		return
+	end
 	local resetSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
 	task.spawn(function()
 		local okSummary, result = pcall(SummarizeFarmLog, previousResetLog, "RESET")
@@ -12779,6 +12968,7 @@ task.spawn(function()
 	end)
 	while not summaryDone do task.wait() end
 
+	local resetStatus, resetContentRendered = nil, false
 	local panelBuildOk, panelBuildError = pcall(function()
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmResetLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
@@ -12810,6 +13000,7 @@ task.spawn(function()
 	title.Parent = frame
 
 	local status = Instance.new("TextLabel")
+	resetStatus = status
 	status.Size = UDim2.new(1, -20, 0, 22)
 	status.Position = UDim2.new(0, 10, 0, 42)
 	status.BackgroundTransparency = 1
@@ -12893,14 +13084,17 @@ task.spawn(function()
 	close.Activated:Connect(function()
 		pcall(function() gui:Destroy() end)
 		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmResetLogConsumed.txt", previousResetLog) end end)
+		ReleaseLogLifecycleSlot("RESET_RECOVERY")
 	end)
+	gui.Destroying:Connect(function() ReleaseLogLifecycleSlot("RESET_RECOVERY") end)
 
-	-- Hold the Reset loader until AutomaticSize, text bounds and scroll canvas are stable.
-	WaitForLogContentRendered(gui, preview, scroll)
+	-- Keep the loading cover until the exact summary text and its scroll canvas settle.
+	resetContentRendered = WaitForLogContentRendered(gui, preview, scroll, resetSummary, 8)
+	if not resetContentRendered then resetStatus.Text = "El diseño tardó demasiado; el resumen está visible y el archivo conserva el log completo." end
 	end)
 	if not panelBuildOk then warn("[Celestial] Reset Log panel build failed: " .. tostring(panelBuildError)) end
-	if loadingGui then pcall(function() loadingGui:Destroy() end) end
-	if _G.Celestial.ResetLogLoadingGui == loadingGui then _G.Celestial.ResetLogLoadingGui = nil end
+	DestroyLogLoadingGui(loadingGui, "ResetLogLoadingGui")
+	if not panelBuildOk then ReleaseLogLifecycleSlot("RESET_RECOVERY") end
 end)
 
 print("✨ CELESTIAL FRAMEWORK V19.18.16 - MM2 / DUELS / SPIDER ESP + OBJECT ESP + SELF ESP ✨")
