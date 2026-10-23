@@ -1,4 +1,7 @@
--- V3.17: serialized log lifecycle, covered render-confirmed loaders, command-acceleration smoothing, and explicit mismatch telemetry; speed ceiling remains 80.
+-- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
+-- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
+-- Auto-Farm noclip remains disabled; collision bypass and server-validation evasion are not enabled.
+-- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -5203,6 +5206,29 @@ local CoinEngine = {
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
+	-- V3.22: threat-aware routing shares the existing movement controller; it never writes CFrame.
+	ThreatResponse = {
+		Enabled = true,
+		EnterDistance = 15,       -- same red-zone distance shown by the Dangerometer
+		ReleaseDistance = 22,     -- hysteresis prevents rapid on/off switching around 15 studs
+		LostGrace = 0.60,         -- brief grace for role-detector updates / character replication
+		RoleScanInterval = 0.25,
+		RouteCheckInterval = 0.30,
+		PreferredSeparation = 24, -- prefer coins at least this far from the Murderer
+		Active = false,
+		Murderer = nil,
+		CachedMurderer = nil,
+		NextRoleScanAt = 0,
+		NextRouteCheckAt = 0,
+		LastSeenAt = 0,
+		LastDistance = math.huge,
+		-- V3.22: explicit self-role guard; never route away from the local player.
+		LocalMurderer = false,
+		LocalMurdererSafe = false,
+		LocalMurdererSafeLogged = false,
+		NextSelfRoleScanAt = 0,
+		SelfRoleScanInterval = 0.25,
+	},
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
 	BaseMaxSpeed = 80,         -- V3.14: conserva el tope original del slider
 	MaxVerticalVelocity = 12, -- limita la orden vertical sin reducir el tope configurado
@@ -5243,6 +5269,19 @@ local CoinEngine = {
 	DiagNoCollect = false,       -- SOLO DIAGNOSTICO: vuela y frena igual pero NO llama a firetouchinterest (no recoge monedas reales)
 	PingSettleMargin = 0.05,
 	PingSettleMax = 0.30,
+	-- ===== V3.23: VUELO CONTINUO + PERFILES DE SAFE MODE =====
+	-- Ningun perfil toca la velocidad del slider (maximo 80): solo cambian suavidad, giros y tolerancias.
+	FlowFlight = true,           -- conserva el impulso entre monedas y recoge "al pasar" (false = V3.22: parar y esperar en cada moneda)
+	SoftStop = true,             -- pausas/lag/sin objetivo: decelera con rampa en vez de cortar la velocidad a 0 en un frame
+	TurnPenalty = { safe = 14, normal = 8 },   -- coste (studs equivalentes) por media vuelta al elegir la siguiente moneda
+	Profiles = {
+		-- Safe Mode ON: giros mas suaves, paso mas ajustado por la moneda, salida mas conservadora
+		safe   = { PickupRadius = 1.0, MinExitSpeed = 16, LateralAccel = 110, AccelMul = 1.0, SteerTimeMul = 1.30, SoftStopDecel = 90 },
+		-- Safe Mode OFF: mas agil (giros mas rapidos, mas tolerancia de paso), misma velocidad maxima
+		normal = { PickupRadius = 1.6, MinExitSpeed = 24, LateralAccel = 170, AccelMul = 1.5, SteerTimeMul = 0.80, SoftStopDecel = 150 },
+	},
+	NoSoftStop = false,          -- se activa en ResetPath: teletransporte/cambio de personaje = parada seca
+	FlowLastPos = nil, FlowLastAt = 0, FlowLastExit = 0, FlowLastSweep = 0,
 	-- ===== DETECTOR DE RONDA =====
 	WeaponDebounce = 0.4,        -- armas asignadas (y monedas presentes) durante este tiempo = ronda iniciada
 	RoundStartGrace = 1.0,       -- espera tras detectar el inicio (el juego aun puede estar moviendote)
@@ -5252,7 +5291,7 @@ local CoinEngine = {
 	PingAdaptiveSpeed = false, -- V3.14: compatibilidad heredada; el ping ya no reduce la velocidad objetivo
 	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
 	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
-	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
+	NoclipWanted = false,      -- V3.22: Auto-Farm conserva las colisiones fisicas
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
@@ -5265,6 +5304,21 @@ local CoinEngine = {
 	RemovingConnection = nil,
 }
 _G.Celestial.CoinEngine = CoinEngine
+
+-- V3.23: perfil activo segun el interruptor Safe Mode (se lee en cada frame: el cambio es inmediato).
+function CoinEngine.GetProfile()
+	if State.FarmSafeMode ~= false then return CoinEngine.Profiles.safe end
+	return CoinEngine.Profiles.normal
+end
+
+-- Rumbo horizontal actual segun la velocidad ordenada (nil si casi no hay movimiento).
+function CoinEngine.VelocityHeading()
+	local v = CoinEngine.LastCommandVelocity
+	if not v then return nil end
+	local h = Vector3.new(v.X, 0, v.Z)
+	if h.Magnitude < 8 then return nil end
+	return h.Unit
+end
 
 local lastRoot = nil
 local lastContainer = nil
@@ -5355,7 +5409,7 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	CoinEngine.NoclipWanted = true       -- atraviesa paredes mientras vuela / flota
+	CoinEngine.NoclipWanted = false      -- V3.22: Auto-Farm conserva las colisiones físicas
 end
 
 -- Estabilidad adaptativa V3.14.
@@ -5416,6 +5470,8 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 	-- Higher speed asks for more look-ahead (direction filtering), not a lower velocity cap.
 	-- The response stays bounded so steering does not remain stuck pointing at an old coin.
 	local responseTime = math.clamp(0.020 + pingLoad * 0.018 + fpsLoad * 0.016 + speedLoad * 0.010, 0.018, 0.064)
+	-- V3.23: Safe Mode suaviza mas el giro (respuesta mas lenta); sin Safe Mode responde mas rapido.
+	responseTime = math.clamp(responseTime * CoinEngine.GetProfile().SteerTimeMul, 0.014, 0.085)
 	local alpha = math.clamp(1 - math.exp(-frameDt / responseTime), 0.10, 0.88)
 	adaptiveSteerAlpha, adaptiveRiskScore = alpha, risk
 	adaptiveFPS, adaptivePhysicalSpeed = fps, physicalSpeed
@@ -5473,6 +5529,7 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 		local floorAccel = tonumber(CoinEngine.RiskCommandAccelerationFloor) or 80
 		local risk = math.clamp(tonumber(adaptiveRiskScore) or 0, 0, 1)
 		local commandAccel = math.max(floorAccel, baseAccel - (baseAccel - floorAccel) * risk)
+		commandAccel *= CoinEngine.GetProfile().AccelMul     -- V3.23: perfil Safe = 1.0 (igual que V3.22); sin Safe = mas agil
 		local activeTarget = CoinEngine.CurrentTarget
 		local root = GetRoot()
 		if activeTarget and root then
@@ -5614,6 +5671,8 @@ local function OnDescendantRemoving(obj)
 end
 
 local function ResetPath()
+	CoinEngine.NoSoftStop = true      -- V3.23: un reinicio de ruta (reaparicion, servidor nos movio...) detiene en seco
+	CoinEngine.FlowLastPos = nil
 	CoinEngine.CurrentTarget = nil
 	CoinEngine.NextTarget = nil
 	bestDist = math.huge
@@ -5646,6 +5705,17 @@ local function Deactivate()
 	coinsSinceRest = 0
 	CoinEngine.CoinCount = 0
 	roundActive = false
+	CoinEngine.ThreatResponse.Active = false
+	CoinEngine.ThreatResponse.Murderer = nil
+	CoinEngine.ThreatResponse.CachedMurderer = nil
+	CoinEngine.ThreatResponse.NextRoleScanAt = 0
+	CoinEngine.ThreatResponse.NextRouteCheckAt = 0
+	CoinEngine.ThreatResponse.LastSeenAt = 0
+	CoinEngine.ThreatResponse.LastDistance = math.huge
+	CoinEngine.ThreatResponse.LocalMurderer = false
+	CoinEngine.ThreatResponse.LocalMurdererSafe = false
+	CoinEngine.ThreatResponse.LocalMurdererSafeLogged = false
+	CoinEngine.ThreatResponse.NextSelfRoleScanAt = 0
 	weaponsSince, noWeaponsSince = nil, nil
 	ResetRoundCounters()
 	StopFlight()
@@ -5799,7 +5869,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.17 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5882,6 +5952,13 @@ local function LogStep(now, dt, force)
 	if not root then return end
 	local p = root.Position
 	local tgt = CoinEngine.CurrentTarget
+	local targetPos = (tgt and tgt.Parent) and tgt.Position or Vector3.new(-1, -1, -1)
+	local targetName = (tgt and tgt.Parent) and tostring(tgt.Name):gsub("%s+", "_"):gsub("[^%w_%-]", "") or "none"
+	local threatState = CoinEngine.ThreatResponse or {}
+	local threatDistance = tonumber(threatState.LastDistance) or -1
+	if threatDistance == math.huge or threatDistance ~= threatDistance then threatDistance = -1 end
+	local threatActiveFlag = threatState.Active and 1 or 0
+	local selfMurdererFlag = threatState.LocalMurderer and 1 or 0
 	local sampleDt = lastLogAt and math.max(now - lastLogAt, 0) or 0
 	local sampleDelta = lastLogPos and (p - lastLogPos).Magnitude or -1
 	-- Si el intervalo es muy corto (muestra forzada justo despues de otra), la division amplifica el
@@ -5901,12 +5978,13 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
 		commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1,
+		targetPos.X, targetPos.Y, targetPos.Z, targetName, threatDistance, threatActiveFlag, selfMurdererFlag,
 		1 / frameDt, frameDt * 1000, cachedPingMs,
 		hum and tostring(hum:GetState()) or "?",
 		hum and tostring(hum.PlatformStand) or "?",
@@ -5967,7 +6045,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 4 | script-version=3.17 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
+				"log-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -6548,7 +6626,7 @@ local function CoinTravelScore(fromPos, coinPos)
 end
 
 -- Una sola pasada O(N): elige la moneda con menor coste de ruta, no solo menor distancia 3D.
-local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
+local function PickNearestRaw(fromPos, exclude, now, verticalLimit, heading)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
@@ -6565,6 +6643,15 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 				local distance = delta.Magnitude
 				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
 					local score = CoinTravelScore(fromPos, coin.Position)
+					if heading and CoinEngine.FlowFlight then
+						-- V3.23: penaliza giros bruscos (media vuelta = TurnPenalty studs extra) para encadenar rutas fluidas
+						local fx, fz = delta.X, delta.Z
+						local fm = math.sqrt(fx * fx + fz * fz)
+						if fm > 1 then
+							local cosT = (fx * heading.X + fz * heading.Z) / fm
+							score += Param(CoinEngine.TurnPenalty.normal, CoinEngine.TurnPenalty.safe) * (1 - cosT) * 0.5
+						end
+					end
 					if score < bestScore then best, bestScore = coin, score end
 				end
 			end
@@ -6573,11 +6660,11 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	return best
 end
 
-local function PickNearest(fromPos, exclude, now)
+local function PickNearest(fromPos, exclude, now, heading)
 	-- Fase 1: busca monedas a una altura parecida, para no subir de piso sin necesidad.
 	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
 	for _ = 1, 6 do
-		local c = PickNearestRaw(fromPos, exclude, now, preferredGap)
+		local c = PickNearestRaw(fromPos, exclude, now, preferredGap, heading)
 		if not c then break end
 		if IsGrounded(c) then return c end
 		CoinEngine.Blacklist[c] = now + 6          -- sin suelo cercano: se reintenta mas tarde
@@ -6585,7 +6672,7 @@ local function PickNearest(fromPos, exclude, now)
 	-- Fase 2: si el nivel cercano esta vacio, permite otros pisos, pero exige suelo cercano.
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 	for _ = 1, 6 do
-		local c = PickNearestRaw(fromPos, exclude, now, maxGap)
+		local c = PickNearestRaw(fromPos, exclude, now, maxGap, heading)
 		if not c then return nil end
 		if IsGrounded(c) then return c end
 		CoinEngine.Blacklist[c] = now + 6
@@ -6593,12 +6680,269 @@ local function PickNearest(fromPos, exclude, now)
 	return nil
 end
 
+-- V3.22: identify the local player's Murderer role from authoritative local script signals.
+-- Cached briefly to avoid scanning tools/inventory every movement frame.
+CoinEngine.DetectLocalMurderer = function(now)
+	local threat = CoinEngine.ThreatResponse
+	if now < (threat.NextSelfRoleScanAt or 0) then
+		return threat.LocalMurderer == true
+	end
+	threat.NextSelfRoleScanAt = now + (threat.SelfRoleScanInterval or 0.25)
+
+	local isMurderer = false
+	local localName = LocalPlayer and LocalPlayer.Name or ""
+	local stateName = tostring(State.MurdererName or "")
+	if localName ~= "" and stateName == localName then
+		isMurderer = true
+	end
+
+	if not isMurderer then
+		local ok, role = pcall(GetPlayerTeam, LocalPlayer)
+		if ok and role == "MURDERER" then isMurderer = true end
+	end
+
+	if not isMurderer then
+		local detector = _G.Celestial and _G.Celestial.PowerDetector
+		if detector and detector.CurrentPlayer == LocalPlayer then
+			local detectorState = string.lower(tostring(detector.CurrentState or ""))
+			if detectorState:find("you are the murderer", 1, true)
+				or detectorState:find("local murderer", 1, true) then
+				isMurderer = true
+			end
+		end
+	end
+
+	-- Inventory is only a fallback during an active round and in a murder game mode.
+	-- Requiring a knife without a gun reduces false positives from unrelated tools.
+	if not isMurderer and roundActive then
+		local mode = string.upper(tostring(_G.Celestial.GameMode or "MM2"))
+		local murderMode = mode == "MM2" or mode:find("MURDER", 1, true) ~= nil
+		if murderMode then
+			local ok, hasKnife, hasGun = pcall(CheckPlayerInventory, LocalPlayer)
+			if ok and hasKnife == true and hasGun ~= true then isMurderer = true end
+		end
+	end
+
+	threat.LocalMurderer = isMurderer
+	return isMurderer
+end
+
+-- ---------------------------------------------------------------
+-- V3.22: MURDER THREAT RESPONSE / DANGEROMETER ROLE SHARING
+-- Detects the Murderer using the role scanner used by the Dangerometer, then
+-- redirects coin selection through the same movement engine (no CFrame teleport).
+-- ---------------------------------------------------------------
+local function IsLiveThreatPlayer(plr)
+	if not plr or plr == LocalPlayer or plr.Parent ~= Players then return false end
+	local hum = GetHumanoid(plr)
+	local root = GetRoot(plr)
+	return hum ~= nil and hum.Health > 0 and root ~= nil
+end
+
+local function ResolveFarmMurderer(now)
+	local threat = CoinEngine.ThreatResponse
+	local roleName = tostring(State.MurdererName or "")
+	if roleName ~= "" and roleName ~= LocalPlayer.Name then
+		local named = Players:FindFirstChild(roleName)
+		if IsLiveThreatPlayer(named) then
+			threat.CachedMurderer = named
+			return named
+		end
+	end
+
+	-- The Dangerometer already treats Ghost detection as a valid role signal.
+	local detector = _G.Celestial.PowerDetector
+	if detector and detector.CurrentPower == "Ghost" and IsLiveThreatPlayer(detector.CurrentPlayer) then
+		threat.CachedMurderer = detector.CurrentPlayer
+		return detector.CurrentPlayer
+	end
+
+	if now < threat.NextRoleScanAt then
+		if IsLiveThreatPlayer(threat.CachedMurderer) then return threat.CachedMurderer end
+		return nil
+	end
+	threat.NextRoleScanAt = now + threat.RoleScanInterval
+
+	-- Low-frequency fallback mirrors the Dangerometer's inventory-based Murderer check.
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if IsLiveThreatPlayer(plr) then
+			local ok, isKnife = pcall(CheckPlayerInventory, plr)
+			if ok and isKnife then
+				threat.CachedMurderer = plr
+				return plr
+			end
+		end
+	end
+	threat.CachedMurderer = nil
+	return nil
+end
+
+local function IsThreatSafeCoin(coin)
+	local threat = CoinEngine.ThreatResponse
+	if not threat.Active or not coin or not coin.Parent then return true end
+	local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
+	if not murderRoot then return true end
+	return (coin.Position - murderRoot.Position).Magnitude >= threat.PreferredSeparation
+end
+
+local function PickThreatCoin(fromPos, exclude, now)
+	local threat = CoinEngine.ThreatResponse
+	local murderer = threat.Murderer
+	local murderRoot = murderer and GetRoot(murderer)
+	if not threat.Active or not murderRoot then
+		return PickNearest(fromPos, exclude, now)
+	end
+
+	local murderPos = murderRoot.Position
+	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
+	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+
+	local function FindCandidate(verticalLimit, requireSeparation)
+		local best, bestScore = nil, math.huge
+		for coin in pairs(CoinEngine.CoinCache) do
+			if coin ~= exclude then
+				if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+					UnregisterCoin(coin)
+				else
+					local blacklistedUntil = CoinEngine.Blacklist[coin]
+					if blacklistedUntil and blacklistedUntil <= now then
+						CoinEngine.Blacklist[coin] = nil
+						blacklistedUntil = nil
+					end
+					local delta = coin.Position - fromPos
+					local verticalGap = math.abs(delta.Y)
+					local distance = delta.Magnitude
+					local murderGap = (coin.Position - murderPos).Magnitude
+					if not blacklistedUntil and IsSafeCoinPosition(coin.Position)
+						and verticalGap <= verticalLimit and distance <= maxDistance
+						and (not requireSeparation or murderGap >= threat.PreferredSeparation) then
+						if IsGrounded(coin) then
+							local routeVector = coin.Position - fromPos
+							local awayVector = fromPos - murderPos
+							local directionPenalty = 0
+							if routeVector.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
+								local awayDot = routeVector.Unit:Dot(awayVector.Unit)
+								directionPenalty = math.max(0, 0.25 - awayDot) * 24
+							end
+							local score = CoinTravelScore(fromPos, coin.Position) + directionPenalty
+							if score < bestScore then best, bestScore = coin, score end
+						else
+							CoinEngine.Blacklist[coin] = now + 6
+						end
+					end
+				end
+			end
+		end
+		return best
+	end
+
+	-- First try coins with room from the Murderer on the current floor, then other floors.
+	local candidate = FindCandidate(preferredGap, true)
+	if candidate then return candidate end
+	candidate = FindCandidate(maxGap, true)
+	if candidate then return candidate end
+
+	-- If every available coin is close to the threat, choose a reachable coin using a
+	-- distance penalty. This degrades gracefully instead of stopping coin collection.
+	local fallback, fallbackScore = nil, math.huge
+	for coin in pairs(CoinEngine.CoinCache) do
+		if coin ~= exclude and coin.Parent and IsInRecognizedCoinSource(coin) and IsValidCoin(coin) then
+			local bl = CoinEngine.Blacklist[coin]
+			if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
+			local delta = coin.Position - fromPos
+			local murderGap = (coin.Position - murderPos).Magnitude
+			if not bl and IsSafeCoinPosition(coin.Position)
+				and math.abs(delta.Y) <= maxGap and delta.Magnitude <= maxDistance then
+				if IsGrounded(coin) then
+					local riskPenalty = math.max(0, threat.PreferredSeparation - murderGap) * 8
+					local awayVector = fromPos - murderPos
+					local directionPenalty = 0
+					if delta.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
+						local awayDot = delta.Unit:Dot(awayVector.Unit)
+						directionPenalty = math.max(0, 0.25 - awayDot) * 24
+					end
+					local score = CoinTravelScore(fromPos, coin.Position) + riskPenalty + directionPenalty
+					if score < fallbackScore then fallback, fallbackScore = coin, score end
+				else
+					CoinEngine.Blacklist[coin] = now + 6
+				end
+			end
+		end
+	end
+	return fallback
+end
+
+local function UpdateThreatResponse(root, now)
+	local threat = CoinEngine.ThreatResponse
+	if not threat.Enabled or not root then return nil, math.huge end
+
+	-- If the local player is confirmed as Murderer, do not classify them as their own danger.
+	-- Clear any stale threat route and return to the normal coin selector.
+	if CoinEngine.DetectLocalMurderer(now) then
+		threat.Active = false
+		threat.Murderer = nil
+		threat.CachedMurderer = nil
+		threat.LastDistance = math.huge
+		threat.LastSeenAt = now
+		threat.LocalMurdererSafe = true
+		if not threat.LocalMurdererSafeLogged then
+			threat.LocalMurdererSafeLogged = true
+			return "self-murderer-safe", math.huge
+		end
+		return nil, math.huge
+	end
+	threat.LocalMurdererSafe = false
+	threat.LocalMurdererSafeLogged = false
+
+	local wasActive = threat.Active
+	local murderer = ResolveFarmMurderer(now)
+	local murderRoot = murderer and GetRoot(murderer)
+	local distance = murderRoot and (root.Position - murderRoot.Position).Magnitude or math.huge
+
+	if not threat.Active then
+		if murderer and distance <= threat.EnterDistance then
+			threat.Active = true
+			threat.Murderer = murderer
+			threat.LastSeenAt = now
+			threat.LastDistance = distance
+		end
+	else
+		if murderer and murderRoot and distance <= threat.ReleaseDistance then
+			threat.Murderer = murderer
+			threat.LastSeenAt = now
+			threat.LastDistance = distance
+		elseif now - threat.LastSeenAt >= threat.LostGrace then
+			threat.Active = false
+			threat.Murderer = nil
+			threat.LastDistance = math.huge
+		end
+	end
+
+	if wasActive ~= threat.Active then
+		return threat.Active and "entered" or "released", distance
+	end
+	return nil, distance
+end
+
 -- El siguiente objetivo se elige desde la posicion del ACTUAL (no desde el jugador),
 -- lo que reduce el recorrido total y deja la transicion lista antes de llegar.
 local function PrepareNext(now)
 	local cur = CoinEngine.CurrentTarget
 	if not cur or not cur.Parent then CoinEngine.NextTarget = nil; return end
-	local nxt = PickNearest(cur.Position, cur, now)
+	local nxt
+	if CoinEngine.ThreatResponse.Active then
+		nxt = PickThreatCoin(cur.Position, cur, now)
+	else
+		local heading
+		local hroot = GetRoot()
+		if hroot then
+			local d = cur.Position - hroot.Position
+			d = Vector3.new(d.X, 0, d.Z)
+			if d.Magnitude > 1 then heading = d.Unit end
+		end
+		nxt = PickNearest(cur.Position, cur, now, heading)
+	end
 	CoinEngine.NextTarget = nxt
 	nextPrepareAt = nxt and math.huge or (now + 0.25)
 end
@@ -6616,11 +6960,17 @@ local function AdvanceTarget(root, now)
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 	if nxt and IsAvailable(nxt, now)
 		and (nxt.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-		and math.abs(nxt.Position.Y - root.Position.Y) <= maxGap then
+		and math.abs(nxt.Position.Y - root.Position.Y) <= maxGap
+		and IsThreatSafeCoin(nxt) then
 		SetCurrent(nxt, now)
 		return
 	end
-	local c = PickNearest(root.Position, nil, now)
+	local c
+	if CoinEngine.ThreatResponse.Active then
+		c = PickThreatCoin(root.Position, nil, now)
+	else
+		c = PickNearest(root.Position, nil, now, CoinEngine.VelocityHeading())
+	end
 	if c then
 		SetCurrent(c, now)
 	else
@@ -6725,6 +7075,126 @@ end
 -- CONTROLADOR DE MOVIMIENTO (unico, Heartbeat, sin esperas)
 -- ---------------------------------------------------------------
 
+-- ---------------------------------------------------------------
+-- V3.23: VUELO CONTINUO.
+-- El personaje ya no frena a 0 en cada moneda: conserva el impulso y recoge "al pasar".
+--  * Recogida por BARRIDO: a 80 studs/s avanza ~1.3 studs por frame, asi que comprobar solo la
+--    posicion de cada frame podria saltarse la moneda. Se usa la distancia minima entre el punto de
+--    contacto y el segmento recorrido este frame (limitado a saltos < 20 studs).
+--  * La velocidad maxima sigue siendo la del slider. Solo se planifica la velocidad de SALIDA de
+--    cada moneda segun el giro hacia la siguiente (recto = sin frenar; vuelta cerrada = frena antes),
+--    el espacio disponible hasta la siguiente y el intervalo minimo entre recogidas.
+--  * Solo frena del todo en la ultima moneda disponible.
+-- ---------------------------------------------------------------
+function CoinEngine.ContactPoint(coin, root)
+	local h = math.max(0.5, (root.Size.Y + coin.Size.Y) * 0.5 - 0.15)
+	return coin.Position + Vector3.new(0, h, 0)
+end
+
+function CoinEngine.FlowStep(root, target, now, dt, safe, speed, tt)
+	local prof = CoinEngine.GetProfile()
+	local rootPos = root.Position
+	local lastPos = CoinEngine.FlowLastPos
+	if lastPos and now - (CoinEngine.FlowLastAt or 0) > 0.1 then lastPos = nil end   -- posicion previa obsoleta (pausa/lag)
+	local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
+
+	-- 1) Recogida por barrido hacia la moneda actual
+	local approachPos = CoinEngine.ContactPoint(target, root)
+	local delta = approachPos - rootPos
+	local dist = delta.Magnitude
+	if dist ~= dist or dist == math.huge then return end
+	local sweep = dist
+	if lastPos then
+		local seg = rootPos - lastPos
+		local len2 = seg:Dot(seg)
+		if len2 > 1e-6 and len2 < 400 then
+			local t = math.clamp((approachPos - lastPos):Dot(seg) / len2, 0, 1)
+			sweep = (lastPos + seg * t - approachPos).Magnitude
+		end
+	end
+	CoinEngine.FlowLastSweep = sweep
+	if math.min(dist, sweep) <= prof.PickupRadius then
+		lastProgress = now
+		if now - lastCollectAt >= minGap and IsAvailable(target, now) then
+			local collectInfo = string.format("collect d=%.1f spd=%.1f arr=0.00 gap=%.2f settle=0.00 dy=%.1f sb=%d ps=%d sl=%d dn=%d sf=%d fl=1 sw=%.2f ex=%.0f pr=%.1f",
+				dist, root.AssemblyLinearVelocity.Magnitude, now - lastCollectAt, target.Position.Y - rootPos.Y,
+				CoinEngine.SoftBrake and 1 or 0, CoinEngine.PingSettle and 1 or 0,
+				math.floor(tonumber(State.TweenSpeed) or 0), CoinEngine.DiagNoCollect and 1 or 0, safe and 1 or 0,
+				sweep, CoinEngine.FlowLastExit or 0, prof.PickupRadius)
+			lastCollectAt = now
+			arriveTarget = nil
+			if CollectCoin(root, target, now) then
+				coinsCollectedTotal += 1
+				LogEvent(collectInfo)
+				hiTag = collectInfo
+				if not touchedCoins[target] then
+					touchedCoins[target] = true
+					roundCollected += 1
+					batchCollected += 1
+				end
+				-- Siguiente objetivo ya preparado: se sigue volando sin perder el impulso.
+				AdvanceTarget(root, now)
+				target = CoinEngine.CurrentTarget
+				if not target then
+					CoinEngine.FlowLastPos = rootPos
+					CoinEngine.FlowLastAt = now
+					return            -- sin mas monedas: SafeControllerStep decelera con rampa
+				end
+				approachPos = CoinEngine.ContactPoint(target, root)
+				delta = approachPos - rootPos
+				dist = delta.Magnitude
+				if dist ~= dist or dist == math.huge or dist < 0.001 then return end
+			end
+		end
+	end
+
+	-- 2) Velocidad de salida segun el giro hacia la siguiente moneda
+	local dir = delta / dist
+	local exitSpeed = 0
+	local nxt = CoinEngine.NextTarget
+	if nxt and nxt ~= target and nxt.Parent and IsAvailable(nxt, now) then
+		local out = CoinEngine.ContactPoint(nxt, root) - approachPos
+		local outLen = out.Magnitude
+		if outLen > 0.05 then
+			local cosT = dir:Dot(out / outLen)
+			local sharp = (1 - cosT) * 0.5                       -- 0 = recto, 1 = media vuelta
+			local risk = math.clamp(tonumber(adaptiveRiskScore) or 0, 0, 1)
+			local aLat = prof.LateralAccel * (1 - 0.35 * risk)   -- con ping/FPS malos se gira con mas margen
+			local vTurn = math.sqrt(aLat * outLen / (2 * sharp + 0.05))
+			local vSpace = outLen / (minGap * 1.2)               -- tiempo hasta la siguiente >= intervalo minimo de recogida
+			local minExit = math.min(prof.MinExitSpeed, speed)            -- con sliders bajos el minimo no puede superar la velocidad
+			exitSpeed = math.clamp(math.min(vTurn, vSpace), minExit, speed)
+		end
+	end
+	CoinEngine.FlowLastExit = exitSpeed
+
+	-- 3) Perfil de velocidad: frena solo lo necesario para llegar con la velocidad de salida planificada
+	local margin = math.max(dist - prof.PickupRadius, 0)
+	local brakeCap = math.sqrt(exitSpeed * exitSpeed + 2 * CoinEngine.MaxAcceleration * margin)
+	local v = math.min(currentSpeed, brakeCap)
+	if CoinEngine.ChaseFix and tt then
+		local lead = math.clamp(tt.vel:Dot(dir), 0, CoinEngine.ChaseMaxLead)
+		if lead > 0 then v = math.min(currentSpeed, v + lead) end
+	end
+	if dist > prof.PickupRadius then
+		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))   -- no quedarse a medio camino
+	end
+	lastFlightV = v
+	if v == v and flightVel then
+		ApplyStableFlightVelocity(dir, v, dt)
+		velApplied = true
+		-- Orientacion segun la velocidad ORDENADA (ya suavizada), no segun la direccion cruda a la moneda:
+		-- evita giros bruscos del personaje al cambiar de objetivo.
+		local cv = CoinEngine.LastCommandVelocity or Vector3.zero
+		local face = Vector3.new(cv.X, 0, cv.Z)
+		if face.Magnitude > 2 and flightGyro then
+			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + face)
+		end
+	end
+	CoinEngine.FlowLastPos = rootPos
+	CoinEngine.FlowLastAt = now
+end
+
 local function ControllerStep(dt)
 	if not State.FarmEnabled then
 		solidOverlapSince = nil
@@ -6737,7 +7207,7 @@ local function ControllerStep(dt)
 
 	local now = os.clock()
 	local rawDt = dt
-	CoinEngine.NoclipWanted = flightOn     -- mientras se vuela (o se flota en una pausa) se atraviesa la geometria
+	CoinEngine.NoclipWanted = false     -- V3.22: no desactiva colisiones durante el Auto-Farm
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -6791,6 +7261,15 @@ local function ControllerStep(dt)
 
 	-- Sin ronda en curso (lobby / cuenta atras / armas aun sin asignar): NO volar ni mover al personaje.
 	if not roundActive then
+		if CoinEngine.ThreatResponse.Active or CoinEngine.ThreatResponse.Murderer or CoinEngine.ThreatResponse.CachedMurderer then
+			CoinEngine.ThreatResponse.Active = false
+			CoinEngine.ThreatResponse.Murderer = nil
+			CoinEngine.ThreatResponse.CachedMurderer = nil
+			CoinEngine.ThreatResponse.NextRoleScanAt = 0
+			CoinEngine.ThreatResponse.NextRouteCheckAt = 0
+			CoinEngine.ThreatResponse.LastSeenAt = 0
+			CoinEngine.ThreatResponse.LastDistance = math.huge
+		end
 		StopFlight()
 		lastSetPos = nil
 		currentSpeed = 0
@@ -6830,6 +7309,40 @@ local function ControllerStep(dt)
 		return
 	end
 
+	-- V3.22: update the Dangerometer-backed Murderer distance and temporarily favor safer coins.
+	local threatTransition, threatDistance = UpdateThreatResponse(root, now)
+	if threatTransition == "entered" then
+		local saferCoin = PickThreatCoin(root.Position, nil, now)
+		if saferCoin then SetCurrent(saferCoin, now) end
+		local murderRoot = CoinEngine.ThreatResponse.Murderer and GetRoot(CoinEngine.ThreatResponse.Murderer)
+		local separation = saferCoin and murderRoot and (saferCoin.Position - murderRoot.Position).Magnitude or -1
+		LogEvent(string.format("murder-threat-response entered dist=%.1f targetSep=%.1f target=%s",
+			threatDistance, separation, saferCoin and saferCoin:GetFullName() or "none"))
+	elseif threatTransition == "released" or threatTransition == "self-murderer-safe" then
+		-- Drop the temporary route; normal nearest-coin routing takes over immediately.
+		SetCurrent(nil, now)
+		if threatTransition == "self-murderer-safe" then
+			LogEvent("murder-threat-response self-role-safe=1 local-is-murderer=1 normal-routing=1")
+		else
+			LogEvent("murder-threat-response released normal-routing=1")
+		end
+	end
+	local threat = CoinEngine.ThreatResponse
+	if threat.Active and now >= threat.NextRouteCheckAt then
+		threat.NextRouteCheckAt = now + threat.RouteCheckInterval
+		local cur = CoinEngine.CurrentTarget
+		if not cur or not IsAvailable(cur, now) or not IsThreatSafeCoin(cur) then
+			local saferCoin = PickThreatCoin(root.Position, nil, now)
+			if saferCoin and saferCoin ~= cur then
+				SetCurrent(saferCoin, now)
+				local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
+				local separation = murderRoot and (saferCoin.Position - murderRoot.Position).Magnitude or -1
+				LogEvent(string.format("murder-threat-response reroute dist=%.1f targetSep=%.1f target=%s",
+					threat.LastDistance, separation, saferCoin:GetFullName()))
+			end
+		end
+	end
+
 	if CoinEngine.CoinCount == 0 then return end            -- espera (flotando quieto) hasta que un evento registre monedas
 	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
 
@@ -6845,16 +7358,25 @@ local function ControllerStep(dt)
 	if now >= nextImproveCheck then
 		nextImproveCheck = now + 0.35
 		local cur = CoinEngine.CurrentTarget
-		local cand = PickNearest(root.Position, nil, now)
+		local cand
+		if CoinEngine.ThreatResponse.Active then
+			cand = PickThreatCoin(root.Position, nil, now)
+		else
+			cand = PickNearest(root.Position, nil, now, CoinEngine.VelocityHeading())
+		end
 		if cand and cand ~= cur then
 			local dc = CoinTravelScore(root.Position, cur.Position)
 			local dn = CoinTravelScore(root.Position, cand.Position)
-			if dn < dc * CoinEngine.SwitchRatio then SetCurrent(cand, now) end
+			local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
+			if CoinEngine.ThreatResponse.Active and not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
+				shouldSwitch = true
+			end
+			if shouldSwitch then SetCurrent(cand, now) end
 		end
 	end
 
 	-- ===== VUELO hacia la moneda =====
-	SetStatus("farming")
+	SetStatus(CoinEngine.ThreatResponse.Active and "threat-routing" or "farming")
 	EnsureFlight(root, hum)
 
 	-- Recuperacion adaptativa: no apaga el Farm ni introduce pausas.
@@ -6897,8 +7419,12 @@ local function ControllerStep(dt)
 		nextAdaptiveProfileLogAt = now + 1.0
 		local physicalSpeed = 0
 		pcall(function() physicalSpeed = root.AssemblyLinearVelocity.Magnitude end)
-		LogEvent(string.format("adaptive-stability ping=%.0f fps=%.1f slider=%.1f cmd=%.1f phys=%.1f risk=%.2f steer=%.2f",
-			cachedPingMs, adaptiveFPS, speed, currentSpeed, physicalSpeed, adaptiveRiskScore, adaptiveSteerAlpha))
+		local cpsWin = CoinEngine.CpsWin
+		if not cpsWin or now - cpsWin.t > 6 then cpsWin = {t = now, n = coinsCollectedTotal}; CoinEngine.CpsWin = cpsWin end
+		local cps = (coinsCollectedTotal - cpsWin.n) / math.max(now - cpsWin.t, 0.5)
+		LogEvent(string.format("adaptive-stability ping=%.0f fps=%.1f slider=%.1f cmd=%.1f phys=%.1f risk=%.2f steer=%.2f cps=%.2f flow=%d safe=%d",
+			cachedPingMs, adaptiveFPS, speed, currentSpeed, physicalSpeed, adaptiveRiskScore, adaptiveSteerAlpha,
+			cps, CoinEngine.FlowFlight and 1 or 0, safe and 1 or 0))
 	end
 
 	local target = CoinEngine.CurrentTarget
@@ -6966,7 +7492,10 @@ local function ControllerStep(dt)
 	CoinEngine.LastTargetVel = tt.vel.Magnitude
 
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
-	if dist <= pickupDistance then
+	if CoinEngine.FlowFlight and firetouchinterest then
+		-- V3.23: vuelo continuo (ver CoinEngine.FlowStep). Con FlowFlight = false se usa el flujo V3.22 de abajo.
+		CoinEngine.FlowStep(root, target, now, dt, safe, speed, tt)
+	elseif dist <= pickupDistance then
 		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
 		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
 		if firetouchinterest then
@@ -7086,9 +7615,21 @@ local function SafeControllerStep(dt)
 		end
 	end
 	if flightVel and not velApplied then
-		pcall(function() flightVel.Velocity = Vector3.zero end) -- sin orden: flota quieto
-		CoinEngine.LastCommandVelocity = Vector3.zero
+		local prevCmd = CoinEngine.LastCommandVelocity or Vector3.zero
+		local prevMag = prevCmd.Magnitude
+		if CoinEngine.SoftStop and not CoinEngine.NoSoftStop and State.FarmEnabled and prevMag > 1.5 then
+			-- V3.23: sin orden este frame (pausa por lag, sin objetivo...): decelera con rampa en vez de
+			-- cortar la velocidad ordenada a 0 en un solo frame.
+			local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 1 / 20)
+			local newCmd = prevCmd.Unit * math.max(prevMag - CoinEngine.GetProfile().SoftStopDecel * frameDt, 0)
+			pcall(function() flightVel.Velocity = newCmd end)
+			CoinEngine.LastCommandVelocity = newCmd
+		else
+			pcall(function() flightVel.Velocity = Vector3.zero end) -- sin orden: flota quieto
+			CoinEngine.LastCommandVelocity = Vector3.zero
+		end
 	end
+	CoinEngine.NoSoftStop = false
 	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt, csMs) end
 	if State.FarmEnabled then
 		local lsT0, lwT0 = os.clock(), tick()
@@ -12594,7 +13135,7 @@ local function SummarizeFarmLog(raw, kind)
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.17",
+		"CH " .. kind .. " SUMMARY | analizador=3.21",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
