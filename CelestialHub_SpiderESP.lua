@@ -1,4 +1,4 @@
--- V3.13: stricter stale-coin rejection; conservative target validation, based on V3.11.
+-- V3.14: adaptive steering from ping/FPS/physical speed; preserves the V3.12 speed limit up to 80.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -927,7 +927,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 16, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -5086,18 +5086,19 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 16,         -- V3.13: movimiento normal del Humanoid, sin vuelo forzado
-	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
-	MaxAcceleration = 72,     -- V3.9: suaviza cambios de direccion para el rango 70-80
+	BaseMaxSpeed = 80,         -- V3.14: conserva el tope original del slider
+	MaxVerticalVelocity = 12, -- limita la orden vertical sin reducir el tope configurado
+	MaxAcceleration = 72,     -- se usa para calcular el frenado de aproximacion a la moneda
 	LastCommandVelocity = Vector3.zero,
-	RampTime = 0.55,           -- V3.9: rampa mas larga para acelerar progresivamente hasta 80
+	AdaptiveStability = true, -- adapta la direccion con ping, FPS y velocidad fisica; no impone un tope dinamico
+	RampTime = 0.55,           -- rampa original de aceleracion para el rango 70-80
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	VerticalTravelPenalty = 2.5, -- una moneda en el mismo piso pesa mas que una elevada
 	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
 	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 16,   -- V3.13: Safe Mode conserva el límite de movimiento normal
+	SafeMaxSpeed = 80,   -- V3.14: Safe Mode conserva el mismo tope de 80
 	SafeRampTime = 0.65,       -- rampa extra gradual en Safe Mode
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
@@ -5106,11 +5107,11 @@ local CoinEngine = {
 	-- ===== LOTES FIJOS (solo con Safe Mode) =====
 	Batches = {13, 13, 13, 11},  -- monedas RECOGIDAS por el script en cada lote; tras cada lote (menos el ultimo) hay pausa
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
-	-- ===== MOVIMIENTO NORMAL (sin BodyVelocity, BodyGyro, PlatformStand ni noclip) =====
-	StopDistance = 0.0,          -- V3.13: aproximación horizontal mediante movimiento normal
-	FlightApproachGain = 8,      -- frenado lógico; el movimiento real lo controla Humanoid
-	SafeFlightApproachGain = 6,  -- Safe Mode conserva una aproximación más suave
-	FlightMinSpeed = 0,          -- no se fuerza una velocidad mínima
+	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
+	StopDistance = 0.0,          -- V3.11: apunta al punto de contacto sobre la moneda, no se queda a 2 studs
+	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
+	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
+	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
 	ChaseFix = true,             -- V3.2: compensa monedas que se mueven (sin esto, con gain 8 queda a ~3.7 > PickupDistance y nunca recoge). false = V3.1
 	ChaseMaxLead = 30,           -- V3.2: tope (studs/s) de la velocidad extra que se suma por mover la moneda
 	-- ===== PRUEBAS A/B (poner en false para volver al comportamiento anterior) =====
@@ -5118,7 +5119,7 @@ local CoinEngine = {
 	SoftBrakeGain = 8,           -- ganancia de frenado al acercarse con SoftBrake (menor = frena desde mas lejos)
 	SoftBrakeDecay = 0.5,        -- factor por frame de la velocidad al llegar (0.5 = la mitad cada frame)
 	PingSettle = false,          -- espera previa a recoger = ping + margen (antes: ping/2 + 0.02). OFF: en el log V3 costo ~35% de monedas/s sin mejora demostrada
-	DiagNoCollect = false,       -- V3.13: la recogida se deja al contacto normal del juego
+	DiagNoCollect = false,       -- SOLO DIAGNOSTICO: vuela y frena igual pero NO llama a firetouchinterest (no recoge monedas reales)
 	PingSettleMargin = 0.05,
 	PingSettleMax = 0.30,
 	-- ===== DETECTOR DE RONDA =====
@@ -5127,13 +5128,13 @@ local CoinEngine = {
 	RoundEndDebounce = 3.0,      -- sin armas en ningun inventario durante este tiempo = ronda terminada
 	SettleMin = 0.03,          -- espera minima al llegar a la moneda (el servidor ve tu posicion con retraso)
 	SettleMax = 0.15,
-	PingAdaptiveSpeed = true,  -- V3.3 (HIPOTESIS): con ping alto el servidor ve tu posicion mas atrasada; se reduce la velocidad. false = desactivar
-	PingAdaptiveStart = 150,   -- ms de ping a partir de los que se reduce (velocidad * 150/ping)
-	PingAdaptiveMin = 20,      -- velocidad minima (studs/s) aunque el ping sea enorme
-	NoclipWanted = false,      -- V3.13: siempre desactivado; se conservan las colisiones normales
+	PingAdaptiveSpeed = false, -- V3.14: compatibilidad heredada; el ping ya no reduce la velocidad objetivo
+	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
+	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
+	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
-	PickupDistance = 1.5,       -- margen horizontal de aproximación; la recogida depende del contacto normal
+	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
 	CollectCooldown = 4.0,      -- V3.11: evita perseguir de nuevo monedas tocadas que siguen temporalmente en el mapa
 	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
 	StuckBlacklist = 5,
@@ -5165,6 +5166,8 @@ local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar 
 local noclipOn = false
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
 local cachedPingMs, nextPingAt = 80, 0
+local adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = 1, 0, 60, 0
+local nextAdaptiveProfileLogAt = 0
 
 -- ===== Estado: detector de ronda + lotes FIJOS de monedas + vuelo (config en CoinEngine) =====
 local roundActive = false              -- true solo mientras la ronda esta en curso (armas asignadas + monedas)
@@ -5198,45 +5201,119 @@ end
 local function StopFlight()
 	if flightGyro then pcall(function() flightGyro:Destroy() end); flightGyro = nil end
 	if flightVel then pcall(function() flightVel:Destroy() end); flightVel = nil end
-	local hum = GetHumanoid()
-	if hum then
-		pcall(function() hum.PlatformStand = false end)
-		pcall(function() hum:Move(Vector3.zero, false) end)
+	if flightOn then
+		local hum = GetHumanoid()
+		if hum then pcall(function() hum.PlatformStand = false end) end
 	end
 	flightOn = false
 	CoinEngine.LastCommandVelocity = Vector3.zero
-	_G.Celestial.FarmFlying = false
+	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
 	CoinEngine.NoclipWanted = false
-	if noclipOn then RestoreCollisions() end
 end
 
 local function EnsureFlight(root, hum)
-	-- Compatibilidad con el resto del controlador: no crea fuerzas ni pone al Humanoid en PlatformStand.
-	if flightGyro then pcall(function() flightGyro:Destroy() end); flightGyro = nil end
-	if flightVel then pcall(function() flightVel:Destroy() end); flightVel = nil end
-	if hum then
-		pcall(function() hum.PlatformStand = false end)
-		pcall(function() hum.WalkSpeed = math.clamp(tonumber(State.TweenSpeed) or 16, 8, 16) end)
+	if not flightGyro or flightGyro.Parent ~= root then
+		if flightGyro then pcall(function() flightGyro:Destroy() end) end
+		flightGyro = Instance.new("BodyGyro")
+		flightGyro.Name = "__CelestialFarmGyro"
+		flightGyro.MaxTorque = Vector3.new(99999, 99999, 99999)
+		flightGyro.P = 9000
+		flightGyro.CFrame = root.CFrame
+		flightGyro.Parent = root
 	end
-	flightOn = false
-	_G.Celestial.FarmFlying = false
-	CoinEngine.NoclipWanted = false
-	if noclipOn then RestoreCollisions() end
+	if not flightVel or flightVel.Parent ~= root then
+		if flightVel then pcall(function() flightVel:Destroy() end) end
+		flightVel = Instance.new("BodyVelocity")
+		flightVel.Name = "__CelestialFarmVel"
+		flightVel.MaxForce = Vector3.new(99999, 99999, 99999)
+		flightVel.Velocity = Vector3.zero
+		flightVel.Parent = root
+	end
+	if not hum.PlatformStand then hum.PlatformStand = true end
+	flightOn = true
+	_G.Celestial.FarmFlying = true
+	CoinEngine.NoclipWanted = true       -- atraviesa paredes mientras vuela / flota
+end
+
+-- Estabilidad adaptativa V3.14.
+-- El ping, los FPS (dt de Heartbeat) y la velocidad fisica modifican SOLO la suavidad del giro.
+-- No hay un tope de velocidad dinamico: se conserva la magnitud solicitada cuando existe una
+-- direccion horizontal. La frenada por proximidad a la moneda sigue siendo independiente.
+local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
+	local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 0.05)
+	local fps = 1 / frameDt
+	local pingNow = os.clock()
+	if pingNow >= nextPingAt then
+		nextPingAt = pingNow + 1
+		local okPing, measuredPing = pcall(function()
+			return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if okPing and tonumber(measuredPing) then cachedPingMs = tonumber(measuredPing) end
+	end
+	local ping = math.clamp(tonumber(cachedPingMs) or 80, 0, 1000)
+	local actualSpeed = math.max(0, tonumber(requestedSpeed) or 0)
+	local char = LocalPlayer and LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		pcall(function() actualSpeed = root.AssemblyLinearVelocity.Magnitude end)
+	end
+	local speedSignal = math.max(actualSpeed, tonumber(requestedSpeed) or 0)
+	local pingLoad = math.clamp((ping - 60) / 200, 0, 1)
+	local fpsLoad = math.clamp((50 - fps) / 30, 0, 1)
+	local speedLoad = math.clamp((speedSignal - 30) / 50, 0, 1)
+	local risk = math.clamp(pingLoad * 0.38 + fpsLoad * 0.34 + speedLoad * 0.28, 0, 1)
+	-- Con latencia/FPS peores se filtran mas los cambios de rumbo; a velocidad alta se mantiene
+	-- suficiente respuesta para no quedarse siguiendo una direccion antigua durante demasiado tiempo.
+	local responseTime = math.clamp(0.020 + pingLoad * 0.014 + fpsLoad * 0.012 - speedLoad * 0.006, 0.012, 0.046)
+	local alpha = math.clamp(1 - math.exp(-frameDt / responseTime), 0.12, 0.90)
+	adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = alpha, risk, fps, actualSpeed
+	return alpha
 end
 
 local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
-	-- Nombre conservado para no romper llamadas existentes. Ahora solo da dirección de movimiento
-	-- al Humanoid normal; no asigna AssemblyLinearVelocity ni crea BodyVelocity.
-	local hum = GetHumanoid()
-	if not hum or not direction then return end
-	local horizontal = Vector3.new(direction.X, 0, direction.Z)
-	if horizontal.Magnitude > 0.05 then
-		pcall(function() hum.WalkSpeed = math.clamp(tonumber(State.TweenSpeed) or 16, 8, 16) end)
-		pcall(function() hum:Move(horizontal.Unit, false) end)
-	else
-		pcall(function() hum:Move(Vector3.zero, false) end)
+	if not flightVel or not direction then return end
+	local speed = math.max(0, tonumber(requestedSpeed) or 0)
+	local dirMag = direction.Magnitude
+	if dirMag < 1e-5 then return end
+	local dir = direction / dirMag
+	local previous = CoinEngine.LastCommandVelocity or Vector3.zero
+	local alpha = CoinEngine.AdaptiveStability and GetAdaptiveSteeringAlpha(dt, speed) or 1
+
+	-- Se limita la orden vertical, pero el presupuesto horizontal se calcula por separado para
+	-- conservar la magnitud solicitada en vez de recortar la velocidad en giros/desniveles.
+	local desiredY = math.clamp(dir.Y * speed, -CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+	local previousY = math.clamp(previous.Y, -CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+	local yAlpha = math.clamp(alpha + 0.12, 0.12, 1)
+	local y = math.clamp(previousY + (desiredY - previousY) * yAlpha,
+		-CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+
+	local desiredHorizontal = Vector3.new(dir.X, 0, dir.Z)
+	local previousHorizontal = Vector3.new(previous.X, 0, previous.Z)
+	local horizontalDirection = nil
+	if desiredHorizontal.Magnitude > 1e-4 then
+		local desiredUnit = desiredHorizontal.Unit
+		if previousHorizontal.Magnitude > 1e-4 and alpha < 0.999 then
+			-- Interpolar el angulo (no los vectores) tambien suaviza cambios cercanos a 180 grados.
+			local previousUnit = previousHorizontal.Unit
+			local previousAngle = math.atan2(previousUnit.X, previousUnit.Z)
+			local desiredAngle = math.atan2(desiredUnit.X, desiredUnit.Z)
+			local angleDelta = (desiredAngle - previousAngle + math.pi) % (2 * math.pi) - math.pi
+			local angle = previousAngle + angleDelta * alpha
+			horizontalDirection = Vector3.new(math.sin(angle), 0, math.cos(angle))
+		else
+			horizontalDirection = desiredUnit
+		end
+	elseif previousHorizontal.Magnitude > 1e-4 then
+		-- Objetivo casi directamente arriba/abajo: conserva el rumbo horizontal previo mientras
+		-- la componente vertical permanece dentro del limite, en vez de inventar un giro brusco.
+		horizontalDirection = previousHorizontal.Unit
 	end
-	CoinEngine.LastCommandVelocity = Vector3.zero
+
+	local horizontalBudget = math.sqrt(math.max(0, speed * speed - y * y))
+	local horizontal = horizontalDirection and horizontalDirection * horizontalBudget or Vector3.zero
+	local targetVelocity = horizontal + Vector3.new(0, y, 0)
+	flightVel.Velocity = targetVelocity
+	CoinEngine.LastCommandVelocity = targetVelocity
 end
 
 local function CoinNameMatches(obj)
@@ -5418,8 +5495,19 @@ local function RestoreCollisions()
 end
 
 local function NoclipStep()
-	CoinEngine.NoclipWanted = false
-	if noclipOn or next(origCollide) ~= nil then RestoreCollisions() end
+	if CoinEngine.NoclipWanted and CoinEngine.Active and State.FarmEnabled then
+		local char = LocalPlayer.Character
+		if not char then return end
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") then
+				if origCollide[part] == nil then origCollide[part] = part.CanCollide end
+				part.CanCollide = false
+			end
+		end
+		noclipOn = true
+	elseif noclipOn then
+		RestoreCollisions()
+	end
 end
 
 local overlapParams = OverlapParams.new()
@@ -5471,9 +5559,9 @@ end
 
 -- ---------------------------------------------------------------
 -- REGISTRO DE DIAGNOSTICO + RECUPERACION ADAPTATIVA
--- Guarda ~40 s de muestras en CelestialFarmLog.txt. Separa la velocidad ordenada por CH de la
--- velocidad fisica real. Ante solapamiento persistente, reduce temporalmente la velocidad y cambia
--- de objetivo sin detener el controlador ni poner la velocidad a cero.
+-- Guarda muestras en CelestialFarmLog.txt. Separa la velocidad ordenada por CH de la velocidad
+-- fisica real. Ante solapamiento persistente, descarta el objetivo y redirige sin imponer un tope
+-- dinamico de velocidad.
 -- ---------------------------------------------------------------
 
 local logBuf, pendingEvents = {}, {}
@@ -5482,8 +5570,6 @@ local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
 local SOLID_OVERLAP_CONFIRM_TIME = 0.60
-local overlapSpeedCapUntil = 0
-local overlapRecoverySpeedCap = 36
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -6339,14 +6425,30 @@ local function AdvanceTarget(root, now)
 end
 
 local function CollectCoin(root, coin, now)
-	-- V3.13: no simula toques. La moneda solo cuenta como recogida cuando el juego la retira
-	-- mediante su propio sistema de contacto/eventos.
-	if not coin or not coin.Parent or not IsValidCoin(coin) then
-		LogEvent("coin-no-longer-valid")
+	-- No usar una asignacion directa de CFrame al root como alternativa: incluso un salto corto
+	-- puede poner el root dentro de geometria y producir una posicion que el servidor rechace.
+	-- Sin firetouchinterest dejamos que el contacto fisico normal recoja la moneda.
+	if not firetouchinterest then
+		LogEvent("touch-api-unavailable")
 		return false
 	end
-	LogEvent("normal-contact-await")
-	return false
+	local ok = true
+	if not CoinEngine.DiagNoCollect then
+		ok = pcall(function()
+			firetouchinterest(root, coin, 0)
+			firetouchinterest(root, coin, 1)
+		end)
+	end
+	if not ok then
+		LogEvent("touch-api-failed")
+		return false
+	end
+	CoinEngine.Blacklist[coin] = now + CoinEngine.CollectCooldown
+	local n = (CoinEngine.Attempts[coin] or 0) + 1
+	CoinEngine.Attempts[coin] = n
+	if n >= 3 then CoinEngine.Blacklist[coin] = now + 8 end
+	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
+	return true
 end
 
 -- ---------------------------------------------------------------
@@ -6548,9 +6650,9 @@ local function ControllerStep(dt)
 	SetStatus("farming")
 	EnsureFlight(root, hum)
 
-	-- Recuperacion adaptativa: no apaga el Farm, no aplica velocidad cero y no introduce pausas.
-	-- Si el solapamiento persiste durante el movimiento, evita insistir con el mismo objetivo,
-	-- limita la velocidad durante un periodo corto y deja que el controlador seleccione otro objetivo.
+	-- Recuperacion adaptativa: no apaga el Farm ni introduce pausas.
+	-- Si persiste un solapamiento, evita insistir con el mismo objetivo y selecciona otra ruta;
+	-- el perfil adaptativo suaviza el giro sin reducir el limite de velocidad configurado.
 	if now >= nextSolidGuardCheck then
 		nextSolidGuardCheck = now + 0.12
 		if IsInsideSolid(root.Position) then
@@ -6560,12 +6662,11 @@ local function ControllerStep(dt)
 				local targetDistance = target and (target.Position - root.Position).Magnitude or math.huge
 				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
 				if actualSpeed >= 10 and targetDistance > 4 then
-					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f cap=%.1f", actualSpeed, targetDistance, overlapRecoverySpeedCap))
+					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1", actualSpeed, targetDistance))
 					if target then CoinEngine.Blacklist[target] = now + 2.5 end
 					-- No resetear currentSpeed ni la velocidad física: el siguiente objetivo se procesa
 					-- en este mismo ciclo y ApplyStableFlightVelocity suaviza el cambio de dirección.
 					SetCurrent(nil, now)
-					overlapSpeedCapUntil = math.max(overlapSpeedCapUntil, now + 1.5)
 					solidOverlapSince = nil
 				else
 					-- Cerca de una moneda o a baja velocidad puede ser un solapamiento de medición.
@@ -6580,15 +6681,18 @@ local function ControllerStep(dt)
 
 	local safe = SafeOn()
 	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
-	if now < overlapSpeedCapUntil then
-		speed = math.min(speed, overlapRecoverySpeedCap)
-	end
-	if CoinEngine.PingAdaptiveSpeed and cachedPingMs > CoinEngine.PingAdaptiveStart then
-		speed = math.min(speed, math.max(CoinEngine.PingAdaptiveMin, speed * CoinEngine.PingAdaptiveStart / cachedPingMs))
-	end
 	dt = math.clamp(dt, 0, 0.05)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
-	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual
+	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual hasta el valor del slider
+	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
+	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
+	if now >= nextAdaptiveProfileLogAt then
+		nextAdaptiveProfileLogAt = now + 1.0
+		local physicalSpeed = 0
+		pcall(function() physicalSpeed = root.AssemblyLinearVelocity.Magnitude end)
+		LogEvent(string.format("adaptive-stability ping=%.0f fps=%.1f slider=%.1f cmd=%.1f phys=%.1f risk=%.2f steer=%.2f",
+			cachedPingMs, adaptiveFPS, speed, currentSpeed, physicalSpeed, adaptiveRiskScore, adaptiveSteerAlpha))
+	end
 
 	local target = CoinEngine.CurrentTarget
 	if not target or not IsAvailable(target, now) then
@@ -6597,7 +6701,7 @@ local function ControllerStep(dt)
 		if not target then return end
 	end
 
-	-- V3.13: validar el objetivo contra la posicion ACTUAL del jugador en cada ciclo.
+	-- V3.12: validar el objetivo contra la posicion ACTUAL del jugador en cada ciclo.
 	-- Una moneda recogida puede seguir un instante en cache o reaparecer con una posicion antigua.
 	-- Si queda demasiado lejos/arriba despues de seleccionarla, se descarta en vez de perseguirla.
 	local targetDelta = target.Position - root.Position
@@ -6629,22 +6733,17 @@ local function ControllerStep(dt)
 		end
 	end
 	local rootPos = root.Position
-	-- V3.13: navegación horizontal con el Humanoid normal. La altura no se convierte en una orden
-	-- de vuelo; los desniveles requieren las rampas/escaleras del mapa o pueden quedar inaccesibles.
-	local approachPos = target.Position
-	local delta = Vector3.new(target.Position.X - rootPos.X, 0, target.Position.Z - rootPos.Z)
+	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
+	-- Dirigirse al centro geométrico de la moneda hacía que el personaje quedara a varios studs en horizontal
+	-- al dispararse la recogida por distancia 3D.
+	local contactHeight = math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15)
+	local approachPos = target.Position + Vector3.new(0, contactHeight, 0)
+	local delta = approachPos - rootPos
 	local dist = delta.Magnitude
 	if dist ~= dist or dist == math.huge then
 		CoinEngine.Blacklist[target] = now + 10
 		SetCurrent(nil, now)
 		return
-	end
-	if dist > 0.6 then
-		ApplyStableFlightVelocity(delta / dist, currentSpeed, dt)
-		velApplied = true
-	else
-		local normalHumanoid = GetHumanoid()
-		if normalHumanoid then pcall(function() normalHumanoid:Move(Vector3.zero, false) end) end
 	end
 
 	-- V3.2: velocidad estimada del objetivo (posicion entre frames, suavizada)
@@ -6659,10 +6758,11 @@ local function ControllerStep(dt)
 	end
 	CoinEngine.LastTargetVel = tt.vel.Magnitude
 
-	local pickupDistance = CoinEngine.PickupDistance
+	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
 	if dist <= pickupDistance then
-		-- V3.13: no llama a firetouchinterest; el juego decide si el contacto normal recoge la moneda.
-		if false then
+		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
+		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
+		if firetouchinterest then
 			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
 			lastProgress = now
 			if CoinEngine.SoftBrake then
@@ -9861,7 +9961,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Walk Speed", "Normal Humanoid movement (8-16); no forced flight or noclip.", 8, 16, State.TweenSpeed, function(v)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (80 max; adaptive steering does not lower the selected limit).", 10, 80, State.TweenSpeed, function(v)
 			local oldValue = State.TweenSpeed
 			State.TweenSpeed = v
 			local engine = _G.Celestial and _G.Celestial.CoinEngine
