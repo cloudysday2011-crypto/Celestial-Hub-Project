@@ -5049,7 +5049,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- AUTO-FARM V3.8: recuperacion adaptativa sin parada por solapamiento\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
+-- AUTO-FARM V3.9: slider 80 + aceleracion y giros mas graduales; recuperacion sin parada por solapamiento\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
 -- ====================================================================
@@ -5085,17 +5085,17 @@ local CoinEngine = {
 	CurrentTarget = nil,
 	NextTarget = nil,          -- precalculado mientras se viaja al actual
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 60,         -- limite de velocidad solicitada (V3.7: slider hasta 60)
+	BaseMaxSpeed = 80,         -- V3.9: limite ampliado para slider hasta 80
 	MaxVerticalVelocity = 12, -- evita los picos verticales de +/-50 observados en el log
-	MaxAcceleration = 90,     -- limita cambios bruscos de velocidad/direccion por segundo^2
+	MaxAcceleration = 72,     -- V3.9: suaviza cambios de direccion para el rango 70-80
 	LastCommandVelocity = Vector3.zero,
-	RampTime = 0.35,           -- aceleracion progresiva para el rango ampliado hasta 60
+	RampTime = 0.55,           -- V3.9: rampa mas larga para acelerar progresivamente hasta 80
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	MaxVerticalGap = 60,
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 60,   -- V3.7: mismo tope que BaseMaxSpeed
-	SafeRampTime = 0.4,
+	SafeMaxSpeed = 80,   -- V3.9: mismo tope ampliado que BaseMaxSpeed
+	SafeRampTime = 0.65,       -- rampa extra gradual en Safe Mode
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
 	SafeMaxVerticalGap = 60,
@@ -6590,7 +6590,7 @@ local function ControllerStep(dt)
 	end
 
 	local safe = SafeOn()
-	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
 	if now < overlapSpeedCapUntil then
 		speed = math.min(speed, overlapRecoverySpeedCap)
 	end
@@ -9824,7 +9824,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (60 max; server-side limits may still apply).", 10, 60, State.TweenSpeed, function(v)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (80 max; server-side limits may still apply).", 10, 80, State.TweenSpeed, function(v)
 			local oldValue = State.TweenSpeed
 			State.TweenSpeed = v
 			local engine = _G.Celestial and _G.Celestial.CoinEngine
