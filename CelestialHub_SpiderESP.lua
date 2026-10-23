@@ -1,4 +1,4 @@
--- V3.11: precise coin approach and stale-coin filtering, based on V3.10 Smart Coin Routing.
+-- V3.12: stricter stale-coin rejection; conservative target validation, based on V3.11.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -6642,14 +6642,30 @@ local function ControllerStep(dt)
 		target = CoinEngine.CurrentTarget
 		if not target then return end
 	end
-	-- Una moneda recogida puede quedar un instante en el cache y algunos juegos la recolocan/teletransportan.
-	-- Si el objetivo salta una distancia físicamente inverosímil entre muestras, se descarta y se elige otro;
-	-- así no perseguimos el objeto hasta el cielo por una posición obsoleta.
+
+	-- V3.12: validar el objetivo contra la posicion ACTUAL del jugador en cada ciclo.
+	-- Una moneda recogida puede seguir un instante en cache o reaparecer con una posicion antigua.
+	-- Si queda demasiado lejos/arriba despues de seleccionarla, se descarta en vez de perseguirla.
+	local targetDelta = target.Position - root.Position
+	local targetMaxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	if not IsAvailable(target, now)
+		or targetDelta.Magnitude > Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+		or math.abs(targetDelta.Y) > targetMaxGap then
+		LogEvent(string.format("stale-coin-target-invalid dist=%.1f dy=%.1f", targetDelta.Magnitude, targetDelta.Y))
+		CoinEngine.Blacklist[target] = now + 8
+		SetCurrent(nil, now)
+		AdvanceTarget(root, now)
+		target = CoinEngine.CurrentTarget
+		if not target then return end
+	end
+
+	-- Filtrado mas estricto de monedas recolocadas: como las monedas normales son estaticas,
+	-- un salto repentino suele indicar que el objetivo fue recogido, reciclado o quedo obsoleto.
 	local previousTrack = CoinEngine.TargetTrack
 	if previousTrack and previousTrack.obj == target and now - previousTrack.at >= 0.025 then
 		local elapsed = now - previousTrack.at
 		local jump = (target.Position - previousTrack.pos).Magnitude
-		if jump > math.max(10, 80 * elapsed) then
+		if jump > math.max(4, 35 * elapsed) then
 			LogEvent(string.format("stale-coin-reposition jump=%.1f dt=%.3f", jump, elapsed))
 			CoinEngine.Blacklist[target] = now + 8
 			SetCurrent(nil, now)
