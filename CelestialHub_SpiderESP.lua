@@ -5049,7 +5049,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- AUTO-FARM V3.9: slider 80 + aceleracion y giros mas graduales; recuperacion sin parada por solapamiento\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
+-- AUTO-FARM V3.10: seleccion de monedas con prioridad horizontal, suelo cercano y frenado anticipado\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
 -- ====================================================================
@@ -5092,13 +5092,16 @@ local CoinEngine = {
 	RampTime = 0.55,           -- V3.9: rampa mas larga para acelerar progresivamente hasta 80
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
-	MaxVerticalGap = 60,
+	VerticalTravelPenalty = 2.5, -- una moneda en el mismo piso pesa mas que una elevada
+	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
+	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
 	SafeMaxSpeed = 80,   -- V3.9: mismo tope ampliado que BaseMaxSpeed
 	SafeRampTime = 0.65,       -- rampa extra gradual en Safe Mode
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
-	SafeMaxVerticalGap = 60,
+	SafePreferredVerticalGap = 22,
+	SafeMaxVerticalGap = 60,      -- respaldo para otros pisos si el nivel actual esta vacio
 	-- ===== LOTES FIJOS (solo con Safe Mode) =====
 	Batches = {13, 13, 13, 11},  -- monedas RECOGIDAS por el script en cada lote; tras cada lote (menos el ultimo) hay pausa
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
@@ -6256,10 +6259,13 @@ local function IsGrounded(coin)
 	local ignore = {}
 	local container = FindCoinContainer()
 	if container then ignore[#ignore + 1] = container end
+	ignore[#ignore + 1] = coin -- evita que la propia moneda cuente como "suelo" en mapas sin CoinContainer
 	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
 	groundParams.FilterDescendantsInstances = ignore
 	local ok, hit = pcall(function()
-		return Workspace:Raycast(coin.Position + Vector3.new(0, 2, 0), Vector3.new(0, -40, 0), groundParams)
+		-- El suelo debe estar razonablemente cerca; el raycast de 40 studs aceptaba
+		-- candidatos suspendidos muy por encima del piso.
+		return Workspace:Raycast(coin.Position + Vector3.new(0, 2, 0), Vector3.new(0, -14, 0), groundParams)
 	end)
 	if ok and hit then
 		CoinEngine.GroundOk[coin] = true
@@ -6268,10 +6274,19 @@ local function IsGrounded(coin)
 	return false
 end
 
--- Una sola pasada O(N): la moneda disponible mas cercana a "fromPos".
-local function PickNearestRaw(fromPos, exclude, now)
-	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
-	local best, bestD = nil, Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+-- Coste de ruta: favorece monedas del mismo nivel para evitar ascensos diagonales sin sentido.
+local function CoinTravelScore(fromPos, coinPos)
+	local delta = coinPos - fromPos
+	local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	return horizontal + math.abs(delta.Y) * CoinEngine.VerticalTravelPenalty
+end
+
+-- Una sola pasada O(N): elige la moneda con menor coste de ruta, no solo menor distancia 3D.
+local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
+	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
+		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
+	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+	local best, bestScore = nil, math.huge
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
 			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
@@ -6279,9 +6294,12 @@ local function PickNearestRaw(fromPos, exclude, now)
 			else
 				local bl = CoinEngine.Blacklist[coin]
 				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-				if not bl and IsSafeCoinPosition(coin.Position) and math.abs(coin.Position.Y - fromPos.Y) <= maxGap then
-					local d = (coin.Position - fromPos).Magnitude
-					if d <= bestD then best, bestD = coin, d end
+				local delta = coin.Position - fromPos
+				local verticalGap = math.abs(delta.Y)
+				local distance = delta.Magnitude
+				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
+					local score = CoinTravelScore(fromPos, coin.Position)
+					if score < bestScore then best, bestScore = coin, score end
 				end
 			end
 		end
@@ -6290,11 +6308,21 @@ local function PickNearestRaw(fromPos, exclude, now)
 end
 
 local function PickNearest(fromPos, exclude, now)
+	-- Fase 1: busca monedas a una altura parecida, para no subir de piso sin necesidad.
+	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
 	for _ = 1, 6 do
-		local c = PickNearestRaw(fromPos, exclude, now)
+		local c = PickNearestRaw(fromPos, exclude, now, preferredGap)
+		if not c then break end
+		if IsGrounded(c) then return c end
+		CoinEngine.Blacklist[c] = now + 6          -- sin suelo cercano: se reintenta mas tarde
+	end
+	-- Fase 2: si el nivel cercano esta vacio, permite otros pisos, pero exige suelo cercano.
+	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	for _ = 1, 6 do
+		local c = PickNearestRaw(fromPos, exclude, now, maxGap)
 		if not c then return nil end
 		if IsGrounded(c) then return c end
-		CoinEngine.Blacklist[c] = now + 6          -- sin suelo: se reintenta mas tarde
+		CoinEngine.Blacklist[c] = now + 6
 	end
 	return nil
 end
@@ -6319,7 +6347,10 @@ end
 
 local function AdvanceTarget(root, now)
 	local nxt = CoinEngine.NextTarget
-	if nxt and IsAvailable(nxt, now) and (nxt.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance) then
+	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	if nxt and IsAvailable(nxt, now)
+		and (nxt.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+		and math.abs(nxt.Position.Y - root.Position.Y) <= maxGap then
 		SetCurrent(nxt, now)
 		return
 	end
@@ -6549,8 +6580,8 @@ local function ControllerStep(dt)
 		local cur = CoinEngine.CurrentTarget
 		local cand = PickNearest(root.Position, nil, now)
 		if cand and cand ~= cur then
-			local dc = (cur.Position - root.Position).Magnitude
-			local dn = (cand.Position - root.Position).Magnitude
+			local dc = CoinTravelScore(root.Position, cur.Position)
+			local dn = CoinTravelScore(root.Position, cand.Position)
 			if dn < dc * CoinEngine.SwitchRatio then SetCurrent(cand, now) end
 		end
 	end
@@ -6687,8 +6718,15 @@ local function ControllerStep(dt)
 			local lead = math.clamp(tt.vel:Dot(dir), 0, CoinEngine.ChaseMaxLead)
 			if lead > 0 then v = math.min(currentSpeed, v + lead) end
 		end
+		-- Limite de frenado fisico: empieza a bajar la velocidad mucho antes de tocar la moneda.
+		local brakeMargin = math.max(dist - CoinEngine.PickupDistance, 0)
+		local brakeCap = math.sqrt(2 * CoinEngine.MaxAcceleration * brakeMargin)
+		v = math.min(v, brakeCap)
+		-- Conserva el avance continuo lejos del objetivo, pero no fuerza 8 studs/s al entrar en rango.
+		if dist > CoinEngine.PickupDistance + 5 then
+			v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
+		end
 		lastFlightV = v
-		v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		if v == v and flightVel then
 			ApplyStableFlightVelocity(dir, v, dt)
 			velApplied = true
