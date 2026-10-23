@@ -1,5 +1,6 @@
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
+-- V3.22 Stability Envelope: retain slider max 80; temporarily cap speed on slow frames / solid overlap and log the active cap.
 -- Auto-Farm NoClip is enabled only while the farm flight is active; collisions are restored when flight stops.
 -- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
 -- ====================================================================
@@ -5234,7 +5235,11 @@ local CoinEngine = {
 	MaxVerticalVelocity = 12, -- limita la orden vertical sin reducir el tope configurado
 	MaxAcceleration = 72,     -- se usa para calcular el frenado de aproximacion a la moneda
 	LastCommandVelocity = Vector3.zero,
-	AdaptiveStability = true, -- adapta direccion y cambios de velocidad; no impone un tope dinamico
+	AdaptiveStability = true, -- adapta direccion y cambios de velocidad
+	LastSafetyCap = 80,       -- limite temporal efectivo; el slider visible conserva el maximo 80
+	LastSafetyReason = "normal", -- razon activa para el diagnostico
+	SpeedSafetyHoldUntil = 0, -- evita que un unico frame rapido reactive 80 de golpe tras un tiron
+	SpeedSafetyHoldCap = 80,  -- 68 temporal / 55 tras tiron severo / 80 al recuperarse
 	CommandAcceleration = 150, -- limita cambios bruscos de la velocidad ordenada; no limita la velocidad final
 	RiskCommandAccelerationFloor = 80, -- aceleracion minima cuando ping/FPS/desajuste empeoran
 	NearTargetAccelerationMultiplier = 1.75, -- frena/ajusta con rapidez en el contacto de la moneda
@@ -5311,6 +5316,7 @@ local lastCollectAt = 0
 local coinsSinceRest = 0
 local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
 local noclipOn = false
+local solidOverlapActive = false          -- ultimo resultado del guard de solidos (cada 0.12 s)
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
 local cachedPingMs, nextPingAt = 80, 0
 local adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = 1, 0, 60, 0
@@ -5355,6 +5361,11 @@ local function StopFlight()
 		if hum then pcall(function() hum.PlatformStand = false end) end
 	end
 	flightOn = false
+	solidOverlapActive = false
+	CoinEngine.SpeedSafetyHoldUntil = 0
+	CoinEngine.SpeedSafetyHoldCap = 80
+	CoinEngine.LastSafetyCap = 80
+	CoinEngine.LastSafetyReason = "normal"
 	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
 	CoinEngine.NoclipWanted = false
@@ -5801,17 +5812,22 @@ local function HiResPush(now, dt, csMs)
 	if not root then return end
 	local p, v = root.Position, root.AssemblyLinearVelocity
 	local tgt = CoinEngine.CurrentTarget
+	local hiHumanoid = GetHumanoid()
+	local hiState, hiPlatform = "?", 0
+	if hiHumanoid then pcall(function() hiState = tostring(hiHumanoid:GetState()); hiPlatform = hiHumanoid.PlatformStand and 1 or 0 end) end
 	local commandedVelocity = CoinEngine.LastCommandVelocity or Vector3.zero
 	local commandGap = math.abs(v.Magnitude - commandedVelocity.Magnitude)
 	local verticalGap = math.abs(v.Y - commandedVelocity.Y)
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d%s",
+		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
 		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
 		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
 		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
 		coinsCollectedTotal,
+		tonumber(CoinEngine.LastSafetyCap) or 80, tostring(CoinEngine.LastSafetyReason or "normal"),
+		solidOverlapActive and 1 or 0, hiState, hiPlatform, noclipOn and 1 or 0,
 		hiTag and (" <" .. hiTag .. ">") or "")
 	if _G.Celestial.OTI then _G.Celestial.OTI.LastCostMs = 0 end   -- el coste de OTI solo aparece en el frame donde corrio
 	hiResCount = math.min(hiResCount + 1, HIRES_N)
@@ -5836,7 +5852,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5945,7 +5961,7 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f speedCap=%.1f capWhy=%s risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
@@ -5959,7 +5975,8 @@ local function LogStep(now, dt, force)
 		coinsCollectedTotal, tostring(roundActive), roundCollected,
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
 		tostring(batchPausing), math.max(0, pauseUntil - now),
-		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), tonumber(State.TweenSpeed) or -1, adaptiveRiskScore, adaptiveSteerAlpha, adaptiveFPS, adaptivePhysicalSpeed, table.concat(pendingEvents, ","))
+		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), tonumber(State.TweenSpeed) or -1,
+		tonumber(CoinEngine.LastSafetyCap) or 80, tostring(CoinEngine.LastSafetyReason or "normal"), adaptiveRiskScore, adaptiveSteerAlpha, adaptiveFPS, adaptivePhysicalSpeed, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -6012,7 +6029,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos",
+				"log-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -6535,6 +6552,7 @@ local function StopFarmForSafety(reason)
 	RestoreCollisions()
 	ResetPath()
 	solidOverlapSince = nil
+	solidOverlapActive = false
 	SetStatus("safety-stop")
 end
 
@@ -7212,10 +7230,11 @@ local function ControllerStep(dt)
 
 	-- Recuperacion adaptativa: no apaga el Farm ni introduce pausas.
 	-- Si persiste un solapamiento, evita insistir con el mismo objetivo y selecciona otra ruta;
-	-- el perfil adaptativo suaviza el giro sin reducir el limite de velocidad configurado.
+	-- el limite temporal solo se reduce durante cuadros lentos / solapamiento confirmado.
 	if now >= nextSolidGuardCheck then
 		nextSolidGuardCheck = now + 0.12
 		if IsInsideSolid(root.Position) then
+			solidOverlapActive = true
 			solidOverlapSince = solidOverlapSince or now
 			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
 				local target = CoinEngine.CurrentTarget
@@ -7235,23 +7254,57 @@ local function ControllerStep(dt)
 				end
 			end
 		else
+			solidOverlapActive = false
 			solidOverlapSince = nil
 		end
 	end
 
 	local safe = SafeOn()
-	local speed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	local sliderSpeed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	local speed = sliderSpeed
+	local safetyReason = "normal"
+	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
+	-- El log vio 58/360 intervalos HI-RES equivalentes a <25 FPS y picos de dt de 86.9 ms.
+	-- Se mantiene un margen temporal despues de cada tiron para evitar alternar 55/80 entre frames.
+	local holdUntil = tonumber(CoinEngine.SpeedSafetyHoldUntil) or 0
+	local holdCap = tonumber(CoinEngine.SpeedSafetyHoldCap) or 80
+	if sampleDt >= 0.065 then
+		holdCap = math.min(holdCap, 55)
+		holdUntil = math.max(holdUntil, now + 0.45)
+	elseif sampleDt >= 0.040 then
+		holdCap = now < holdUntil and math.min(holdCap, 68) or 68
+		holdUntil = math.max(holdUntil, now + 0.30)
+	end
+	if now >= holdUntil then
+		holdCap = 80
+	else
+		if holdCap <= 55 then safetyReason = "low-fps-critical" else safetyReason = "low-fps" end
+		speed = math.min(speed, holdCap)
+	end
+	CoinEngine.SpeedSafetyHoldUntil = holdUntil
+	CoinEngine.SpeedSafetyHoldCap = holdCap
+	-- Dentro de geometria solida el NoClip sigue funcionando, pero se reduce temporalmente el impulso.
+	if solidOverlapActive and speed > 52 then
+		speed = 52
+		safetyReason = safetyReason == "normal" and "solid-overlap" or (safetyReason .. "+solid")
+	end
+	if safetyReason ~= CoinEngine.LastSafetyReason then
+		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms solid=%d hold=%.2f",
+			sliderSpeed, speed, safetyReason, sampleDt * 1000, solidOverlapActive and 1 or 0, math.max(0, holdUntil - now)))
+		CoinEngine.LastSafetyReason = safetyReason
+	end
+	CoinEngine.LastSafetyCap = speed
 	dt = math.clamp(dt, 0, 0.05)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
-	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- aceleracion gradual hasta el valor del slider
+	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
 	if now >= nextAdaptiveProfileLogAt then
 		nextAdaptiveProfileLogAt = now + 1.0
 		local physicalSpeed = 0
 		pcall(function() physicalSpeed = root.AssemblyLinearVelocity.Magnitude end)
-		LogEvent(string.format("adaptive-stability ping=%.0f fps=%.1f slider=%.1f cmd=%.1f phys=%.1f risk=%.2f steer=%.2f",
-			cachedPingMs, adaptiveFPS, speed, currentSpeed, physicalSpeed, adaptiveRiskScore, adaptiveSteerAlpha))
+		LogEvent(string.format("adaptive-stability ping=%.0f fps=%.1f slider=%.1f cap=%.1f cmd=%.1f phys=%.1f risk=%.2f steer=%.2f",
+			cachedPingMs, adaptiveFPS, sliderSpeed, speed, currentSpeed, physicalSpeed, adaptiveRiskScore, adaptiveSteerAlpha))
 	end
 
 	local target = CoinEngine.CurrentTarget
