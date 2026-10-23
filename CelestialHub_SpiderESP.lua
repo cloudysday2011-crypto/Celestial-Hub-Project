@@ -1,3 +1,4 @@
+-- V3.11: precise coin approach and stale-coin filtering, based on V3.10 Smart Coin Routing.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -5106,7 +5107,7 @@ local CoinEngine = {
 	Batches = {13, 13, 13, 11},  -- monedas RECOGIDAS por el script en cada lote; tras cada lote (menos el ultimo) hay pausa
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
 	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
-	StopDistance = 2.0,          -- el vuelo apunta a quedar a esta distancia de la moneda (recoge a PickupDistance)
+	StopDistance = 0.0,          -- V3.11: apunta al punto de contacto sobre la moneda, no se queda a 2 studs
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
@@ -5132,8 +5133,8 @@ local CoinEngine = {
 	NoclipWanted = false,      -- el controlador lo activa mientras vuela (atraviesa paredes)
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
-	PickupDistance = 3.4,
-	CollectCooldown = 1.0,     -- segundos sin re-apuntar a una moneda ya tocada
+	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
+	CollectCooldown = 4.0,      -- V3.11: evita perseguir de nuevo monedas tocadas que siguen temporalmente en el mapa
 	StuckTimeout = 1.25,       -- sin progreso hacia el objetivo -> descartar
 	StuckBlacklist = 5,
 	SwitchRatio = 0.5,         -- solo cambia de objetivo si el nuevo esta a < 50% de distancia
@@ -5283,6 +5284,9 @@ local function IsValidCoin(obj)
 	if not obj or not obj.Parent or not obj:IsA("BasePart") or not CoinNameMatches(obj) then return false end
 	local s = obj.Size
 	if s.X > 10 or s.Y > 10 or s.Z > 10 then return false end
+	-- Monedas que el juego ya ocultó tras recogerlas no deben seguir siendo objetivos.
+	local ok, transparency = pcall(function() return obj.Transparency end)
+	if ok and transparency >= 0.98 then return false end
 	return IsSafeCoinPosition(obj.Position)
 end
 
@@ -6638,8 +6642,29 @@ local function ControllerStep(dt)
 		target = CoinEngine.CurrentTarget
 		if not target then return end
 	end
+	-- Una moneda recogida puede quedar un instante en el cache y algunos juegos la recolocan/teletransportan.
+	-- Si el objetivo salta una distancia físicamente inverosímil entre muestras, se descarta y se elige otro;
+	-- así no perseguimos el objeto hasta el cielo por una posición obsoleta.
+	local previousTrack = CoinEngine.TargetTrack
+	if previousTrack and previousTrack.obj == target and now - previousTrack.at >= 0.025 then
+		local elapsed = now - previousTrack.at
+		local jump = (target.Position - previousTrack.pos).Magnitude
+		if jump > math.max(10, 80 * elapsed) then
+			LogEvent(string.format("stale-coin-reposition jump=%.1f dt=%.3f", jump, elapsed))
+			CoinEngine.Blacklist[target] = now + 8
+			SetCurrent(nil, now)
+			AdvanceTarget(root, now)
+			target = CoinEngine.CurrentTarget
+			if not target then return end
+		end
+	end
 	local rootPos = root.Position
-	local delta = target.Position - rootPos
+	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
+	-- Dirigirse al centro geométrico de la moneda hacía que el personaje quedara a varios studs en horizontal
+	-- al dispararse la recogida por distancia 3D.
+	local contactHeight = math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15)
+	local approachPos = target.Position + Vector3.new(0, contactHeight, 0)
+	local delta = approachPos - rootPos
 	local dist = delta.Magnitude
 	if dist ~= dist or dist == math.huge then
 		CoinEngine.Blacklist[target] = now + 10
