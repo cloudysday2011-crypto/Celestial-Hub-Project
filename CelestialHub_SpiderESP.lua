@@ -1,4 +1,4 @@
--- V3.14: adaptive steering from ping/FPS/physical speed; preserves the V3.12 speed limit up to 80.
+-- V3.15: measured-data log analyzer, load-ready log UI, smoothed adaptive steering; speed ceiling remains 80.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -780,6 +780,7 @@ local function ShowKickLogLoadingGui()
 
 	local scanGui = Instance.new("ScreenGui")
 	scanGui.Name = "CelestialKickLogLoadingGui"
+	scanGui.DisplayOrder = 10000
 	scanGui.ResetOnSpawn = false
 	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	scanGui.IgnoreGuiInset = true
@@ -834,6 +835,7 @@ local function ShowResetLogLoadingGui()
 
 	local scanGui = Instance.new("ScreenGui")
 	scanGui.Name = "CelestialResetLogLoadingGui"
+	scanGui.DisplayOrder = 10000
 	scanGui.ResetOnSpawn = false
 	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	scanGui.IgnoreGuiInset = true
@@ -5167,6 +5169,8 @@ local noclipOn = false
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
 local cachedPingMs, nextPingAt = 80, 0
 local adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = 1, 0, 60, 0
+local adaptivePingEmaMs, adaptiveFPSEma, adaptiveSpeedEma = 80, 60, 0
+local adaptiveEmaInitialized = false
 local nextAdaptiveProfileLogAt = 0
 
 -- ===== Estado: detector de ronda + lotes FIJOS de monedas + vuelo (config en CoinEngine) =====
@@ -5242,31 +5246,50 @@ end
 local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 	local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 0.05)
 	local fps = 1 / frameDt
-	local pingNow = os.clock()
-	if pingNow >= nextPingAt then
-		nextPingAt = pingNow + 1
+	local now = os.clock()
+	if now >= nextPingAt then
+		nextPingAt = now + 0.50
 		local okPing, measuredPing = pcall(function()
 			return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
 		end)
-		if okPing and tonumber(measuredPing) then cachedPingMs = tonumber(measuredPing) end
+		if okPing and tonumber(measuredPing) and tonumber(measuredPing) >= 0 then
+			cachedPingMs = math.clamp(tonumber(measuredPing), 0, 1000)
+		else
+			local okLocal, localPing = pcall(function() return LocalPlayer:GetNetworkPing() * 1000 end)
+			if okLocal and tonumber(localPing) and localPing >= 0 then cachedPingMs = math.clamp(localPing, 0, 1000) end
+		end
 	end
+
 	local ping = math.clamp(tonumber(cachedPingMs) or 80, 0, 1000)
-	local actualSpeed = math.max(0, tonumber(requestedSpeed) or 0)
+	local physicalSpeed = math.max(0, tonumber(requestedSpeed) or 0)
 	local char = LocalPlayer and LocalPlayer.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if root then
-		pcall(function() actualSpeed = root.AssemblyLinearVelocity.Magnitude end)
+	if root then pcall(function() physicalSpeed = root.AssemblyLinearVelocity.Magnitude end) end
+	local speedSignal = math.max(physicalSpeed, tonumber(requestedSpeed) or 0)
+
+	-- EMA removes one-frame FPS/ping spikes from the steering decision, while measurements remain
+	-- raw in the diagnostic log. It never changes the requested speed or slider ceiling.
+	if not adaptiveEmaInitialized then
+		adaptivePingEmaMs, adaptiveFPSEma, adaptiveSpeedEma = ping, fps, speedSignal
+		adaptiveEmaInitialized = true
+	else
+		local sensorAlpha = math.clamp(1 - math.exp(-frameDt / 0.35), 0.025, 0.35)
+		adaptivePingEmaMs = adaptivePingEmaMs + (ping - adaptivePingEmaMs) * sensorAlpha
+		adaptiveFPSEma = adaptiveFPSEma + (fps - adaptiveFPSEma) * sensorAlpha
+		adaptiveSpeedEma = adaptiveSpeedEma + (speedSignal - adaptiveSpeedEma) * sensorAlpha
 	end
-	local speedSignal = math.max(actualSpeed, tonumber(requestedSpeed) or 0)
-	local pingLoad = math.clamp((ping - 60) / 200, 0, 1)
-	local fpsLoad = math.clamp((50 - fps) / 30, 0, 1)
-	local speedLoad = math.clamp((speedSignal - 30) / 50, 0, 1)
-	local risk = math.clamp(pingLoad * 0.38 + fpsLoad * 0.34 + speedLoad * 0.28, 0, 1)
-	-- Con latencia/FPS peores se filtran mas los cambios de rumbo; a velocidad alta se mantiene
-	-- suficiente respuesta para no quedarse siguiendo una direccion antigua durante demasiado tiempo.
-	local responseTime = math.clamp(0.020 + pingLoad * 0.014 + fpsLoad * 0.012 - speedLoad * 0.006, 0.012, 0.046)
-	local alpha = math.clamp(1 - math.exp(-frameDt / responseTime), 0.12, 0.90)
-	adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = alpha, risk, fps, actualSpeed
+
+	local pingLoad = math.clamp((adaptivePingEmaMs - 55) / 190, 0, 1)
+	local fpsLoad = math.clamp((48 - adaptiveFPSEma) / 28, 0, 1)
+	local speedLoad = math.clamp((math.max(speedSignal, adaptiveSpeedEma) - 45) / 45, 0, 1)
+	local risk = math.clamp(pingLoad * 0.36 + fpsLoad * 0.34 + speedLoad * 0.30, 0, 1)
+
+	-- Higher speed asks for more look-ahead (direction filtering), not a lower velocity cap.
+	-- The response stays bounded so steering does not remain stuck pointing at an old coin.
+	local responseTime = math.clamp(0.020 + pingLoad * 0.018 + fpsLoad * 0.016 + speedLoad * 0.010, 0.018, 0.064)
+	local alpha = math.clamp(1 - math.exp(-frameDt / responseTime), 0.10, 0.88)
+	adaptiveSteerAlpha, adaptiveRiskScore = alpha, risk
+	adaptiveFPS, adaptivePhysicalSpeed = fps, physicalSpeed
 	return alpha
 end
 
@@ -5620,7 +5643,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 2 | script-version=3.15 | metrics=slider,cmd,phys,vy,cmdY,ping,fps,dt,solid,noclip,risk,steer\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -5719,7 +5742,7 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d ev=%s",
+		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f toCoin=%.1f fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
 		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
@@ -5732,7 +5755,7 @@ local function LogStep(now, dt, force)
 		coinsCollectedTotal, tostring(roundActive), roundCollected,
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
 		tostring(batchPausing), math.max(0, pauseUntil - now),
-		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), table.concat(pendingEvents, ","))
+		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), tonumber(State.TweenSpeed) or -1, adaptiveRiskScore, adaptiveSteerAlpha, adaptiveFPS, adaptivePhysicalSpeed, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -6116,7 +6139,7 @@ ResetDiag.Explain = function(classification)
 		DEATH_CAUSE_UNKNOWN = "Se observó una muerte normal, pero no se encontró quién la causó.",
 		NORMAL_ROUND_TRANSITION = "El juego terminó la ronda y devolvió al personaje al lobby. Es un proceso normal; no genera Reset Log.",
 		GAME_OR_ROUND_RESET_SUSPECTED = "Clasificación antigua/ambigua; no se debe recuperar como incidente de Reset Log.",
-		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio probable del juego/servidor: el personaje desapareció vivo con AutoFarm y noclip activos a velocidad 50, sin evento Died. Roblox no expone la causa exacta, así que no es una certeza absoluta.",
+		GAME_RESET_LIKELY_DURING_AUTOFARM = "Reinicio probable del juego/servidor: el personaje desapareció vivo con AutoFarm y noclip activos y el slider registrado era de al menos 49.5. Roblox no expone la causa exacta, así que no es una certeza absoluta.",
 		FORCED_OR_SERVER_RESET_DURING_AUTOFARM = "El personaje desapareció vivo mientras AutoFarm y noclip estaban activos; origen ambiguo, no se guarda como reinicio del juego.",
 		RESET_WITHOUT_DEATH_SOURCE_UNKNOWN = "El personaje desapareció vivo; no hay evidencia suficiente para separar reset manual y reset del servidor/juego.",
 		RESPAWN_WITHOUT_OBSERVED_DEATH = "Se detectó respawn, pero no se capturó una causa verificable.",
@@ -6255,10 +6278,16 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(
 				and classification == "GAME_RESET_LIKELY_DURING_AUTOFARM"
 			if isGameResetCandidate then
 				local loader = ShowResetLogLoadingGui()
-				task.wait(1.15)
+				if _G.Celestial.HubLoaded == true then
+					ResetDiag.ShowResult(classification, confidence, evidence)
+				end
+				-- Keep the spinner above the result until the result panel has actually rendered.
+				pcall(function()
+					RunService.RenderStepped:Wait()
+					RunService.RenderStepped:Wait()
+				end)
 				if loader then pcall(function() loader:Destroy() end) end
 				if _G.Celestial.ResetLogLoadingGui == loader then _G.Celestial.ResetLogLoadingGui = nil end
-				if _G.Celestial.HubLoaded == true then ResetDiag.ShowResult(classification, confidence, evidence) end
 			end
 		end)
 	end
@@ -12199,48 +12228,164 @@ State.PowerDetectorActive = true
 -- evidence from the log so a useful summary can be copied without sending thousands of lines.
 local function SummarizeFarmLog(raw, kind)
 	raw = tostring(raw or "")
-	local firstLine = raw:match("^([^\r\n]+)") or "sin encabezado"
-	local out = {"CH " .. tostring(kind or "LOG") .. " SUMMARY", "Evento: " .. firstLine}
-	local maxAbsVy, maxAbsCmdY, maxPhys, maxCmd, maxPing = 0, 0, 0, 0, 0
-	local solidCount, noclipCount, sampleCount, lastCoins = 0, 0, 0, "?"
-	local classification = string.upper(tostring(kind or "")) == "RESET"
+	kind = string.upper(tostring(kind or "LOG"))
+	local reason = raw:match("reason:%s*([^\r\n]+)") or (raw:match("^([^\r\n]+)") or "sin encabezado")
+	local schema = raw:match("log%-schema:%s*([^\r\n]+)") or "legacy / sin versión de esquema"
+	local classification = kind == "RESET"
 		and (raw:match("classification=([%w_%-]+)") or raw:match("kind=([%w_%-]+)")) or nil
-	for line in raw:gmatch("[^\r\n]+") do
-		local vy = tonumber(line:match("vy=([%-%.%d]+)"))
-		local cmdY = tonumber(line:match("cmdY=([%-%.%d]+)"))
-		local phys = tonumber(line:match("phys=([%-%.%d]+)"))
-		local cmd = tonumber(line:match("cmd=([%-%.%d]+)"))
-		local ping = tonumber(line:match("ping=([%-%.%d]+)"))
-		local coins = line:match("coins=([%-]?%d+)")
-		if vy then maxAbsVy = math.max(maxAbsVy, math.abs(vy)) end
-		if cmdY then maxAbsCmdY = math.max(maxAbsCmdY, math.abs(cmdY)) end
-		if phys then maxPhys = math.max(maxPhys, phys) end
-		if cmd then maxCmd = math.max(maxCmd, cmd) end
-		if ping then maxPing = math.max(maxPing, ping) end
-		if line:find("inSolid=true", 1, true) then solidCount = solidCount + 1 end
-		if line:find("noclip=true", 1, true) then noclipCount = noclipCount + 1 end
-		if line:find("sdt=", 1, true) then sampleCount = sampleCount + 1 end
-		if coins then lastCoins = coins end
+	local function num(line, key)
+		return tonumber(line:match("%f[%w_]" .. key .. "=([%-]?[%d%.]+)"))
 	end
-	if classification then out[#out + 1] = "Clasificación: " .. classification end
-	if sampleCount > 0 then
-		out[#out + 1] = string.format("Muestras=%d | cmd máx.=%.1f | física máx.=%.1f | |vy| física máx.=%.1f | |cmdY| máx.=%.1f", sampleCount, maxCmd, maxPhys, maxAbsVy, maxAbsCmdY)
-		out[#out + 1] = string.format("Solapamientos sólidos=%d | muestras con noclip=%d | ping máx. observado=%.0f ms | monedas=%s", solidCount, noclipCount, maxPing, lastCoins)
+	local function truth(line, key)
+		local v = line:match("%f[%w_]" .. key .. "=(%w+)")
+		return v == "true"
+	end
+	local function pct(a, b)
+		return b > 0 and (100 * a / b) or 0
+	end
+	local function occurrences(haystack, needle)
+		local count, cursor = 0, 1
+		while true do
+			local at = haystack:find(needle, cursor, true)
+			if not at then break end
+			count += 1
+			cursor = at + #needle
+		end
+		return count
+	end
+	local data = {
+		regular = 0, hires = 0, cmdMax = 0, physMax = 0, cmdYMax = 0, vyMax = 0,
+		sliderMax = nil, sliderMin = nil, pingMin = math.huge, pingMax = 0, pingSum = 0, pingN = 0,
+		fpsMin = math.huge, fpsMax = 0, fpsSum = 0, fpsN = 0, lowFps = 0,
+		solid = 0, noclip = 0, platform = 0, sampleTimeMin = math.huge, sampleTimeMax = -math.huge,
+		stepMax = 0, sampleSpeedMax = 0, nearCoinMin = math.huge, coinLast = "?", gameCoinLast = "?",
+		riskSum = 0, riskMax = 0, riskN = 0, steerMin = math.huge, steerMax = 0, steerN = 0,
+		physOverCmd = 0, stateCounts = {}, legacyNoSlider = false,
+	}
+	local inHires = false
+	for line in raw:gmatch("[^\r\n]+") do
+		if line:find("--- HI-RES:", 1, true) then
+			inHires = true
+		elseif line:find(" sdt=", 1, true) then
+			data.regular += 1
+			local t = num(line, "t")
+			if t then data.sampleTimeMin = math.min(data.sampleTimeMin, t); data.sampleTimeMax = math.max(data.sampleTimeMax, t) end
+			local cmd, phys = num(line, "cmd"), num(line, "phys")
+			local vy, cmdY, ping, fps = num(line, "vy"), num(line, "cmdY"), num(line, "ping"), num(line, "fps")
+			local slider, step, sampleSpd, toCoin = num(line, "slider"), num(line, "step"), num(line, "sampleSpd"), num(line, "toCoin")
+			local risk, steer = num(line, "risk"), num(line, "steer")
+			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)) end
+			if phys then data.physMax = math.max(data.physMax, math.abs(phys)) end
+			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)) end
+			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)) end
+			if slider then data.sliderMax = data.sliderMax and math.max(data.sliderMax, slider) or slider; data.sliderMin = data.sliderMin and math.min(data.sliderMin, slider) or slider end
+			if ping then data.pingMin = math.min(data.pingMin, ping); data.pingMax = math.max(data.pingMax, ping); data.pingSum += ping; data.pingN += 1 end
+			if fps then data.fpsMin = math.min(data.fpsMin, fps); data.fpsMax = math.max(data.fpsMax, fps); data.fpsSum += fps; data.fpsN += 1; if fps < 25 then data.lowFps += 1 end end
+			if step then data.stepMax = math.max(data.stepMax, math.abs(step)) end
+			if sampleSpd then data.sampleSpeedMax = math.max(data.sampleSpeedMax, math.abs(sampleSpd)) end
+			if toCoin and toCoin >= 0 then data.nearCoinMin = math.min(data.nearCoinMin, toCoin) end
+			if risk then data.riskMax = math.max(data.riskMax, risk); data.riskSum += risk; data.riskN += 1 end
+			if steer then data.steerMin = math.min(data.steerMin, steer); data.steerMax = math.max(data.steerMax, steer); data.steerN += 1 end
+			if cmd and phys and phys > cmd + 15 then data.physOverCmd += 1 end
+			if truth(line, "inSolid") then data.solid += 1 end
+			if truth(line, "noclip") then data.noclip += 1 end
+			if truth(line, "platformStand") then data.platform += 1 end
+			local state = line:match("%f[%w_]state=([^%s]+)")
+			if state then data.stateCounts[state] = (data.stateCounts[state] or 0) + 1 end
+			local coins, gameCoins = num(line, "coins"), num(line, "gc")
+			if coins then data.coinLast = tostring(coins) end
+			if gameCoins then data.gameCoinLast = tostring(gameCoins) end
+		elseif inHires and line:match("%f[%w_]dt=[%-]?[%d%.]+ms") and line:find("pos=", 1, true) then
+			data.hires += 1
+			local t = num(line, "t")
+			if t then data.sampleTimeMin = math.min(data.sampleTimeMin, t); data.sampleTimeMax = math.max(data.sampleTimeMax, t) end
+			local cmd, phys, cmdY, ping = num(line, "cmd"), num(line, "phys"), num(line, "cmdY"), num(line, "ping")
+			local vy = tonumber(line:match("vel=%([^,]+,([%-]?[%d%.]+),"))
+			local dtMs = tonumber(line:match("%f[%w_]dt=([%-]?[%d%.]+)ms"))
+			if cmd then data.cmdMax = math.max(data.cmdMax, math.abs(cmd)) end
+			if phys then data.physMax = math.max(data.physMax, math.abs(phys)) end
+			if cmdY then data.cmdYMax = math.max(data.cmdYMax, math.abs(cmdY)) end
+			if vy then data.vyMax = math.max(data.vyMax, math.abs(vy)) end
+			if ping then data.pingMin = math.min(data.pingMin, ping); data.pingMax = math.max(data.pingMax, ping); data.pingSum += ping; data.pingN += 1 end
+			if dtMs and dtMs > 0 then
+				local fps = 1000 / dtMs
+				data.fpsMin = math.min(data.fpsMin, fps); data.fpsMax = math.max(data.fpsMax, fps); data.fpsSum += fps; data.fpsN += 1
+				if fps < 25 then data.lowFps += 1 end
+			end
+			if cmd and phys and phys > cmd + 15 then data.physOverCmd += 1 end
+		end
+	end
+	-- Legacy logs can have sliderSpeed only in diagnostic event records, not in each sample.
+	for value in raw:gmatch("sliderSpeed=([%-]?[%d%.]+)") do
+		local n = tonumber(value)
+		if n then data.sliderMax = data.sliderMax and math.max(data.sliderMax, n) or n; data.sliderMin = data.sliderMin and math.min(data.sliderMin, n) or n end
+	end
+	if data.regular == 0 and data.hires == 0 then data.legacyNoSlider = true end
+	local total = data.regular
+	local duration = (data.sampleTimeMax > data.sampleTimeMin and data.sampleTimeMin < math.huge) and (data.sampleTimeMax - data.sampleTimeMin) or nil
+	local out = {
+		"CH " .. kind .. " SUMMARY | analizador=3.15",
+		"Evento registrado: " .. reason,
+		"Esquema de log: " .. schema,
+	}
+	if classification then out[#out + 1] = "Clasificación del incidente: " .. classification end
+	out[#out + 1] = string.format("Cobertura: muestras normales=%d | frames HI-RES=%d | duración observada=%s",
+		data.regular, data.hires, duration and string.format("%.2f s", duration) or "no calculable")
+	if data.regular > 0 or data.hires > 0 then
+		out[#out + 1] = string.format("Velocidad: slider máx. observado=%s | comando máx.=%.1f | física máx.=%.1f | pico físico-comando >15=%d muestras",
+			data.sliderMax and string.format("%.1f", data.sliderMax) or "no registrado por muestra", data.cmdMax, data.physMax, data.physOverCmd)
+		out[#out + 1] = string.format("Vertical: |vy| físico máx.=%.1f | |cmdY| máx.=%.1f | desplazamiento por muestra máx.=%.2f | sampleSpd máx.=%.1f",
+			data.vyMax, data.cmdYMax, data.stepMax, data.sampleSpeedMax)
+		if data.pingN > 0 then
+			out[#out + 1] = string.format("Red: ping mín./prom./máx.=%.0f/%.0f/%.0f ms (%d lecturas)", data.pingMin, data.pingSum / data.pingN, data.pingMax, data.pingN)
+		else
+			out[#out + 1] = "Red: ping no disponible en las muestras analizadas."
+		end
+		if data.fpsN > 0 then
+			out[#out + 1] = string.format("Render: FPS mín./prom./máx.=%.1f/%.1f/%.1f | lecturas <25 FPS=%d",
+				data.fpsMin, data.fpsSum / data.fpsN, data.fpsMax, data.lowFps)
+		end
+		out[#out + 1] = string.format("Estado: inSolid=%d/%d (%.1f%%) | noclip=%d/%d (%.1f%%) | PlatformStand=%d/%d (%.1f%%)",
+			data.solid, total, pct(data.solid, total), data.noclip, total, pct(data.noclip, total), data.platform, total, pct(data.platform, total))
+		out[#out + 1] = "Monedas: contador interno final=" .. data.coinLast .. " | contador UI observado final=" .. data.gameCoinLast .. (data.gameCoinLast == "-1" and " (contador no detectado)" or "")
+		if data.nearCoinMin < math.huge then out[#out + 1] = string.format("Aproximación: menor distancia a objetivo registrada=%.2f studs", data.nearCoinMin) end
+		if data.riskN > 0 then out[#out + 1] = string.format("Control adaptable: riesgo prom./máx.=%.2f/%.2f | steer mín./máx.=%.2f/%.2f",
+			data.riskSum / data.riskN, data.riskMax, data.steerMin, data.steerMax) end
+		local mostCommon, mostCount = nil, 0
+		for state, count in pairs(data.stateCounts) do if count > mostCount then mostCommon, mostCount = state, count end end
+		if mostCommon then out[#out + 1] = string.format("Estado Humanoid más frecuente: %s (%d muestras)", mostCommon, mostCount) end
 	end
 	local lower = string.lower(raw)
-	if lower:find("invalid position", 1, true) or lower:find("invalid%-position%-final") then
+	local isInvalidPosition = lower:find("invalid position", 1, true) ~= nil or lower:find("invalid-position-final", 1, true) ~= nil
+	if isInvalidPosition then
 		local clues = {}
-		if maxCmd >= 49.5 then clues[#clues + 1] = "AutoFarm operaba cerca de velocidad 50" end
-		if maxAbsVy >= 35 then clues[#clues + 1] = "picos verticales altos" end
-		if solidCount >= 3 then clues[#clues + 1] = "solapamientos con geometría repetidos" end
-		out[#out + 1] = "Lectura probable: el servidor rechazó una trayectoria/posición del personaje. " .. (#clues > 0 and ("Indicios: " .. table.concat(clues, ", ") .. ".") or "No hay suficientes métricas para aislar la causa exacta.")
+		if data.cmdMax >= 70 then clues[#clues + 1] = string.format("se registró comando >=70 (máx. %.1f; no es una suposición de velocidad 50)", data.cmdMax)
+		elseif data.cmdMax > 0 then clues[#clues + 1] = string.format("máximo de comando observado %.1f", data.cmdMax) end
+		if data.vyMax >= 35 then clues[#clues + 1] = string.format("pico vertical físico alto (%.1f)", data.vyMax) end
+		if total > 0 and pct(data.solid, total) >= 5 then clues[#clues + 1] = string.format("solapamiento con sólidos en %.1f%% de muestras", pct(data.solid, total)) end
+		if total > 0 and pct(data.noclip, total) >= 50 then clues[#clues + 1] = string.format("noclip activo en %.1f%% de muestras", pct(data.noclip, total)) end
+		if data.pingMax >= 150 then clues[#clues + 1] = string.format("latencia observada alta (máx. %.0f ms)", data.pingMax) end
+		if data.lowFps > 0 then clues[#clues + 1] = string.format("hubo %d lecturas por debajo de 25 FPS", data.lowFps) end
+		out[#out + 1] = "Lectura basada en medidas: el archivo registra invalid-position-final; eso confirma el evento, no la causa única. " .. (#clues > 0 and ("Indicios concurrentes: " .. table.concat(clues, "; ") .. ".") or "No hay métricas suficientes para separar las causas.")
+		out[#out + 1] = "No inferir causalidad solo por coincidencia: ping, noclip y solapamientos pueden coexistir sin que este log demuestre cuál disparó la validación del servidor."
 	elseif classification == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
-		out[#out + 1] = "Lectura probable: el personaje desapareció vivo durante el farmeo a velocidad 50, sin muerte registrada; causa probable externa, no certeza absoluta."
-	elseif classification == "GAME_OR_ROUND_RESET_SUSPECTED" then
-		out[#out + 1] = "Lectura: hay indicios de cambio de ronda/juego junto al respawn."
+		out[#out + 1] = "Lectura: las muestras se clasificaron como posible reset durante el farmeo; revisa los eventos de respawn y ronda del log completo. No es una causa confirmada."
+	elseif classification == "NORMAL_ROUND_TRANSITION" then
+		out[#out + 1] = "Lectura: el registro clasifica el evento como transición normal de ronda, no como reset anómalo."
 	end
-	out[#out + 1] = "Confianza: heurística local; el resumen no sustituye al log completo."
-	return table.concat(out, "\n"):sub(1, 1800)
+	local eventCounts = {
+		["solid-overlap-reroute"] = occurrences(raw, "solid-overlap-reroute"),
+		["target-stale"] = occurrences(raw, "target-stale"),
+		["server-moved-us"] = occurrences(raw, "server-moved-us"),
+		["coin-collected"] = occurrences(raw, "coin-collected"),
+	}
+	local events = {}
+	for name, count in pairs(eventCounts) do if count > 0 then events[#events + 1] = name .. "=" .. count end end
+	table.sort(events)
+	if #events > 0 then out[#out + 1] = "Eventos de interés (ocurrencias en texto, no siempre eventos únicos): " .. table.concat(events, " | ") end
+	out[#out + 1] = "Calidad: las métricas usan solo campos presentes; los logs antiguos carecen de algunas lecturas. El log completo conserva el contexto y los frames HI-RES."
+	out[#out + 1] = "Confianza: análisis local basado en telemetría; no tiene acceso a la razón interna del servidor."
+	return table.concat(out, "\n"):sub(1, 6500)
 end
 
 local function CopyFarmTextToClipboard(value)
@@ -12306,8 +12451,6 @@ task.spawn(function()
 		_G.Celestial.KickLogRecoveryQueued = false
 		return
 	end
-	local kickSummary = SummarizeFarmLog(previousLog, "KICK")
-
 	-- Wait for normal CH loading and full Hub UI construction to finish before showing the log loader.
 	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do
 		task.wait(0.1)
@@ -12318,17 +12461,20 @@ task.spawn(function()
 	end
 
 	local loadingGui = ShowKickLogLoadingGui()
-	task.wait(1.5)
-	if loadingGui then pcall(function() loadingGui:Destroy() end) end
-	if _G.Celestial.KickLogLoadingGui == loadingGui then
-		_G.Celestial.KickLogLoadingGui = nil
-	end
+	local kickSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
+	task.spawn(function()
+		local okSummary, result = pcall(SummarizeFarmLog, previousLog, "KICK")
+		if okSummary and type(result) == "string" and result ~= "" then kickSummary = result end
+		summaryDone = true
+	end)
+	while not summaryDone do task.wait() end
 
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "CelestialFarmLogRecovery"
+	gui.DisplayOrder = 100
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -12363,10 +12509,8 @@ task.spawn(function()
 	status.TextSize = 11
 	status.Parent = frame
 
-	task.wait(1.5)
-
 	title.Text = "Kick Log"
-	status.Text = "Previous kick diagnosis loaded."
+	status.Text = "Diagnosis ready; full log remains available in the file."
 
 	local scroll = Instance.new("ScrollingFrame")
 	scroll.Name = "LogPreview"
@@ -12436,13 +12580,22 @@ task.spawn(function()
 		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmLogConsumed.txt", previousLog) end end)
 		_G.Celestial.KickLogRecoveryQueued = false
 	end)
+
+	-- The spinner covers the panel until the summary, controls and scroll canvas are actually built.
+	pcall(function()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+		RunService.RenderStepped:Wait()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+		RunService.RenderStepped:Wait()
+	end)
+	if loadingGui then pcall(function() loadingGui:Destroy() end) end
+	if _G.Celestial.KickLogLoadingGui == loadingGui then _G.Celestial.KickLogLoadingGui = nil end
 end)
 
 -- Recover the previous Reset Log after Kick Log is dismissed, using the same spinner animation.
 task.spawn(function()
 	local previousResetLog = _G.Celestial.PreviousFarmResetLogSnapshot
 	if type(previousResetLog) ~= "string" or previousResetLog == "" then return end
-	local resetSummary = SummarizeFarmLog(previousResetLog, "RESET")
 	while _G.Celestial.HubLoaded ~= true and _G.Celestial.HubLoadFailed ~= true do task.wait(0.1) end
 	if _G.Celestial.HubLoadFailed then return end
 	while _G.Celestial.KickLogRecoveryQueued == true
@@ -12452,14 +12605,19 @@ task.spawn(function()
 	end
 
 	local loadingGui = ShowResetLogLoadingGui()
-	task.wait(1.5)
-	if loadingGui then pcall(function() loadingGui:Destroy() end) end
-	if _G.Celestial.ResetLogLoadingGui == loadingGui then _G.Celestial.ResetLogLoadingGui = nil end
+	local resetSummary, summaryDone = "No se pudo generar el resumen; copia el log completo para revisarlo.", false
+	task.spawn(function()
+		local okSummary, result = pcall(SummarizeFarmLog, previousResetLog, "RESET")
+		if okSummary and type(result) == "string" and result ~= "" then resetSummary = result end
+		summaryDone = true
+	end)
+	while not summaryDone do task.wait() end
 
 	local oldGui = CoreGui:FindFirstChild("CelestialFarmResetLogRecovery")
 	if oldGui then pcall(function() oldGui:Destroy() end) end
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "CelestialFarmResetLogRecovery"
+	gui.DisplayOrder = 100
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -12488,7 +12646,7 @@ task.spawn(function()
 	status.Size = UDim2.new(1, -20, 0, 22)
 	status.Position = UDim2.new(0, 10, 0, 42)
 	status.BackgroundTransparency = 1
-	status.Text = "Previous reset diagnosis loaded."
+	status.Text = "Diagnosis ready; full reset log remains available."
 	status.TextColor3 = Color3.fromRGB(190, 190, 200)
 	status.Font = Enum.Font.Gotham
 	status.TextSize = 11
@@ -12569,6 +12727,16 @@ task.spawn(function()
 		pcall(function() gui:Destroy() end)
 		pcall(function() if type(writefile) == "function" then writefile("CelestialFarmResetLogConsumed.txt", previousResetLog) end end)
 	end)
+
+	-- As with Kick Log, wait for Roblox to render the populated preview before closing the loader.
+	pcall(function()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+		RunService.RenderStepped:Wait()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, preview.AbsoluteSize.Y + 12)
+		RunService.RenderStepped:Wait()
+	end)
+	if loadingGui then pcall(function() loadingGui:Destroy() end) end
+	if _G.Celestial.ResetLogLoadingGui == loadingGui then _G.Celestial.ResetLogLoadingGui = nil end
 end)
 
 print("✨ CELESTIAL FRAMEWORK V19.18.16 - MM2 / DUELS / SPIDER ESP + OBJECT ESP + SELF ESP ✨")
