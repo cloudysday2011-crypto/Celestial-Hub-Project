@@ -28,6 +28,13 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 if not _G.Celestial then
 	_G.Celestial = {}
 end
+-- Invalidate a previous run's mode poller so it cannot overwrite this run's detection.
+local gameModePollToken = (_G.Celestial.GameModePollToken or 0) + 1
+_G.Celestial.GameModePollToken = gameModePollToken
+if _G.Celestial.GameDetectionConnection then
+	pcall(function() _G.Celestial.GameDetectionConnection:Disconnect() end)
+	_G.Celestial.GameDetectionConnection = nil
+end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
@@ -520,12 +527,17 @@ local function ScanGameMode()
 	if Workspace:FindFirstChild("GunDrop") or Workspace:FindFirstChild("RevolverDrop") then scoreMM2 += 30 end
 	if Workspace:FindFirstChild("DuelPads") or Workspace:FindFirstChild("QueuePad") then scoreDuels += 30 end
 
-	if scoreMM2 > scoreDuels then return "MM2"
-	elseif scoreDuels > scoreMM2 then return "DUELS"
-	else
-		if pg and pg:FindFirstChild("MainGUI") then return "MM2" end
-		return "DUELS"
-	end
+	-- Do not guess DUELS when both scores are zero: this was painting active
+	-- MM2/lobby players with duel colors while the game UI was still loading.
+	local hasMainGUI = pg and pg:FindFirstChild("MainGUI") ~= nil
+	local hasDuelGUI = pg and (pg:FindFirstChild("DuelGUI") ~= nil or pg:FindFirstChild("DuelHUD") ~= nil)
+	local hasDuelPads = Workspace:FindFirstChild("DuelPads") ~= nil or Workspace:FindFirstChild("QueuePad") ~= nil
+	if scoreMM2 >= scoreDuels + 10 and scoreMM2 >= 15 then return "MM2" end
+	if scoreDuels >= scoreMM2 + 10 and scoreDuels >= 20 then return "DUELS" end
+	-- Duel-specific GUI/pads beat a generic MainGUI during the duel lobby.
+	if hasDuelGUI or hasDuelPads then return "DUELS" end
+	if hasMainGUI and not hasDuelGUI then return "MM2" end
+	return "UNKNOWN"
 end
 
 -- ====================================================================
@@ -654,30 +666,51 @@ local function CheckDuelsMatchState()
 	if root then DuelsMatchState.LastCharPosition = root.Position end
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	local voteGuiDetected = false
+	local explicitLobbyGuiDetected = false
 	if pg then
 		for _, gui in ipairs(pg:GetChildren()) do
 			if gui:IsA("ScreenGui") and gui.Enabled then
 				local nl = string.lower(gui.Name)
 				if nl:find("vote", 1, true) or nl:find("mapselect", 1, true)
 					or nl:find("mapvote", 1, true) or nl:find("duelvote", 1, true) then
-					voteGuiDetected = true; break
+					voteGuiDetected = true
+				elseif nl == "duellobbygui" or nl == "lobbygui" or nl == "queuegui"
+					or nl == "waitingroomgui" or nl == "intermissiongui" then
+					explicitLobbyGuiDetected = true
 				end
 			end
 		end
 	end
-	if voteGuiDetected then
-		DuelsMatchState.VoteGuiSeen = true
+	if voteGuiDetected or explicitLobbyGuiDetected then
+		DuelsMatchState.VoteGuiSeen = voteGuiDetected
 		DuelsMatchState.InMatch = false
+		DuelsMatchState.LastTeleportTime = 0
 		DuelsMatchState.TeamByPlayer = {}
+		return -- lobby/voting state takes priority over stale Arena folders or markers
 	end
 	local greenTeamMarkerDetected = HasAnyDuelsTeamMarker()
 	if greenTeamMarkerDetected then
 		DuelsMatchState.InMatch = true
 		DuelsMatchState.VoteGuiSeen = false
 	end
+	local duelQueuePadsPresent = Workspace:FindFirstChild("DuelPads") ~= nil or Workspace:FindFirstChild("QueuePad") ~= nil
+	local duelTeamsKnown = AreDuelsTeamsKnown()
+	if duelQueuePadsPresent and not greenTeamMarkerDetected and not duelTeamsKnown then
+		-- Queue pads with no team evidence indicates the lobby. Do not let a stale
+		-- generic Arena folder turn every player red/blue before a duel begins.
+		DuelsMatchState.InMatch = false
+		DuelsMatchState.LastTeleportTime = 0
+		DuelsMatchState.TeamByPlayer = {}
+		return
+	end
 	local foundArenaMap = false
 	local function IsArenaName(name)
 		local nl = string.lower(name)
+		-- A lobby/queue object may itself contain the word "arena"; never use
+		-- such an object as evidence of an active match.
+		if nl:find("lobby", 1, true) or nl:find("queue", 1, true)
+			or nl:find("waiting", 1, true) or nl:find("intermission", 1, true)
+			or nl:find("vote", 1, true) or nl:find("pad", 1, true) then return false end
 		return nl:find("arena", 1, true) or nl:find("duelmap", 1, true) or nl:find("battleground", 1, true)
 			or nl:find("selectedmap", 1, true) or nl:find("matchmap", 1, true)
 	end
@@ -5030,24 +5063,29 @@ _G.Celestial.ConnectionRoleScanner =
 							hl.Adornee = char
 							local roleColor = COLOR_INNOCENT
 							local isGhostVisual = false
-							if infectionBarnActive then
-								local infectionRole = CH_GetInfectionBarnRole(plr, infectionBarnElapsed)
-								if infectionRole == "ZOMBIE" then
-									roleColor = INFECTION_BARN_ZOMBIE_COLOR
-								else
-									roleColor = INFECTION_BARN_SURVIVOR_COLOR
-								end
+							if _G.Celestial.HubLoaded ~= true
+								or _G.Celestial.GameMode == "UNKNOWN" or not _G.Celestial.GameMode then
+								roleColor = COLOR_LOBBY_WHITE -- hub loading or mode detection phase
 							elseif _G.Celestial.GameMode == "MM2" then
-								local name = plr.Name
-								if name == State.MurdererName then
-									roleColor = COLOR_MURDERER
-									isGhostVisual = _G.Celestial.PowerDetector.CurrentPower == "Ghost"
-										and _G.Celestial.PowerDetector.CurrentPlayer == plr
-										and _G.Celestial.PowerDetector.GhostActive == true
-									if isGhostVisual then roleColor = COLOR_GHOST end
-								elseif name == State.SheriffName then roleColor = COLOR_SHERIFF
-								elseif name == State.HeroName then roleColor = COLOR_HERO end
-							else
+								if infectionBarnActive then
+									local infectionRole = CH_GetInfectionBarnRole(plr, infectionBarnElapsed)
+									if infectionRole == "ZOMBIE" then
+										roleColor = INFECTION_BARN_ZOMBIE_COLOR
+									else
+										roleColor = INFECTION_BARN_SURVIVOR_COLOR
+									end
+								else
+									local name = plr.Name
+									if name == State.MurdererName then
+										roleColor = COLOR_MURDERER
+										isGhostVisual = _G.Celestial.PowerDetector.CurrentPower == "Ghost"
+											and _G.Celestial.PowerDetector.CurrentPlayer == plr
+											and _G.Celestial.PowerDetector.GhostActive == true
+										if isGhostVisual then roleColor = COLOR_GHOST end
+									elseif name == State.SheriffName then roleColor = COLOR_SHERIFF
+									elseif name == State.HeroName then roleColor = COLOR_HERO end
+								end
+							else -- DUELS (lobby is always white; only paint teams during an active match)
 								if DuelsMatchState.InMatch then
 									local side = DuelsMatchState.TeamByPlayer[plr]
 									if side == "SELF" then roleColor = COLOR_TEAM_SELF
@@ -5061,7 +5099,9 @@ _G.Celestial.ConnectionRoleScanner =
 											roleColor = COLOR_TEAM_ENEMY
 										end
 									end
-								else roleColor = COLOR_LOBBY_WHITE end
+								else
+									roleColor = COLOR_LOBBY_WHITE
+								end
 							end
 							hl.Enabled = true
 							hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
@@ -5090,13 +5130,18 @@ _G.Celestial.ConnectionRoleScanner =
 							_G.Celestial.SelfHighlight = selfHl
 						end
 						selfHl.Adornee = myChar
-						local selfColor = COLOR_INNOCENT
-						if _G.Celestial.GameMode == "MM2" then
-							if LocalPlayer.Name == State.MurdererName then selfColor = COLOR_MURDERER
+						local selfColor = COLOR_LOBBY_WHITE
+						if _G.Celestial.HubLoaded == true and _G.Celestial.GameMode == "MM2" then
+							if infectionBarnActive then
+								local selfInfectionRole = CH_GetInfectionBarnRole(LocalPlayer, infectionBarnElapsed)
+								selfColor = selfInfectionRole == "ZOMBIE" and INFECTION_BARN_ZOMBIE_COLOR or INFECTION_BARN_SURVIVOR_COLOR
+							elseif LocalPlayer.Name == State.MurdererName then selfColor = COLOR_MURDERER
 							elseif LocalPlayer.Name == State.SheriffName then selfColor = COLOR_SHERIFF
 							elseif LocalPlayer.Name == State.HeroName then selfColor = COLOR_HERO
 							else selfColor = COLOR_INNOCENT end
-						else selfColor = COLOR_TEAM_SELF end
+						elseif _G.Celestial.HubLoaded == true and _G.Celestial.GameMode == "DUELS" and DuelsMatchState.InMatch then
+							selfColor = COLOR_TEAM_SELF
+						end
 						selfHl.Enabled = true
 						selfHl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 						selfHl.FillColor = selfColor
@@ -8917,18 +8962,50 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		local elapsed = tick() - scanStartTime
 		if elapsed >= minScanTime then
 			detectedMode = ScanGameMode()
-			if detectedMode then break end
+			if detectedMode and detectedMode ~= "UNKNOWN" then break end
 		end
 		if elapsed >= maxScanTime then
-			detectedMode = detectedMode or "DUELS"
+			detectedMode = detectedMode or "UNKNOWN"
 			break
 		end
 		task.wait(0.25)
 	end
-	_G.Celestial.GameMode = detectedMode
+	_G.Celestial.GameMode = detectedMode or "UNKNOWN"
 	if scanGui and scanGui.Parent then scanGui:Destroy() end
 	_G.Celestial.ScanGui = nil
-	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
+	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(_G.Celestial.GameMode))
+	_G.Celestial.GameModePollTask = task.spawn(function()
+		local candidateMode, candidateCount = nil, 0
+		while _G.Celestial.GameModePollToken == gameModePollToken do
+			task.wait(2)
+			if _G.Celestial.GameModePollToken ~= gameModePollToken then break end
+			local result = ScanGameMode()
+			if result and result ~= "UNKNOWN" then
+				if result == _G.Celestial.GameMode then
+					candidateMode, candidateCount = nil, 0
+				else
+					if candidateMode == result then candidateCount += 1
+					else candidateMode, candidateCount = result, 1 end
+					if candidateCount >= 2 then
+						local previousMode = _G.Celestial.GameMode
+						_G.Celestial.GameMode = result
+						DuelsMatchState.InMatch = false
+						DuelsMatchState.CurrentMap = nil
+						DuelsMatchState.LastCheck = 0
+						DuelsMatchState.LastCharPosition = nil
+						DuelsMatchState.LastTeleportTime = 0
+						DuelsMatchState.VoteGuiSeen = false
+						DuelsMatchState.TeamByPlayer = {}
+						forceRoleScan = true
+						print("✨ CELESTIAL FRAMEWORK: Game mode updated -> " .. tostring(previousMode) .. " => " .. tostring(result))
+						candidateMode, candidateCount = nil, 0
+					end
+				end
+			else
+				candidateMode, candidateCount = nil, 0
+			end
+		end
+	end)
 	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
 		_G.Celestial.GameDetectionConnection = LocalPlayer.OnTeleport:Connect(function(teleportState)
 			if teleportState == Enum.TeleportState.Started or teleportState == Enum.TeleportState.InProgress
@@ -8937,8 +9014,15 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end
 			task.wait(1)
 			local newMode = ScanGameMode()
-			if newMode then
+			if newMode and newMode ~= "UNKNOWN" then
 				_G.Celestial.GameMode = newMode
+				DuelsMatchState.InMatch = false
+				DuelsMatchState.CurrentMap = nil
+				DuelsMatchState.LastCheck = 0
+				DuelsMatchState.LastCharPosition = nil
+				DuelsMatchState.LastTeleportTime = 0
+				DuelsMatchState.VoteGuiSeen = false
+				DuelsMatchState.TeamByPlayer = {}
 				print("✨ CELESTIAL FRAMEWORK: Re-detected game mode after teleport -> " .. tostring(newMode))
 			end
 		end)
