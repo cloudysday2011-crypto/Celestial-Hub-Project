@@ -6929,12 +6929,36 @@ local function CoinTravelScore(fromPos, coinPos)
 	return horizontal + math.abs(delta.Y) * CoinEngine.VerticalTravelPenalty
 end
 
--- Una sola pasada O(N): elige la moneda con menor coste de ruta, no solo menor distancia 3D.
+-- Selector de ruta: conserva la puntuacion habitual y prefiere una trayectoria despejada
+-- entre los cinco candidatos mas cercanos. Si todos estan bloqueados, mantiene el mejor candidato
+-- original como fallback; no modifica el limite de velocidad ni el sistema NoClip.
+local routeRayParams = RaycastParams.new()
+routeRayParams.FilterType = Enum.RaycastFilterType.Exclude
+routeRayParams.RespectCanCollide = true
+
+local function HasClearCoinRoute(fromPos, coin)
+	if not coin or not coin.Parent then return false end
+	local ignore = {coin}
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	routeRayParams.FilterDescendantsInstances = ignore
+	local origin = fromPos + Vector3.new(0, 0.75, 0)
+	local destination = coin.Position + Vector3.new(0, 0.5, 0)
+	local direction = destination - origin
+	if direction.Magnitude < 0.1 then return true end
+	local ok, hit = pcall(function()
+		return Workspace:Raycast(origin, direction, routeRayParams)
+	end)
+	return ok and hit == nil
+end
+
+-- Una sola pasada O(N) para puntuar; solo hace hasta cinco raycasts al comparar rutas candidatas.
 local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-	local best, bestScore = nil, math.huge
+	local candidates = {}
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
 			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
@@ -6946,13 +6970,21 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 				local verticalGap = math.abs(delta.Y)
 				local distance = delta.Magnitude
 				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
-					local score = CoinTravelScore(fromPos, coin.Position)
-					if score < bestScore then best, bestScore = coin, score end
+					candidates[#candidates + 1] = {coin = coin, score = CoinTravelScore(fromPos, coin.Position)}
 				end
 			end
 		end
 	end
-	return best
+	if #candidates == 0 then return nil end
+	table.sort(candidates, function(a, b) return a.score < b.score end)
+	local checks = math.min(5, #candidates)
+	for i = 1, checks do
+		if HasClearCoinRoute(fromPos, candidates[i].coin) then
+			return candidates[i].coin
+		end
+	end
+	-- No ruta directa despejada entre los cinco mejores: no bloquear el farmeo por completo.
+	return candidates[1].coin
 end
 
 local function PickNearest(fromPos, exclude, now)
