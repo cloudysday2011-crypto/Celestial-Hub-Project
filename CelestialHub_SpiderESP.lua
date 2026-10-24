@@ -1,6 +1,7 @@
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
 -- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
+-- Infection Barn ESP merged onto this known-good baseline; normal mode ESP and NoClip code left unchanged.
 -- Keeps Tuned 3 Auto-Farm movement and NoClip behavior unchanged; no private server APIs are queried.
 -- Auto-Farm NoClip behavior is preserved from the prior version; collisions are restored when flight stops.
 -- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
@@ -27,13 +28,6 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
 if not _G.Celestial then
 	_G.Celestial = {}
-end
--- Invalidate a previous run's mode poller so it cannot overwrite this run's detection.
-local gameModePollToken = (_G.Celestial.GameModePollToken or 0) + 1
-_G.Celestial.GameModePollToken = gameModePollToken
-if _G.Celestial.GameDetectionConnection then
-	pcall(function() _G.Celestial.GameDetectionConnection:Disconnect() end)
-	_G.Celestial.GameDetectionConnection = nil
 end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
@@ -527,17 +521,12 @@ local function ScanGameMode()
 	if Workspace:FindFirstChild("GunDrop") or Workspace:FindFirstChild("RevolverDrop") then scoreMM2 += 30 end
 	if Workspace:FindFirstChild("DuelPads") or Workspace:FindFirstChild("QueuePad") then scoreDuels += 30 end
 
-	-- Do not guess DUELS when both scores are zero: this was painting active
-	-- MM2/lobby players with duel colors while the game UI was still loading.
-	local hasMainGUI = pg and pg:FindFirstChild("MainGUI") ~= nil
-	local hasDuelGUI = pg and (pg:FindFirstChild("DuelGUI") ~= nil or pg:FindFirstChild("DuelHUD") ~= nil)
-	local hasDuelPads = Workspace:FindFirstChild("DuelPads") ~= nil or Workspace:FindFirstChild("QueuePad") ~= nil
-	if scoreMM2 >= scoreDuels + 10 and scoreMM2 >= 15 then return "MM2" end
-	if scoreDuels >= scoreMM2 + 10 and scoreDuels >= 20 then return "DUELS" end
-	-- Duel-specific GUI/pads beat a generic MainGUI during the duel lobby.
-	if hasDuelGUI or hasDuelPads then return "DUELS" end
-	if hasMainGUI and not hasDuelGUI then return "MM2" end
-	return "UNKNOWN"
+	if scoreMM2 > scoreDuels then return "MM2"
+	elseif scoreDuels > scoreMM2 then return "DUELS"
+	else
+		if pg and pg:FindFirstChild("MainGUI") then return "MM2" end
+		return "DUELS"
+	end
 end
 
 -- ====================================================================
@@ -666,51 +655,30 @@ local function CheckDuelsMatchState()
 	if root then DuelsMatchState.LastCharPosition = root.Position end
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	local voteGuiDetected = false
-	local explicitLobbyGuiDetected = false
 	if pg then
 		for _, gui in ipairs(pg:GetChildren()) do
 			if gui:IsA("ScreenGui") and gui.Enabled then
 				local nl = string.lower(gui.Name)
 				if nl:find("vote", 1, true) or nl:find("mapselect", 1, true)
 					or nl:find("mapvote", 1, true) or nl:find("duelvote", 1, true) then
-					voteGuiDetected = true
-				elseif nl == "duellobbygui" or nl == "lobbygui" or nl == "queuegui"
-					or nl == "waitingroomgui" or nl == "intermissiongui" then
-					explicitLobbyGuiDetected = true
+					voteGuiDetected = true; break
 				end
 			end
 		end
 	end
-	if voteGuiDetected or explicitLobbyGuiDetected then
-		DuelsMatchState.VoteGuiSeen = voteGuiDetected
+	if voteGuiDetected then
+		DuelsMatchState.VoteGuiSeen = true
 		DuelsMatchState.InMatch = false
-		DuelsMatchState.LastTeleportTime = 0
 		DuelsMatchState.TeamByPlayer = {}
-		return -- lobby/voting state takes priority over stale Arena folders or markers
 	end
 	local greenTeamMarkerDetected = HasAnyDuelsTeamMarker()
 	if greenTeamMarkerDetected then
 		DuelsMatchState.InMatch = true
 		DuelsMatchState.VoteGuiSeen = false
 	end
-	local duelQueuePadsPresent = Workspace:FindFirstChild("DuelPads") ~= nil or Workspace:FindFirstChild("QueuePad") ~= nil
-	local duelTeamsKnown = AreDuelsTeamsKnown()
-	if duelQueuePadsPresent and not greenTeamMarkerDetected and not duelTeamsKnown then
-		-- Queue pads with no team evidence indicates the lobby. Do not let a stale
-		-- generic Arena folder turn every player red/blue before a duel begins.
-		DuelsMatchState.InMatch = false
-		DuelsMatchState.LastTeleportTime = 0
-		DuelsMatchState.TeamByPlayer = {}
-		return
-	end
 	local foundArenaMap = false
 	local function IsArenaName(name)
 		local nl = string.lower(name)
-		-- A lobby/queue object may itself contain the word "arena"; never use
-		-- such an object as evidence of an active match.
-		if nl:find("lobby", 1, true) or nl:find("queue", 1, true)
-			or nl:find("waiting", 1, true) or nl:find("intermission", 1, true)
-			or nl:find("vote", 1, true) or nl:find("pad", 1, true) then return false end
 		return nl:find("arena", 1, true) or nl:find("duelmap", 1, true) or nl:find("battleground", 1, true)
 			or nl:find("selectedmap", 1, true) or nl:find("matchmap", 1, true)
 	end
@@ -1465,6 +1433,8 @@ local COLOR_GHOST    = Color3.fromRGB(225, 225, 225)
 local COLOR_TEAM_SELF = Color3.fromRGB(255, 100, 50)
 local COLOR_TEAM_ENEMY = Color3.fromRGB(160, 0, 255)
 local COLOR_LOBBY_WHITE = Color3.fromRGB(255, 255, 255)
+local COLOR_INFECTION_SURVIVOR = Color3.fromRGB(255, 176, 0) -- #FFB000
+local COLOR_INFECTION_ZOMBIE = Color3.fromRGB(57, 255, 20) -- #39FF14
 
 -- ====================================================================
 -- HELPERS
@@ -4816,90 +4786,138 @@ _G.Celestial.SpiderESPAPI = {
 end
 
 -- ====================================================================
--- INFECTION BARN ROLE ESP (isolated from normal MM2 role colors)
+-- INFECTION BARN ESP (isolated override; normal MM2/DUELS/SPIDER colors untouched)
 -- ====================================================================
-local INFECTION_BARN_MAP_ID = "76492571136638"
-local INFECTION_BARN_SURVIVOR_COLOR = Color3.fromRGB(255, 176, 0) -- electric amber
-local INFECTION_BARN_ZOMBIE_COLOR = Color3.fromRGB(57, 255, 20) -- toxic green, distinct from default innocent green
-local InfectionBarnRoundStartedAt = 0
-local InfectionBarnCharacterBaselines = setmetatable({}, {__mode = "k"})
-local InfectionBarnRoleCache = setmetatable({}, {__mode = "k"})
+local InfectionBarnESP = {
+	Active = false,
+	MapCheckedAt = 0,
+	MapLoaded = false,
+	RoundStartedAt = 0,
+	LastWeaponState = {},
+	AvatarBaseline = {},
+	RoleByPlayer = {},
+}
+_G.Celestial.InfectionBarnESP = InfectionBarnESP
 
-local function CH_IsInfectionBarnMap()
-	local function norm(v)
-		return tostring(v or ""):upper():gsub("[^A-Z0-9]", "")
+local function CH_NormalizeMapToken(value)
+	if type(value) ~= "string" then return "" end
+	return string.upper((value:gsub("[^%w]", "")))
+end
+
+local function CH_IsInfectionBarnMapLoaded()
+	local now = tick()
+	if now - InfectionBarnESP.MapCheckedAt < 0.45 then
+		return InfectionBarnESP.MapLoaded
 	end
-	local function matches(obj)
-		if not obj then return false end
-		if norm(obj.Name) == "INFECTIONBARN" or norm(obj.Name) == "BARNINFECTION" then return true end
-		for _, attr in ipairs({"MapName", "Map", "CurrentMap", "MapId"}) do
-			local ok, value = pcall(function() return obj:GetAttribute(attr) end)
-			if ok and value ~= nil then
-				local val = tostring(value)
-				if norm(val) == "INFECTIONBARN" or norm(val) == "BARNINFECTION"
-					or val:match("(%d+)") == INFECTION_BARN_MAP_ID then return true end
+	InfectionBarnESP.MapCheckedAt = now
+	local found = false
+	pcall(function()
+		for _, attributeName in ipairs({"MapName", "CurrentMap", "Map"}) do
+			local value = Workspace:GetAttribute(attributeName)
+			local token = CH_NormalizeMapToken(value)
+			if token == "INFECTIONBARN" or token == "BARNINFECTION" then found = true; break end
+		end
+		if not found then
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if (obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("StringValue")) then
+					local token = CH_NormalizeMapToken(obj.Name)
+					if token == "INFECTIONBARN" or token == "BARNINFECTION" then
+						found = true
+						break
+					end
+					if obj:IsA("StringValue") and (obj.Name == "MapName" or obj.Name == "CurrentMap") then
+						token = CH_NormalizeMapToken(obj.Value)
+						if token == "INFECTIONBARN" or token == "BARNINFECTION" then found = true; break end
+					end
+				end
 			end
 		end
+	end)
+	InfectionBarnESP.MapLoaded = found
+	if found and not InfectionBarnESP.Active then
+		InfectionBarnESP.Active = true
+		InfectionBarnESP.RoundStartedAt = now
+		InfectionBarnESP.LastWeaponState = {}
+		InfectionBarnESP.AvatarBaseline = {}
+		InfectionBarnESP.RoleByPlayer = {}
+	elseif not found and InfectionBarnESP.Active then
+		InfectionBarnESP.Active = false
+		InfectionBarnESP.RoundStartedAt = 0
+		InfectionBarnESP.LastWeaponState = {}
+		InfectionBarnESP.AvatarBaseline = {}
+		InfectionBarnESP.RoleByPlayer = {}
+	end
+	return found
+end
+
+local function CH_GetAvatarScaleSignature(plr)
+	local char = plr and plr.Character
+	if not char then return nil end
+	local humanoid = char:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return nil end
+	local values = {}
+	for _, name in ipairs({"BodyHeightScale", "BodyWidthScale", "BodyDepthScale", "HeadScale"}) do
+		local scale = humanoid:FindFirstChild(name)
+		values[name] = scale and tonumber(scale.Value) or 1
+	end
+	return values
+end
+
+local function CH_AvatarScaleChanged(plr)
+	local signature = CH_GetAvatarScaleSignature(plr)
+	if not signature then return false end
+	local baseline = InfectionBarnESP.AvatarBaseline[plr]
+	if not baseline then
+		InfectionBarnESP.AvatarBaseline[plr] = signature
 		return false
 	end
-	local candidates = {Workspace:FindFirstChild("Map"), Workspace:FindFirstChild("Normal"),
-		Workspace:FindFirstChild("Round"), Workspace:FindFirstChild("Arena"), Workspace}
-	for _, container in ipairs(candidates) do
-		if container and matches(container) then return true end
-		if container then
-			for _, child in ipairs(container:GetChildren()) do
-				if matches(child) then return true end
-			end
+	for name, value in pairs(signature) do
+		if math.abs(value - (baseline[name] or 1)) >= 0.12 then
+			return true
 		end
 	end
 	return false
 end
 
-local function CH_InfectionBarnAvatarChanged(player)
-	local char = player and player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if not char or not hum then return false end
-	local values = {}
-	for _, name in ipairs({"BodyHeightScale", "BodyWidthScale", "BodyDepthScale", "HeadScale"}) do
-		local v = hum:FindFirstChild(name)
-		if v and v:IsA("NumberValue") then values[name] = v.Value end
+local function CH_GetInfectionRole(plr, classificationReady)
+	local hasKnife, hasGun = CheckPlayerInventory(plr)
+	local previous = InfectionBarnESP.LastWeaponState[plr]
+	local scaleChanged = CH_AvatarScaleChanged(plr)
+	local role
+	if hasKnife and not hasGun then
+		role = "ZOMBIE"
+	elseif previous and previous.Gun and hasKnife then
+		role = "ZOMBIE"
+	elseif scaleChanged and previous and previous.Gun then
+		role = "ZOMBIE"
+	elseif hasGun and not hasKnife then
+		role = "SURVIVOR"
+	elseif InfectionBarnESP.RoleByPlayer[plr] then
+		role = InfectionBarnESP.RoleByPlayer[plr]
+	else
+		role = "UNKNOWN"
 	end
-	local baseline = InfectionBarnCharacterBaselines[player]
-	if not baseline or baseline.Character ~= char then
-		InfectionBarnCharacterBaselines[player] = {Character = char, Values = values}
-		return false
+	InfectionBarnESP.LastWeaponState[plr] = {Knife = hasKnife, Gun = hasGun}
+	if role == "ZOMBIE" or role == "SURVIVOR" then
+		InfectionBarnESP.RoleByPlayer[plr] = role
 	end
-	local changed, count = false, 0
-	for name, value in pairs(values) do
-		local old = baseline.Values[name]
-		if old ~= nil then
-			count += 1
-			if math.abs(value - old) >= 0.12 then changed = true end
-		end
-	end
-	return count >= 2 and changed
+	if not classificationReady and role ~= "ZOMBIE" then return "UNKNOWN" end
+	return role
 end
 
-local function CH_GetInfectionBarnRole(player, elapsed)
-	local isKnife, isGun = CheckPlayerInventory(player)
-	-- In this mode a knife indicates the infected role; the existing inventory
-	-- detector is reused, while avatar-scale changes act as a secondary signal.
-	if isKnife then
-		InfectionBarnRoleCache[player] = "ZOMBIE"
-		return "ZOMBIE"
+local function CH_InfectionClassificationReady()
+	if not InfectionBarnESP.Active then return false end
+	if tick() - InfectionBarnESP.RoundStartedAt >= 10 then return true end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local knife, gun = CheckPlayerInventory(plr)
+		if knife or gun then return true end
 	end
-	if CH_InfectionBarnAvatarChanged(player) and InfectionBarnRoleCache[player] == "SURVIVOR" then
-		InfectionBarnRoleCache[player] = "ZOMBIE"
-		return "ZOMBIE"
-	end
-	if isGun or elapsed >= 10 then
-		if InfectionBarnRoleCache[player] ~= "ZOMBIE" then
-			InfectionBarnRoleCache[player] = "SURVIVOR"
-		end
-	end
-	return InfectionBarnRoleCache[player] or "SURVIVOR"
+	return false
 end
 
+_G.Celestial.IsInfectionBarnESPActive = CH_IsInfectionBarnMapLoaded
+
+_G.Celestial.Highlights = _G.Celestial.Highlights or {}
 local lastRoleScan = 0
 local forceRoleScan = false
 
@@ -4922,22 +4940,17 @@ _G.Celestial.ConnectionRoleScanner =
 				_G.Celestial.ESPFolder = folder
 			end
 			local activePlayers = Players:GetPlayers()
-			local infectionBarnActive = CH_IsInfectionBarnMap()
-			local infectionBarnElapsed = 0
-			if infectionBarnActive then
-				if InfectionBarnRoundStartedAt == 0 then InfectionBarnRoundStartedAt = now end
-				infectionBarnElapsed = now - InfectionBarnRoundStartedAt
-			else
-				InfectionBarnRoundStartedAt = 0
-				table.clear(InfectionBarnRoleCache)
-				table.clear(InfectionBarnCharacterBaselines)
-			end
+			local infectionBarnActive = CH_IsInfectionBarnMapLoaded()
+			local infectionClassificationReady = infectionBarnActive and CH_InfectionClassificationReady()
 			local activePlayersMap = {}
 			for _, p in ipairs(activePlayers) do activePlayersMap[p] = true end
 			for plr, hl in pairs(_G.Celestial.Highlights) do
 				if not activePlayersMap[plr] or not plr.Parent then
 					if hl then pcall(function() hl:Destroy() end) end
 					PowerDetectionCache[plr] = nil
+					InfectionBarnESP.LastWeaponState[plr] = nil
+					InfectionBarnESP.AvatarBaseline[plr] = nil
+					InfectionBarnESP.RoleByPlayer[plr] = nil
 					DuelsMatchState.TeamByPlayer[plr] = nil
 					if _G.Celestial.SpiderESPAPI then _G.Celestial.SpiderESPAPI.ClearPlayer(plr) end
 					_G.Celestial.Highlights[plr] = nil
@@ -4981,7 +4994,7 @@ _G.Celestial.ConnectionRoleScanner =
 				CheckDuelsMatchState()
 				RefreshDuelsTeamAssignments()
 			end
-			if _G.Celestial.GameMode == "MM2" then
+			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive then
 				local foundMurder = ""
 				local currentGunHolder = nil
 				for _, plr in ipairs(activePlayers) do
@@ -5063,29 +5076,17 @@ _G.Celestial.ConnectionRoleScanner =
 							hl.Adornee = char
 							local roleColor = COLOR_INNOCENT
 							local isGhostVisual = false
-							if _G.Celestial.HubLoaded ~= true
-								or _G.Celestial.GameMode == "UNKNOWN" or not _G.Celestial.GameMode then
-								roleColor = COLOR_LOBBY_WHITE -- hub loading or mode detection phase
-							elseif _G.Celestial.GameMode == "MM2" then
-								if infectionBarnActive then
-									local infectionRole = CH_GetInfectionBarnRole(plr, infectionBarnElapsed)
-									if infectionRole == "ZOMBIE" then
-										roleColor = INFECTION_BARN_ZOMBIE_COLOR
-									else
-										roleColor = INFECTION_BARN_SURVIVOR_COLOR
-									end
-								else
-									local name = plr.Name
-									if name == State.MurdererName then
-										roleColor = COLOR_MURDERER
-										isGhostVisual = _G.Celestial.PowerDetector.CurrentPower == "Ghost"
-											and _G.Celestial.PowerDetector.CurrentPlayer == plr
-											and _G.Celestial.PowerDetector.GhostActive == true
-										if isGhostVisual then roleColor = COLOR_GHOST end
-									elseif name == State.SheriffName then roleColor = COLOR_SHERIFF
-									elseif name == State.HeroName then roleColor = COLOR_HERO end
-								end
-							else -- DUELS (lobby is always white; only paint teams during an active match)
+							if _G.Celestial.GameMode == "MM2" then
+								local name = plr.Name
+								if name == State.MurdererName then
+									roleColor = COLOR_MURDERER
+									isGhostVisual = _G.Celestial.PowerDetector.CurrentPower == "Ghost"
+										and _G.Celestial.PowerDetector.CurrentPlayer == plr
+										and _G.Celestial.PowerDetector.GhostActive == true
+									if isGhostVisual then roleColor = COLOR_GHOST end
+								elseif name == State.SheriffName then roleColor = COLOR_SHERIFF
+								elseif name == State.HeroName then roleColor = COLOR_HERO end
+							else
 								if DuelsMatchState.InMatch then
 									local side = DuelsMatchState.TeamByPlayer[plr]
 									if side == "SELF" then roleColor = COLOR_TEAM_SELF
@@ -5099,9 +5100,13 @@ _G.Celestial.ConnectionRoleScanner =
 											roleColor = COLOR_TEAM_ENEMY
 										end
 									end
-								else
-									roleColor = COLOR_LOBBY_WHITE
-								end
+								else roleColor = COLOR_LOBBY_WHITE end
+							end
+							if infectionBarnActive then
+								local infectionRole = CH_GetInfectionRole(plr, infectionClassificationReady)
+								if infectionRole == "ZOMBIE" then roleColor = COLOR_INFECTION_ZOMBIE
+								elseif infectionRole == "SURVIVOR" then roleColor = COLOR_INFECTION_SURVIVOR
+								else roleColor = COLOR_LOBBY_WHITE end
 							end
 							hl.Enabled = true
 							hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
@@ -5130,18 +5135,18 @@ _G.Celestial.ConnectionRoleScanner =
 							_G.Celestial.SelfHighlight = selfHl
 						end
 						selfHl.Adornee = myChar
-						local selfColor = COLOR_LOBBY_WHITE
-						if _G.Celestial.HubLoaded == true and _G.Celestial.GameMode == "MM2" then
-							if infectionBarnActive then
-								local selfInfectionRole = CH_GetInfectionBarnRole(LocalPlayer, infectionBarnElapsed)
-								selfColor = selfInfectionRole == "ZOMBIE" and INFECTION_BARN_ZOMBIE_COLOR or INFECTION_BARN_SURVIVOR_COLOR
-							elseif LocalPlayer.Name == State.MurdererName then selfColor = COLOR_MURDERER
+						local selfColor = COLOR_INNOCENT
+						if infectionBarnActive then
+							local infectionRole = CH_GetInfectionRole(LocalPlayer, infectionClassificationReady)
+							if infectionRole == "ZOMBIE" then selfColor = COLOR_INFECTION_ZOMBIE
+							elseif infectionRole == "SURVIVOR" then selfColor = COLOR_INFECTION_SURVIVOR
+							else selfColor = COLOR_LOBBY_WHITE end
+						elseif _G.Celestial.GameMode == "MM2" then
+							if LocalPlayer.Name == State.MurdererName then selfColor = COLOR_MURDERER
 							elseif LocalPlayer.Name == State.SheriffName then selfColor = COLOR_SHERIFF
 							elseif LocalPlayer.Name == State.HeroName then selfColor = COLOR_HERO
 							else selfColor = COLOR_INNOCENT end
-						elseif _G.Celestial.HubLoaded == true and _G.Celestial.GameMode == "DUELS" and DuelsMatchState.InMatch then
-							selfColor = COLOR_TEAM_SELF
-						end
+						else selfColor = COLOR_TEAM_SELF end
 						selfHl.Enabled = true
 						selfHl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 						selfHl.FillColor = selfColor
@@ -8962,50 +8967,18 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		local elapsed = tick() - scanStartTime
 		if elapsed >= minScanTime then
 			detectedMode = ScanGameMode()
-			if detectedMode and detectedMode ~= "UNKNOWN" then break end
+			if detectedMode then break end
 		end
 		if elapsed >= maxScanTime then
-			detectedMode = detectedMode or "UNKNOWN"
+			detectedMode = detectedMode or "DUELS"
 			break
 		end
 		task.wait(0.25)
 	end
-	_G.Celestial.GameMode = detectedMode or "UNKNOWN"
+	_G.Celestial.GameMode = detectedMode
 	if scanGui and scanGui.Parent then scanGui:Destroy() end
 	_G.Celestial.ScanGui = nil
-	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(_G.Celestial.GameMode))
-	_G.Celestial.GameModePollTask = task.spawn(function()
-		local candidateMode, candidateCount = nil, 0
-		while _G.Celestial.GameModePollToken == gameModePollToken do
-			task.wait(2)
-			if _G.Celestial.GameModePollToken ~= gameModePollToken then break end
-			local result = ScanGameMode()
-			if result and result ~= "UNKNOWN" then
-				if result == _G.Celestial.GameMode then
-					candidateMode, candidateCount = nil, 0
-				else
-					if candidateMode == result then candidateCount += 1
-					else candidateMode, candidateCount = result, 1 end
-					if candidateCount >= 2 then
-						local previousMode = _G.Celestial.GameMode
-						_G.Celestial.GameMode = result
-						DuelsMatchState.InMatch = false
-						DuelsMatchState.CurrentMap = nil
-						DuelsMatchState.LastCheck = 0
-						DuelsMatchState.LastCharPosition = nil
-						DuelsMatchState.LastTeleportTime = 0
-						DuelsMatchState.VoteGuiSeen = false
-						DuelsMatchState.TeamByPlayer = {}
-						forceRoleScan = true
-						print("✨ CELESTIAL FRAMEWORK: Game mode updated -> " .. tostring(previousMode) .. " => " .. tostring(result))
-						candidateMode, candidateCount = nil, 0
-					end
-				end
-			else
-				candidateMode, candidateCount = nil, 0
-			end
-		end
-	end)
+	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
 	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
 		_G.Celestial.GameDetectionConnection = LocalPlayer.OnTeleport:Connect(function(teleportState)
 			if teleportState == Enum.TeleportState.Started or teleportState == Enum.TeleportState.InProgress
@@ -9014,15 +8987,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end
 			task.wait(1)
 			local newMode = ScanGameMode()
-			if newMode and newMode ~= "UNKNOWN" then
+			if newMode then
 				_G.Celestial.GameMode = newMode
-				DuelsMatchState.InMatch = false
-				DuelsMatchState.CurrentMap = nil
-				DuelsMatchState.LastCheck = 0
-				DuelsMatchState.LastCharPosition = nil
-				DuelsMatchState.LastTeleportTime = 0
-				DuelsMatchState.VoteGuiSeen = false
-				DuelsMatchState.TeamByPlayer = {}
 				print("✨ CELESTIAL FRAMEWORK: Re-detected game mode after teleport -> " .. tostring(newMode))
 			end
 		end)
