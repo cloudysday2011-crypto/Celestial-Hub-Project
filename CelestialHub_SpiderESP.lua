@@ -5398,6 +5398,11 @@ local CoinEngine = {
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
 	ChaseFix = true,             -- V3.2: compensa monedas que se mueven (sin esto, con gain 8 queda a ~3.7 > PickupDistance y nunca recoge). false = V3.1
 	ChaseMaxLead = 30,           -- V3.2: tope (studs/s) de la velocidad extra que se suma por mover la moneda
+	-- ===== TELETRANSPORTE A LA MONEDA (sustituye al vuelo; poner TeleportMode = false para volver al vuelo) =====
+	TeleportMode = true,           -- true: se coloca el CFrame del root sobre la moneda; sin BodyVelocity/BodyGyro/PlatformStand/NoClip
+	LastTeleportAt = 0,            -- ultimo teletransporte propio (campo de la tabla: evita agotar el limite de 200 locals)
+	TeleportMinInterval = 0.30,    -- segundos minimos entre dos teletransportes (evita rafagas si el servidor nos devuelve atras)
+	TeleportPickupDistance = 3.5,  -- en modo TP: distancia al punto de contacto a la que se considera "llegado" (el Humanoid se asienta sobre el suelo)
 	-- ===== PRUEBAS A/B (poner en false para volver al comportamiento anterior) =====
 	SoftBrake = true,            -- frenada progresiva: no pasar de 45 a 0 studs/s en un solo frame al llegar a la moneda
 	SoftBrakeGain = 8,           -- ganancia de frenado al acercarse con SoftBrake (menor = frena desde mas lejos)
@@ -7591,7 +7596,13 @@ local function ControllerStep(dt)
 
 	-- ===== VUELO hacia la moneda =====
 	SetStatus(CoinEngine.ThreatResponse.Active and "threat-routing" or "farming")
-	EnsureFlight(root, hum)
+	if CoinEngine.TeleportMode then
+		-- Modo TP: sin fisica de vuelo ni NoClip. Solo se limpia el vuelo si quedaba algo de antes
+		-- (la comprobacion evita que StopFlight reinicie LastSafetyReason en cada frame).
+		if flightOn or flightVel or flightGyro then StopFlight() end
+	else
+		EnsureFlight(root, hum)
+	end
 
 	-- Recuperacion adaptativa: evita cambiar de objetivo por solapamientos transitorios.
 	-- El NoClip puede cruzar geometria; solo se redirige tras solapamiento sostenido y falta de progreso.
@@ -7798,6 +7809,7 @@ local function ControllerStep(dt)
 	CoinEngine.LastTargetVel = tt.vel.Magnitude
 
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
+	if CoinEngine.TeleportMode then pickupDistance = CoinEngine.TeleportPickupDistance end
 	if dist <= pickupDistance then
 		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
 		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
@@ -7856,6 +7868,25 @@ local function ControllerStep(dt)
 			-- A distancia de contacto no hay que declarar recogida ni limpiar el objetivo manualmente.
 			-- La moneda desaparecera por el contacto del juego o seguira siendo el objetivo.
 			lastProgress = now
+		end
+	elseif CoinEngine.TeleportMode then
+		-- TELETRANSPORTE: un unico salto del root al punto de contacto de la moneda. Despues, el tramo
+		-- "dist <= pickupDistance" de arriba espera el asentamiento (ping) y recoge como siempre.
+		-- Si el servidor nos devuelve atras, "server-moved-us" pausa 1.5 s y StuckTimeout descarta la moneda.
+		if now - CoinEngine.LastTeleportAt >= CoinEngine.TeleportMinInterval and IsSafeCoinPosition(approachPos) then
+			CoinEngine.LastTeleportAt = now
+			local rotation = root.CFrame - root.CFrame.Position
+			root.CFrame = CFrame.new(approachPos) * rotation
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+			end)
+			-- El salto lo hicimos nosotros: no debe contarse como "server-moved-us" en el frame siguiente.
+			lastSetPos = approachPos
+			currentSpeed = 0
+			lastFlightV = 0
+			CoinEngine.LastCommandVelocity = Vector3.zero
+			LogEvent(string.format("teleport d=%.1f dy=%.1f", dist, approachPos.Y - rootPos.Y))
 		end
 	else
 		-- Vuelo: velocidad real hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
