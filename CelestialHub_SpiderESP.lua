@@ -5456,6 +5456,10 @@ local adaptivePingEmaMs, adaptiveFPSEma, adaptiveSpeedEma = 80, 60, 0
 local adaptiveEmaInitialized = false
 -- Safety frame-time EMA is deliberately sample-smoothed: one isolated hitch must not pin the farm at a low cap.
 local adaptiveSafetyFrameDtEma = 1 / 60
+-- Rolling slow-frame window catches repeated stutters that an EMA can dilute.
+-- This is based only on client-observed frame timing, not any hidden/server kick signal.
+local recentSlowFrameTimes = {}
+local slowFrameWindowSeconds = 0.85
 local nextAdaptiveProfileLogAt = 0
 
 -- ===== Estado: detector de ronda + lotes FIJOS de monedas + vuelo (config en CoinEngine) =====
@@ -7363,6 +7367,7 @@ local function ControllerStep(dt)
 	if not State.FarmEnabled then
 		solidOverlapSince = nil
 		nextSolidGuardCheck = 0
+		table.clear(recentSlowFrameTimes)
 		if CoinEngine.Active then Deactivate() end
 		return
 	end
@@ -7583,23 +7588,51 @@ local function ControllerStep(dt)
 	local speed = sliderSpeed
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-	-- Fix de estabilidad V3.22: el limitador previo retenia el cap mas bajo y cada frame de 30-55 ms
-	-- reiniciaba el temporizador. Con tirones intermitentes eso dejaba cmd/phys clavados en 54
-	-- incluso cuando la cadencia volvía a la normalidad. Ahora se usa EMA + cap instantaneo breve.
-	-- La EMA se actualiza por muestra (alpha fijo), para que un unico dt largo no contamine medio segundo.
+	-- Estabilidad adaptativa V3.22.2:
+	-- combina EMA de frame-time con una ventana corta de tirones repetidos. La EMA sola
+	-- puede ocultar rachas de intervalos >40 ms cuando están intercalados con frames rápidos.
+	-- El perfil se adapta a la calidad de ejecución medida en este cliente; no infiere ni intenta
+	-- eludir reglas privadas del servidor. Un único tirón aplica solo el límite instantáneo.
 	local safeSampleDt = math.clamp(sampleDt, 1 / 240, 0.25)
 	adaptiveSafetyFrameDtEma = adaptiveSafetyFrameDtEma + (safeSampleDt - adaptiveSafetyFrameDtEma) * 0.08
 	local frameDtEma = adaptiveSafetyFrameDtEma
+
+	-- Cuenta los intervalos lentos recientes y elimina los que ya salieron de la ventana.
+	-- >=40 ms equivale aproximadamente a menos de 25 FPS entre dos Heartbeats.
+	if sampleDt >= 0.040 then
+		table.insert(recentSlowFrameTimes, now)
+	end
+	while #recentSlowFrameTimes > 0 and (now - recentSlowFrameTimes[1]) > slowFrameWindowSeconds do
+		table.remove(recentSlowFrameTimes, 1)
+	end
+	local slowFramesInWindow = #recentSlowFrameTimes
+
 	local safetyCap = 80
 	if frameDtEma >= 0.055 then
 		safetyCap, safetyReason = 58, "sustained-low-fps-critical"
 	elseif frameDtEma >= 0.045 then
-		safetyCap, safetyReason = 68, "sustained-low-fps"
+		safetyCap, safetyReason = 66, "sustained-low-fps"
 	elseif frameDtEma >= 0.035 then
-		safetyCap, safetyReason = 76, "sustained-frame-time"
+		safetyCap, safetyReason = 74, "sustained-frame-time"
 	end
-	-- Una pausa aislada solo limita este comando; el controlador de aceleracion ya suaviza la vuelta
-	-- al objetivo, por lo que no hace falta retener 54 durante 250-450 ms tras cada tiron.
+
+	-- La racha reciente limita de forma gradual, aunque el promedio EMA siga siendo bueno.
+	-- Al desaparecer los intervalos lentos, el cap vuelve a subir sin un temporizador pegajoso.
+	local burstCap, burstWhy = 80, nil
+	if slowFramesInWindow >= 8 then
+		burstCap, burstWhy = 56, "rolling-lag-critical"
+	elseif slowFramesInWindow >= 6 then
+		burstCap, burstWhy = 62, "rolling-lag-burst"
+	elseif slowFramesInWindow >= 4 then
+		burstCap, burstWhy = 70, "rolling-lag"
+	end
+	if burstCap < safetyCap then
+		safetyCap = burstCap
+		safetyReason = burstWhy
+	end
+
+	-- Un intervalo aislado muy largo reduce solo ese comando; la ventana móvil decidirá si
+	-- hace falta conservar un límite más bajo por una racha de tirones.
 	local instantCap, instantWhy = 80, nil
 	if sampleDt >= 0.090 then
 		instantCap, instantWhy = 64, "single-frame-stall-critical"
@@ -7619,12 +7652,14 @@ local function ControllerStep(dt)
 	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
 	-- mantener el farm en 64 aunque el ping medio de las dos capturas ronda 117-133 ms.
 	local pingCap, pingWhy = 80, nil
-	if cachedPingMs >= 280 then
+	-- Usa el ping suavizado si ya está inicializado: una lectura alta aislada no cambia de perfil.
+	local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
+	if pingForSafety >= 260 then
 		pingCap, pingWhy = 54, "ping-critical"
-	elseif cachedPingMs >= 230 then
-		pingCap, pingWhy = 64, "ping-high"
-	elseif cachedPingMs >= 190 then
-		pingCap, pingWhy = 72, "ping-elevated"
+	elseif pingForSafety >= 205 then
+		pingCap, pingWhy = 62, "ping-high"
+	elseif pingForSafety >= 160 then
+		pingCap, pingWhy = 70, "ping-elevated"
 	end
 	if pingCap < 80 then
 		speed = math.min(speed, pingCap)
@@ -7639,8 +7674,9 @@ local function ControllerStep(dt)
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
-		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms solid=%d",
-			sliderSpeed, speed, safetyReason, sampleDt * 1000, frameDtEma * 1000, solidOverlapActive and 1 or 0))
+		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms slowFrames=%d pingEma=%.0f solid=%d",
+			sliderSpeed, speed, safetyReason, sampleDt * 1000, frameDtEma * 1000, slowFramesInWindow,
+			adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs, solidOverlapActive and 1 or 0))
 		CoinEngine.LastSafetyReason = safetyReason
 	end
 	CoinEngine.LastSafetyCap = speed
