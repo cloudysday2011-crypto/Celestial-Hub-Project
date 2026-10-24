@@ -6002,7 +6002,7 @@ local function UpdateDiagnosticSegment(root)
 	return diagnosticSegment
 end
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
-local SOLID_OVERLAP_CONFIRM_TIME = 1.00
+local SOLID_OVERLAP_CONFIRM_TIME = 0.45
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -7058,13 +7058,14 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	end
 	if #candidates == 0 then return nil end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
-	local checks = math.min(5, #candidates)
+	local checks = math.min(10, #candidates)
 	for i = 1, checks do
 		if HasClearCoinRoute(fromPos, candidates[i].coin) then
 			return candidates[i].coin
 		end
 	end
-	-- No ruta directa despejada entre los cinco mejores: no bloquear el farmeo por completo.
+	-- Si las diez rutas mas cortas estan obstruidas, mantener el fallback para no bloquear el farm.
+	-- El guard de solidos y el selector de objetivo revisan despues si hay una alternativa despejada.
 	return candidates[1].coin
 end
 
@@ -7507,11 +7508,13 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Recuperación ante tirones severos: no reanudar una ruta/moneda posiblemente obsoleta
-	-- después de un frame perdido. El próximo ciclo vuelve a elegir el objetivo desde la posición actual.
-	if tonumber(dt) and dt >= 0.10 then
+	-- Recuperación ante tirones: el último log llegó a 94.6 ms, justo por debajo del umbral
+	-- anterior de 100 ms. Al perder un intervalo largo, no continuar una trayectoria vieja.
+	-- Esto NO cambia el slider ni su límite: pausa brevemente, pone en cero la orden de este frame
+	-- (SafeControllerStep ya garantiza velocidad cero cuando velApplied=false) y recalcula la ruta.
+	if tonumber(dt) and dt >= 0.085 then
 		local hitchDt = tonumber(dt) or 0
-		local recovery = hitchDt >= 0.25 and 0.90 or 0.40
+		local recovery = hitchDt >= 0.25 and 0.90 or (hitchDt >= 0.12 and 0.55 or 0.35)
 		pauseUntil = math.max(pauseUntil, now + recovery)
 		currentSpeed = 0
 		CoinEngine.LastCommandVelocity = Vector3.zero
@@ -7658,10 +7661,16 @@ local function ControllerStep(dt)
 		else
 			cand = PickNearest(root.Position, nil, now)
 		end
-		if cand and cand ~= cur then
+		if cand and cand ~= cur and cur and cur.Parent then
 			local dc = CoinTravelScore(root.Position, cur.Position)
 			local dn = CoinTravelScore(root.Position, cand.Position)
 			local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
+			local currentRouteBlocked = not HasClearCoinRoute(root.Position, cur)
+			local candidateRouteClear = HasClearCoinRoute(root.Position, cand)
+			if currentRouteBlocked and candidateRouteClear then
+				shouldSwitch = true
+				LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1")
+			end
 			if CoinEngine.ThreatResponse.Active and not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
 				shouldSwitch = true
 			end
@@ -7681,21 +7690,26 @@ local function ControllerStep(dt)
 		if IsInsideSolid(root.Position) then
 			solidOverlapActive = true
 			solidOverlapSince = solidOverlapSince or now
-			if now - solidOverlapSince >= SOLID_OVERLAP_CONFIRM_TIME then
-				local target = CoinEngine.CurrentTarget
-				local targetDistance = target and (target.Position - root.Position).Magnitude or math.huge
-				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
-				if actualSpeed >= 12 and targetDistance > 8 and (now - lastProgress) >= 0.85 then
-					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1 confirm=1.00", actualSpeed, targetDistance))
-					-- Un solapamiento es habitual mientras NoClip cruza una pared. Solo abandonar
-					-- el objetivo si la ruta lleva tiempo sin progreso; la blacklist breve evita bucles.
-					if target then CoinEngine.Blacklist[target] = now + 1.0 end
-					SetCurrent(nil, now)
-					solidOverlapSince = nil
-				else
-					-- No cambiar de moneda por un contacto transitorio o mientras aún hay progreso.
-					solidOverlapSince = now
-				end
+			local target = CoinEngine.CurrentTarget
+			local targetDistance = target and target.Parent and (target.Position - root.Position).Magnitude or math.huge
+			local actualSpeed = root.AssemblyLinearVelocity.Magnitude
+			local routeBlocked = target and target.Parent and not HasClearCoinRoute(root.Position, target) or false
+			local overlapAge = now - solidOverlapSince
+			local stalled = (now - lastProgress) >= 0.55
+			if overlapAge >= SOLID_OVERLAP_CONFIRM_TIME and routeBlocked and actualSpeed >= 12 and targetDistance > 8 and stalled then
+				LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1 confirm=%.2f routeBlocked=1 stall=%.2f",
+					actualSpeed, targetDistance, overlapAge, now - lastProgress))
+				-- Cambiar de objetivo solo si hay solapamiento persistente, ruta obstruida y falta de progreso.
+				-- La blacklist temporal evita re-elegir enseguida la misma moneda tras el desvio.
+				CoinEngine.Blacklist[target] = now + 1.5
+				SetCurrent(nil, now)
+				solidOverlapSince = nil
+			elseif routeBlocked and targetDistance > 8 then
+				-- Conservar el inicio del solapamiento mientras la ruta siga bloqueada; no reiniciar
+				-- el reloj en cada chequeo, o el guard nunca acumularia tiempo suficiente para recuperarse.
+			else
+				-- No cambiar de moneda por un contacto transitorio o una ruta que ya esta despejada.
+				solidOverlapSince = now
 			end
 		else
 			solidOverlapActive = false
