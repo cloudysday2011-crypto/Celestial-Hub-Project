@@ -5938,6 +5938,15 @@ local INCIDENT_SIGNAL_MAX, CLIENT_OUTPUT_MAX = 48, 24
 local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
 local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
+local diagnosticRoot, diagnosticSegment = nil, 0
+local function UpdateDiagnosticSegment(root)
+	if root and root ~= diagnosticRoot then
+		diagnosticRoot = root
+		diagnosticSegment += 1
+		lastLogPos, lastLogAt = nil, nil
+	end
+	return diagnosticSegment
+end
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
 local SOLID_OVERLAP_CONFIRM_TIME = 1.00
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
@@ -5957,6 +5966,7 @@ local lastLogMs = 0        -- coste (ms) de la llamada a LogStep del frame anter
 local function HiResPush(now, dt, csMs)
 	local root = GetRoot()
 	if not root then return end
+	local segment = UpdateDiagnosticSegment(root)
 	local p, v = root.Position, root.AssemblyLinearVelocity
 	local tgt = CoinEngine.CurrentTarget
 	local hiHumanoid = GetHumanoid()
@@ -5967,8 +5977,8 @@ local function HiResPush(now, dt, csMs)
 	local verticalGap = math.abs(v.Y - commandedVelocity.Y)
 	hiResHead = hiResHead % HIRES_N + 1
 	hiRes[hiResHead] = string.format(
-		"t=%.3f dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
-		now, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
+		"t=%.3f seg=%d dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
+		now, segment, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
 		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
 		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
 		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
@@ -6259,6 +6269,7 @@ local function LogStep(now, dt, force)
 	nextLogAt = now + 0.25
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root then return end
+	local segment = UpdateDiagnosticSegment(root)
 	local p = root.Position
 	local tgt = CoinEngine.CurrentTarget
 	local targetPos = (tgt and tgt.Parent) and tgt.Position or Vector3.new(-1, -1, -1)
@@ -6287,8 +6298,8 @@ local function LogStep(now, dt, force)
 	end
 	local frameDt = (dt and dt > 0) and dt or lastFrameDt
 	local line = string.format(
-		"t=%.2f sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f speedCap=%.1f capWhy=%s risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
-		now, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
+		"t=%.2f seg=%d sdt=%.3f forced=%d pos=(%.1f,%.1f,%.1f) step=%.2f sampleSpd=%.1f vel=(%.1f,%.1f,%.1f) phys=%.1f vy=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f targetPos=(%.1f,%.1f,%.1f) targetName=%s threatDist=%.1f threatActive=%d selfMurderer=%d fps=%.0f fdt=%.1fms ping=%.0f state=%s platformStand=%s noclip=%s inSolid=%s coins=%d round=%s n=%d batch=%d/%d batchCoins=%d limit=%s batchPausing=%s pauseLeft=%.2f otiOn=%s afOn=%s sinceCollect=%.2f gc=%d slider=%.1f speedCap=%.1f capWhy=%s risk=%.2f steer=%.2f afps=%.1f aphys=%.1f ev=%s",
+		now, segment, sampleDt, force and 1 or 0, p.X, p.Y, p.Z,
 		sampleDelta, sampleSpeed,
 		physicalVelocity.X, physicalVelocity.Y, physicalVelocity.Z, physicalSpeed, physicalVelocity.Y,
 		commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
@@ -6805,6 +6816,15 @@ table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterRemoving:Conne
 			.. " round=" .. tostring(roundActive)
 			.. " farm=" .. tostring(State.FarmEnabled)
 			.. " noclip=" .. tostring(noclipOn), character)
+	if State.FarmEnabled then
+		-- No conservar una ruta/objetivo asociado al personaje que está desapareciendo.
+		StopFlight()
+		ResetPath()
+		lastRoot, lastSetPos = nil, nil
+		lastLogPos, lastLogAt = nil, nil
+		pauseUntil = math.max(pauseUntil, os.clock() + 1.0)
+		LogEvent("character-removing-cleanup hold=1.00 target-reset=1")
+	end
 end))
 
 table.insert(farmResetDiagnosticConnections, LocalPlayer.CharacterAdded:Connect(function(character)
@@ -13344,7 +13364,7 @@ local function SummarizeFarmLog(raw, kind)
 		physOverCmd = 0, normalOverCmd = 0, hiresOverCmd = 0, stateCounts = {}, normalMissingPing = 0, normalMissingFps = 0,
 		normalCmdGapSum = 0, normalCmdGapMax = 0, normalCmdGapN = 0, normalVGapSum = 0, normalVGapMax = 0, normalVGapN = 0,
 		hiresCmdGapSum = 0, hiresCmdGapMax = 0, hiresCmdGapN = 0, hiresVGapSum = 0, hiresVGapMax = 0, hiresVGapN = 0,
-		lastHiPos = nil, lastHiT = nil, declaredMetrics = nil,
+		lastHiPos = nil, lastHiT = nil, lastHiSegment = nil, declaredMetrics = nil,
 		hiDtOver80 = 0, hiDtOver120 = 0, hiDtOver250 = 0,
 		hiSolidGuardOn = 0, hiSolidGuardN = 0, hiCapOn = 0, hiCapN = 0,
 		hiCapCounts = {}, hiRows = {},
@@ -13443,6 +13463,12 @@ local function SummarizeFarmLog(raw, kind)
 				toCoin = num(line, "toCoin"),
 			}
 			if cmd and phys and math.abs(math.abs(phys) - math.abs(cmd)) > 15 then data.physOverCmd += 1; data.hiresOverCmd += 1 end
+			local segment = num(line, "seg")
+			if segment ~= nil and segment ~= data.lastHiSegment then
+				-- Separar posiciones de distintas instancias de personaje (respawn/reset).
+				data.lastHiPos = nil
+				data.lastHiSegment = segment
+			end
 			local px, py, pz = line:match("pos=%(([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)%)")
 			px, py, pz = tonumber(px), tonumber(py), tonumber(pz)
 			if px and py and pz then
