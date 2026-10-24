@@ -1,6 +1,7 @@
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
--- V3.22 Stability Envelope Tuned 2: recover from severe frame stalls and avoid rerouting on transient solid overlap.
+-- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
+-- Keeps Tuned 3 Auto-Farm movement and NoClip behavior unchanged; no private server APIs are queried.
 -- Auto-Farm NoClip behavior is preserved from the prior version; collisions are restored when flight stops.
 -- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
 -- ====================================================================
@@ -776,18 +777,8 @@ local function ShowKickLogLoadingGui()
 	scanGui.IgnoreGuiInset = true
 	scanGui.Parent = CoreGui
 
-	-- Full-screen backdrop prevents a partly-built Kick/Reset panel from peeking
-	-- around the smaller spinner window. The log is revealed only after layout settles.
-	local backdrop = Instance.new("Frame")
-	backdrop.Name = "LoadingBackdrop"
-	backdrop.Size = UDim2.fromScale(1, 1)
-	backdrop.Position = UDim2.fromScale(0, 0)
-	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
-	backdrop.BackgroundTransparency = 0
-	backdrop.BorderSizePixel = 0
-	backdrop.ZIndex = 1
-	backdrop.Parent = scanGui
-
+	-- No fullscreen backdrop: only the compact loading window should cover the game.
+	-- The ScreenGui root is transparent and does not darken or block the rest of the screen.
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "ScanningFrame"
 	mainFrame.ZIndex = 2
@@ -846,18 +837,8 @@ local function ShowResetLogLoadingGui()
 	scanGui.IgnoreGuiInset = true
 	scanGui.Parent = CoreGui
 
-	-- Full-screen backdrop prevents a partly-built Kick/Reset panel from peeking
-	-- around the smaller spinner window. The log is revealed only after layout settles.
-	local backdrop = Instance.new("Frame")
-	backdrop.Name = "LoadingBackdrop"
-	backdrop.Size = UDim2.fromScale(1, 1)
-	backdrop.Position = UDim2.fromScale(0, 0)
-	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
-	backdrop.BackgroundTransparency = 0
-	backdrop.BorderSizePixel = 0
-	backdrop.ZIndex = 1
-	backdrop.Parent = scanGui
-
+	-- No fullscreen backdrop: only the compact loading window should cover the game.
+	-- The ScreenGui root is transparent and does not darken or block the rest of the screen.
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "ScanningFrame"
 	mainFrame.ZIndex = 2
@@ -5788,11 +5769,13 @@ end
 -- ---------------------------------------------------------------
 
 local logBuf, pendingEvents = {}, {}
+local incidentSignals, clientOutputHistory = {}, {}
+local INCIDENT_SIGNAL_MAX, CLIENT_OUTPUT_MAX = 48, 24
 local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
 local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
-local SOLID_OVERLAP_CONFIRM_TIME = 0.60
+local SOLID_OVERLAP_CONFIRM_TIME = 1.00
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -5843,6 +5826,176 @@ local function HiResDump()
 	return table.concat(out, "\n")
 end
 
+local function CleanIncidentText(value, maxLength)
+	return tostring(value or "?"):gsub("[%c|]", " "):gsub("%s+", " "):sub(1, maxLength or 220)
+end
+
+-- Evidence buffer is strictly client-observable. Roblox does not expose private server logs,
+-- anti-cheat rules, or the exact validator decision to a LocalScript.
+local function PushIncidentSignal(source, detail)
+	local row = string.format("t=%.3f source=%s detail=%s", os.clock(),
+		CleanIncidentText(source, 48):gsub("%s+", "_"), CleanIncidentText(detail, 220))
+	incidentSignals[#incidentSignals + 1] = row
+	while #incidentSignals > INCIDENT_SIGNAL_MAX do table.remove(incidentSignals, 1) end
+end
+
+local function IsRelevantClientOutput(message, messageType)
+	local body = string.lower(tostring(message or ""))
+	local kind = string.lower(tostring(messageType or ""))
+	if kind:find("error", 1, true) then return true end
+	local keywords = {"warning", "invalid position", "disconnect", "kicked", "teleport", "replicat", "network", "physics", "heartbeat", "timeout", "character", "position", "velocity", "remote event", "queue exhausted", "failed to", "server lost"}
+	for _, keyword in ipairs(keywords) do
+		if body:find(keyword, 1, true) then return true end
+	end
+	return false
+end
+
+local function PushClientOutput(message, messageType, timestamp)
+	message = CleanIncidentText(message, 260)
+	if message == "" or not IsRelevantClientOutput(message, messageType) then return end
+	local kind = CleanIncidentText(messageType, 40):gsub("%s+", "_")
+	local last = clientOutputHistory[#clientOutputHistory]
+	if last and last:find("msg=" .. message, 1, true) then return end
+	clientOutputHistory[#clientOutputHistory + 1] = string.format("t=%.3f type=%s msg=%s", tonumber(timestamp) or os.clock(), kind, message)
+	while #clientOutputHistory > CLIENT_OUTPUT_MAX do table.remove(clientOutputHistory, 1) end
+end
+
+local function BuildClientIncidentContext(reason)
+	local rows = {
+		"--- CLIENT-OBSERVED INCIDENT CONTEXT (not private server logs) ---",
+		"capture-local-clock=" .. string.format("%.3f", os.clock()),
+		"reason=" .. CleanIncidentText(reason, 180),
+		"placeId=" .. tostring(game.PlaceId) .. " placeVersion=" .. tostring(game.PlaceVersion),
+	}
+	local serverClock = "unavailable"
+	pcall(function() serverClock = string.format("%.3f", Workspace:GetServerTimeNow()) end)
+	rows[#rows + 1] = "client-estimated-server-time=" .. serverClock
+
+	local root, hum = GetRoot(), GetHumanoid()
+	local pos, vel = Vector3.zero, Vector3.zero
+	local rootAnchored = "unknown"
+	if root then
+		pcall(function() pos = root.Position; vel = root.AssemblyLinearVelocity; rootAnchored = tostring(root.Anchored) end)
+	end
+	local stateText, healthText, platformText = "missing", "?", "?"
+	if hum then
+		pcall(function()
+			stateText = tostring(hum:GetState())
+			healthText = string.format("%.1f/%.1f", hum.Health, hum.MaxHealth)
+			platformText = tostring(hum.PlatformStand)
+		end)
+	end
+	local insideSolid = "unknown"
+	if root then pcall(function() insideSolid = tostring(IsInsideSolid(pos)) end) end
+	local target = CoinEngine.CurrentTarget
+	local targetInfo = "none"
+	if target and target.Parent then
+		local targetDist = -1
+		pcall(function() targetDist = (target.Position - pos).Magnitude end)
+		targetInfo = CleanIncidentText(target.Name, 80) .. ";distance=" .. string.format("%.2f", targetDist)
+	end
+	local localPing = "unavailable"
+	pcall(function() localPing = string.format("%.0fms", LocalPlayer:GetNetworkPing() * 1000) end)
+	rows[#rows + 1] = string.format(
+		"local-state farm=%s round=%s slider=%.1f cap=%.1f capWhy=%s cmd=%.2f phys=%.2f pingStats=%.0fms pingPlayer=%s frameDt=%.1fms fpsEstimate=%.1f noclipFlag=%s solidGuard=%s inSolidCheck=%s",
+		tostring(State and State.FarmEnabled), tostring(roundActive), tonumber(State and State.TweenSpeed) or -1,
+		tonumber(CoinEngine.LastSafetyCap) or 80, CleanIncidentText(CoinEngine.LastSafetyReason or "normal", 64),
+		(CoinEngine.LastCommandVelocity and CoinEngine.LastCommandVelocity.Magnitude) or 0, vel.Magnitude,
+		tonumber(cachedPingMs) or -1, localPing, (tonumber(lastFrameDt) or 0) * 1000,
+		(tonumber(lastFrameDt) or 0) > 0 and (1 / lastFrameDt) or -1,
+		tostring(noclipOn), tostring(solidOverlapActive), insideSolid)
+	rows[#rows + 1] = string.format("character state=%s health=%s platformStand=%s rootExists=%s rootAnchored=%s pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f,%.2f) target=%s",
+		CleanIncidentText(stateText, 80), healthText, platformText, tostring(root ~= nil), rootAnchored,
+		pos.X, pos.Y, pos.Z, vel.X, vel.Y, vel.Z, targetInfo)
+
+	rows[#rows + 1] = "--- RECENT CHARACTER / TELEPORT SIGNALS ---"
+	if #incidentSignals == 0 then
+		rows[#rows + 1] = "no buffered signals"
+	else
+		for _, signal in ipairs(incidentSignals) do rows[#rows + 1] = signal end
+	end
+	rows[#rows + 1] = "--- FILTERED CLIENT ERROR/WARNING OUTPUT ---"
+	if #clientOutputHistory == 0 then
+		rows[#rows + 1] = "no matching local output captured"
+	else
+		for _, output in ipairs(clientOutputHistory) do rows[#rows + 1] = output end
+	end
+
+	-- Best-effort snapshot from the client's own output history. Only relevant errors/warnings
+	-- are included; this is not a fetch of server console or hidden game state.
+	local historyLines = {}
+	pcall(function()
+		local logService = game:GetService("LogService")
+		local history = logService:GetLogHistory()
+		if type(history) ~= "table" then return end
+		for i = #history, math.max(1, #history - 100), -1 do
+			local entry = history[i]
+			if entry then
+				local message = entry.message or entry.Message or ""
+				local kind = entry.messageType or entry.MessageType or "?"
+				if IsRelevantClientOutput(message, kind) then
+					local stamp = tonumber(entry.timestamp or entry.Timestamp) or os.clock()
+					historyLines[#historyLines + 1] = string.format("t=%.3f type=%s msg=%s", stamp,
+						CleanIncidentText(kind, 40):gsub("%s+", "_"), CleanIncidentText(message, 260))
+					if #historyLines >= 12 then break end
+				end
+			end
+		end
+	end)
+	if #historyLines > 0 then
+		rows[#rows + 1] = "--- RECENT MATCHING LOGSERVICE HISTORY (client-visible only) ---"
+		for i = #historyLines, 1, -1 do rows[#rows + 1] = historyLines[i] end
+	end
+	rows[#rows + 1] = "LIMIT: LocalScript cannot inspect private server console, hidden anti-cheat rules, or the exact server validator decision; entries above are observable client evidence only."
+	return table.concat(rows, "\n")
+end
+
+local function InstallIncidentObservers()
+	if _G.Celestial.IncidentObserverConnections then
+		for _, oldConnection in ipairs(_G.Celestial.IncidentObserverConnections) do
+			pcall(function() oldConnection:Disconnect() end)
+		end
+	end
+	local connections = {}
+	_G.Celestial.IncidentObserverConnections = connections
+	local function track(signal, callback)
+		local ok, connection = pcall(function() return signal:Connect(callback) end)
+		if ok and connection then connections[#connections + 1] = connection end
+	end
+	local logService
+	pcall(function() logService = game:GetService("LogService") end)
+	if logService then
+		track(logService.MessageOut, function(message, messageType)
+			if IsRelevantClientOutput(message, messageType) then PushClientOutput(message, messageType, os.clock()) end
+		end)
+	end
+	track(LocalPlayer.CharacterRemoving, function(character)
+		PushIncidentSignal("character-removing", "name=" .. CleanIncidentText(character and character.Name, 80))
+	end)
+	local function watchCharacter(character)
+		PushIncidentSignal("character-added", "name=" .. CleanIncidentText(character and character.Name, 80))
+		local hum = character and character:FindFirstChildOfClass("Humanoid")
+		if not hum then return end
+		track(hum.Died, function() PushIncidentSignal("humanoid-died", "health=" .. tostring(hum.Health)) end)
+		track(hum.StateChanged, function(oldState, newState)
+			local stateName = tostring(newState)
+			if stateName:find("Dead", 1, true) or stateName:find("PlatformStanding", 1, true)
+				or stateName:find("Physics", 1, true) or stateName:find("FallingDown", 1, true)
+				or stateName:find("GettingUp", 1, true) or stateName:find("Freefall", 1, true) then
+				PushIncidentSignal("humanoid-state", tostring(oldState) .. "->" .. stateName)
+			end
+		end)
+	end
+	if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
+	track(LocalPlayer.CharacterAdded, watchCharacter)
+	pcall(function()
+		track(LocalPlayer.OnTeleport, function(teleportState, placeId)
+			PushIncidentSignal("teleport-state", tostring(teleportState) .. " placeId=" .. tostring(placeId or game.PlaceId))
+		end)
+	end)
+	PushIncidentSignal("observer", "client-observable diagnostic hooks armed")
+end
+
 local function LogEvent(tag)
 	if logFinalized then return end
 	if #pendingEvents >= 8 then table.remove(pendingEvents, 1) end   -- conserva los eventos MAS recientes
@@ -5852,11 +6005,16 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard\n" .. table.concat(logBuf, "\n")
-	if forceOverwrite then   -- volcado final (kick / safety-stop): añade los ultimos frames
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
 			payload = payload .. "\n--- HI-RES: ultimos " .. hiResCount .. " frames (1 linea por frame) ---\n" .. dump
+		end
+		local okContext, context = pcall(BuildClientIncidentContext, reason)
+		if okContext and type(context) == "string" and context ~= "" then
+			payload = payload .. "\n" .. context
+			pcall(writefile, "CelestialFarmIncidentContext.txt", context)
 		end
 	end
 	pcall(writefile, "CelestialFarmLog.txt", payload)
@@ -5871,12 +6029,16 @@ local function ResetDiagnosticLog()
 	table.clear(logBuf)
 	table.clear(pendingEvents)
 	table.clear(hiRes)
+	table.clear(incidentSignals)
+	table.clear(clientOutputHistory)
 	hiResHead, hiResCount, hiTag = 0, 0, nil
 	nextLogAt, nextFlushAt = 0, 0
 	lastLogPos, lastLogAt = nil, nil
 	nextSolidGuardCheck, solidOverlapSince = 0, nil
 	LogEvent("diagnostic-restarted")
 end
+
+InstallIncidentObservers()
 
 -- V3.3: contador REAL de monedas del juego (indicador de la esquina inferior izquierda de MM2).
 -- Candidatos = textos numericos visibles en esa esquina de PlayerGui. Se elige el que CAMBIA de valor
@@ -6029,7 +6191,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 4 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard",
+				"log-schema: 5 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -7233,9 +7395,9 @@ local function ControllerStep(dt)
 	SetStatus(CoinEngine.ThreatResponse.Active and "threat-routing" or "farming")
 	EnsureFlight(root, hum)
 
-	-- Recuperacion adaptativa: no apaga el Farm ni introduce pausas.
-	-- Si persiste un solapamiento, evita insistir con el mismo objetivo y selecciona otra ruta;
-	-- el limite temporal solo se reduce durante cuadros lentos / solapamiento confirmado.
+	-- Recuperacion adaptativa: evita cambiar de objetivo por solapamientos transitorios.
+	-- El NoClip puede cruzar geometria; solo se redirige tras solapamiento sostenido y falta de progreso.
+	-- La velocidad efectiva tambien considera los picos de ping medidos.
 	if now >= nextSolidGuardCheck then
 		nextSolidGuardCheck = now + 0.12
 		if IsInsideSolid(root.Position) then
@@ -7245,16 +7407,15 @@ local function ControllerStep(dt)
 				local target = CoinEngine.CurrentTarget
 				local targetDistance = target and (target.Position - root.Position).Magnitude or math.huge
 				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
-				if actualSpeed >= 10 and targetDistance > 4 and (now - lastProgress) >= 0.45 then
-					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1", actualSpeed, targetDistance))
-					if target then CoinEngine.Blacklist[target] = now + 2.5 end
-					-- No resetear currentSpeed ni la velocidad física: el siguiente objetivo se procesa
-					-- en este mismo ciclo y ApplyStableFlightVelocity suaviza el cambio de dirección.
+				if actualSpeed >= 12 and targetDistance > 8 and (now - lastProgress) >= 0.85 then
+					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1 confirm=1.00", actualSpeed, targetDistance))
+					-- Un solapamiento es habitual mientras NoClip cruza una pared. Solo abandonar
+					-- el objetivo si la ruta lleva tiempo sin progreso; la blacklist breve evita bucles.
+					if target then CoinEngine.Blacklist[target] = now + 1.0 end
 					SetCurrent(nil, now)
 					solidOverlapSince = nil
 				else
-					-- Cerca de una moneda o a baja velocidad puede ser un solapamiento de medición.
-					-- Confirmar de nuevo sin interrumpir el movimiento.
+					-- No cambiar de moneda por un contacto transitorio o mientras aún hay progreso.
 					solidOverlapSince = now
 				end
 			end
@@ -7269,8 +7430,8 @@ local function ControllerStep(dt)
 	local speed = sliderSpeed
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-	-- El ultimo LOG mostro dt maximo de 63.7 ms: no alcanzo el umbral critico anterior de 65 ms.
-	-- Ahora el sobre reacciona en tres niveles y mantiene cada reduccion brevemente para evitar oscilaciones.
+	-- El sobre de velocidad responde a cuadros lentos con retencion breve para evitar oscilaciones;
+	-- el ping se aplica despues como limite adicional, sin alterar el slider visible.
 	local holdUntil = tonumber(CoinEngine.SpeedSafetyHoldUntil) or 0
 	local holdCap = tonumber(CoinEngine.SpeedSafetyHoldCap) or 80
 	if sampleDt >= 0.055 then
@@ -7291,12 +7452,26 @@ local function ControllerStep(dt)
 	end
 	CoinEngine.SpeedSafetyHoldUntil = holdUntil
 	CoinEngine.SpeedSafetyHoldCap = holdCap
+	-- Red de seguridad para picos de latencia: no modifica NoClip ni el slider; solo limita
+	-- temporalmente la velocidad efectiva mientras el ping medido es alto.
+	local pingCap, pingWhy = 80, nil
+	if cachedPingMs >= 230 then
+		pingCap, pingWhy = 50, "ping-critical"
+	elseif cachedPingMs >= 190 then
+		pingCap, pingWhy = 56, "ping-high"
+	elseif cachedPingMs >= 160 then
+		pingCap, pingWhy = 64, "ping-elevated"
+	end
+	if pingCap < 80 then
+		speed = math.min(speed, pingCap)
+		if safetyReason == "normal" then safetyReason = pingWhy else safetyReason = safetyReason .. "+" .. pingWhy end
+	end
 	-- Con NoClip activo, el mero solapamiento con una pared puede ser transitorio mientras se atraviesa.
 	-- Recortar velocidad solo si el solapamiento persiste y además no hay progreso hacia el objetivo.
 	local solidStall = solidOverlapActive and solidOverlapSince ~= nil
-		and (now - solidOverlapSince) >= 0.30 and (now - lastProgress) >= 0.45
-	if solidStall and speed > 44 then
-		speed = 44
+		and (now - solidOverlapSince) >= 0.85 and (now - lastProgress) >= 0.85
+	if solidStall and speed > 50 then
+		speed = 50
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
@@ -7545,6 +7720,7 @@ CoinEngine.KickConn = game:GetService("GuiService").ErrorMessageChanged:Connect(
 		or normalizedMessage:find("removed from the game", 1, true)
 		or normalizedMessage:find("invalid position", 1, true)
 	if explicitKick then
+		PushIncidentSignal("gui-error", cleanMessage)
 		LogEvent("KICK: " .. cleanMessage)
 		pcall(LogStep, os.clock(), 0, true)
 		logFinalized = true
@@ -7559,6 +7735,7 @@ CoinEngine.KickConn = game:GetService("GuiService").ErrorMessageChanged:Connect(
 		ResetPath()
 		SetStatus("kick-detected")
 	else
+		PushIncidentSignal("gui-error", cleanMessage)
 		LogEvent("GUI-ERROR: " .. cleanMessage)
 		pcall(LogStep, os.clock(), 0, true)
 	end
@@ -12910,6 +13087,9 @@ local function SummarizeFarmLog(raw, kind)
 		normalCmdGapSum = 0, normalCmdGapMax = 0, normalCmdGapN = 0, normalVGapSum = 0, normalVGapMax = 0, normalVGapN = 0,
 		hiresCmdGapSum = 0, hiresCmdGapMax = 0, hiresCmdGapN = 0, hiresVGapSum = 0, hiresVGapMax = 0, hiresVGapN = 0,
 		lastHiPos = nil, lastHiT = nil, declaredMetrics = nil,
+		hiDtOver80 = 0, hiDtOver120 = 0, hiDtOver250 = 0,
+		hiSolidGuardOn = 0, hiSolidGuardN = 0, hiCapOn = 0, hiCapN = 0,
+		hiCapCounts = {}, hiRows = {},
 	}
 	data.declaredMetrics = schema:match("metrics=([^\r\n]+)")
 	local inHires = false
@@ -12976,11 +13156,34 @@ local function SummarizeFarmLog(raw, kind)
 				data.hiresDtSum += dtMs / 1000
 				data.hiresDtCount += 1
 				data.hiresDtMax = math.max(data.hiresDtMax, dtMs)
+				if dtMs >= 80 then data.hiDtOver80 += 1 end
+				if dtMs >= 120 then data.hiDtOver120 += 1 end
+				if dtMs >= 250 then data.hiDtOver250 += 1 end
 				local inferredFps = 1000 / dtMs
 				push(data.hiresInferredFps, inferredFps)
 				if inferredFps < 25 then data.hiresLowFps += 1 end
 				if inferredFps < 10 then data.hiresVeryLowFps += 1 end
 			end
+			local speedCap = num(line, "speedCap")
+			local capWhy = line:match("%f[%w_]capWhy=([^%s]+)")
+			local solidGuard = num(line, "solidGuard")
+			if speedCap then
+				data.hiCapN += 1
+				if speedCap < 79.9 then
+					data.hiCapOn += 1
+					local why = capWhy or "unspecified"
+					data.hiCapCounts[why] = (data.hiCapCounts[why] or 0) + 1
+				end
+			end
+			if solidGuard ~= nil then
+				data.hiSolidGuardN += 1
+				if solidGuard > 0 then data.hiSolidGuardOn += 1 end
+			end
+			data.hiRows[#data.hiRows + 1] = {
+				t = num(line, "t"), dtMs = dtMs, ping = ping, cmd = cmd, phys = phys,
+				speedCap = speedCap, capWhy = capWhy, solidGuard = solidGuard,
+				toCoin = num(line, "toCoin"),
+			}
 			if cmd and phys and math.abs(math.abs(phys) - math.abs(cmd)) > 15 then data.physOverCmd += 1; data.hiresOverCmd += 1 end
 			local px, py, pz = line:match("pos=%(([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)%)")
 			px, py, pz = tonumber(px), tonumber(py), tonumber(pz)
@@ -13006,12 +13209,31 @@ local function SummarizeFarmLog(raw, kind)
 		local n = tonumber(value)
 		if n then data.sliderMax = data.sliderMax and math.max(data.sliderMax, n) or n; data.sliderMin = data.sliderMin and math.min(data.sliderMin, n) or n end
 	end
+	local tail = { count = 0, dtMax = 0, pingMax = -1, cmdMax = 0, capMin = math.huge, guardOn = 0, guardN = 0, capOn = 0, capN = 0 }
+	local lastHiTime = data.hiresTimeMax
+	if lastHiTime > -math.huge then
+		for _, row in ipairs(data.hiRows) do
+			if row.t and row.t >= lastHiTime - 1.5 then
+				tail.count += 1
+				if row.dtMs then tail.dtMax = math.max(tail.dtMax, row.dtMs) end
+				if row.ping then tail.pingMax = math.max(tail.pingMax, row.ping) end
+				if row.cmd then tail.cmdMax = math.max(tail.cmdMax, math.abs(row.cmd)) end
+				if row.speedCap then
+					tail.capN += 1
+					tail.capMin = math.min(tail.capMin, row.speedCap)
+					if row.speedCap < 79.9 then tail.capOn += 1 end
+				end
+				if row.solidGuard ~= nil then tail.guardN += 1; if row.solidGuard > 0 then tail.guardOn += 1 end end
+			end
+		end
+	end
+	data.tail = tail
 	local normalDuration = (data.normalTimeMax > data.normalTimeMin and data.normalTimeMin < math.huge)
 		and (data.normalTimeMax - data.normalTimeMin) or nil
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.21",
+		"CH " .. kind .. " SUMMARY | analizador=3.22-client-context",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
@@ -13054,6 +13276,21 @@ local function SummarizeFarmLog(raw, kind)
 		if #data.hiresInferredFps.values > 0 then
 			out[#out + 1] = string.format("HI-RES: intervalos equivalentes a <25 FPS=%d/%d (%.1f%%) | <10 FPS=%d | dt máximo=%.1f ms",
 				data.hiresLowFps, #data.hiresInferredFps.values, pct(data.hiresLowFps, #data.hiresInferredFps.values), data.hiresVeryLowFps, data.hiresDtMax)
+			out[#out + 1] = string.format("Tirones HI-RES: dt >=80ms=%d | >=120ms=%d | >=250ms=%d (ventana completa)", data.hiDtOver80, data.hiDtOver120, data.hiDtOver250)
+		end
+		if data.hiCapN > 0 then
+			local capReasons = {}
+			for why, count in pairs(data.hiCapCounts) do capReasons[#capReasons + 1] = why .. "=" .. count end
+			table.sort(capReasons)
+			out[#out + 1] = string.format("Protección HI-RES: límite inferior a 80 en %d/%d frames (%.1f%%); razones=%s; solidGuard activo=%d/%d frames",
+				data.hiCapOn, data.hiCapN, pct(data.hiCapOn, data.hiCapN), #capReasons > 0 and table.concat(capReasons, ",") or "ninguna registrada",
+				data.hiSolidGuardOn, data.hiSolidGuardN)
+		end
+		if data.tail then
+			out[#out + 1] = string.format("Ventana previa (últimos 1.5 s HI-RES): frames=%d | dt máx.=%.1f ms | ping máx.=%s | cmd máx.=%.1f | cap mínimo=%s | solidGuard=%d/%d frames",
+				data.tail.count, data.tail.dtMax, data.tail.pingMax >= 0 and (string.format("%.0f ms", data.tail.pingMax)) or "no disponible",
+				data.tail.cmdMax, data.tail.capMin < math.huge and string.format("%.1f", data.tail.capMin) or "no disponible",
+				data.tail.guardOn, data.tail.guardN)
 		end
 		out[#out + 1] = string.format("Estado (muestras normales): inSolid=%d/%d (%.1f%%) | noclip=%d/%d (%.1f%%) | PlatformStand=%d/%d (%.1f%%)",
 			data.solid, data.regular, pct(data.solid, data.regular), data.noclip, data.regular, pct(data.noclip, data.regular), data.platform, data.regular, pct(data.platform, data.regular))
@@ -13083,8 +13320,59 @@ local function SummarizeFarmLog(raw, kind)
 		end
 		if data.hiStepOver5 > 0 then clues[#clues + 1] = string.format("%d transiciones HI-RES superaron 5 studs entre posiciones guardadas", data.hiStepOver5) end
 		out[#out + 1] = "Lectura basada en medidas: el archivo registra invalid-position-final; eso confirma el evento, no la causa única. "
-			.. (#clues > 0 and ("Indicios concurrentes: " .. table.concat(clues, "; ") .. ".") or "No hay métricas suficientes para separar las causas.")
-		out[#out + 1] = "Limitación causal: ninguna métrica de este archivo revela la regla interna que rechazó la posición. Los indicadores son correlaciones temporales, no prueba de qué disparó el kick."
+			.. (#clues > 0 and ("Indicios de toda la ventana: " .. table.concat(clues, "; ") .. ".") or "No hay métricas suficientes para separar las causas.")
+		local hypotheses = {}
+		if data.tail and (data.tail.pingMax >= 180 or data.tail.dtMax >= 80) then
+			hypotheses[#hypotheses + 1] = "1) latencia/tirón reciente: evidencia temporal en los últimos 1.5 s; confianza orientativa MEDIA"
+		end
+		if (data.tail and data.tail.guardOn > 0) or raw:find("solid-overlap-reroute", 1, true) then
+			hypotheses[#hypotheses + 1] = "2) ruta o colisión cerca de sólidos: guard/cambio de ruta registrado; confianza orientativa MEDIA"
+		end
+		if data.tail and data.tail.capOn > 0 then
+			hypotheses[#hypotheses + 1] = "3) el limitador estaba activo justo antes del volcado; el evento persistió con límite reducido, así que velocidad alta por sí sola queda menos respaldada por esta ventana"
+		elseif data.cmdMax >= 60 then
+			hypotheses[#hypotheses + 1] = "3) comando de movimiento elevado en parte de la ventana; no se confirma como causa"
+		end
+		if #hypotheses == 0 then hypotheses[#hypotheses + 1] = "No se puede priorizar una hipótesis con las muestras disponibles." end
+		out[#out + 1] = "Pistas priorizadas (solo correlación, no causas del servidor): " .. table.concat(hypotheses, " | ")
+		local outputErrorCount, seenOutputErrors = 0, {}
+		for line in raw:gmatch("[^\r\n]+") do
+			if line:find("type=Enum.MessageType.MessageError", 1, true) or line:find("type=MessageError", 1, true) then
+				local message = line:match("msg=(.*)$") or line
+				if not seenOutputErrors[message] then seenOutputErrors[message] = true; outputErrorCount += 1 end
+			end
+		end
+		out[#out + 1] = "Contexto local extra: " .. (raw:find("CLIENT-OBSERVED INCIDENT CONTEXT", 1, true) and "capturado" or "no disponible") .. "; mensajes de error visibles en cliente=" .. tostring(outputErrorCount)
+		local recentClientMessages, recentSignalLines = {}, {}
+		local collectOutput, collectSignals = false, false
+		for line in raw:gmatch("[^\r\n]+") do
+			if line:find("--- FILTERED CLIENT ERROR/WARNING OUTPUT ---", 1, true) then
+				collectOutput, collectSignals = true, false
+			elseif line:find("--- RECENT MATCHING LOGSERVICE HISTORY", 1, true) then
+				collectOutput, collectSignals = true, false
+			elseif line:find("--- RECENT CHARACTER / TELEPORT SIGNALS ---", 1, true) then
+				collectOutput, collectSignals = false, true
+			elseif line:sub(1, 3) == "---" or line:find("LIMIT:", 1, true) then
+				collectOutput, collectSignals = false, false
+			elseif collectOutput and line:find("type=", 1, true) and line:find("msg=", 1, true) then
+				recentClientMessages[#recentClientMessages + 1] = line:sub(1, 220)
+			elseif collectSignals and line:find("source=", 1, true) then
+				recentSignalLines[#recentSignalLines + 1] = line:sub(1, 180)
+			end
+		end
+		if #recentClientMessages > 0 then
+			local beginAt = math.max(1, #recentClientMessages - 2)
+			local selected = {}
+			for i = beginAt, #recentClientMessages do selected[#selected + 1] = recentClientMessages[i] end
+			out[#out + 1] = "Mensajes visibles más recientes (muestra filtrada): " .. table.concat(selected, " | ")
+		end
+		if #recentSignalLines > 0 then
+			local beginAt = math.max(1, #recentSignalLines - 3)
+			local selected = {}
+			for i = beginAt, #recentSignalLines do selected[#selected + 1] = recentSignalLines[i] end
+			out[#out + 1] = "Señales recientes del personaje: " .. table.concat(selected, " | ")
+		end
+		out[#out + 1] = "Limitación causal: el cliente no recibe acceso al registro privado del servidor ni a la decisión interna del validador. El nuevo contexto solo añade errores/advertencias visibles, cambios de personaje y estado replicado/medido en el cliente; se necesita un log del servidor autorizado para conocer una razón interna real."
 	elseif classification == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 		out[#out + 1] = "Lectura: la telemetría clasificó el evento como posible reset durante el farmeo; revisa la secuencia de CharacterRemoving/CharacterAdded y la ronda. No confirma el origen en servidor/juego."
 	elseif classification == "NORMAL_ROUND_TRANSITION" then
@@ -13107,6 +13395,10 @@ local function SummarizeFarmLog(raw, kind)
 		["motion-discrepancy"] = countText("motion-discrepancy"),
 		["coin-collected"] = countText("coin-collected"),
 		["safety-stop"] = countText("SAFETY-STOP"),
+		["client-character-removing"] = countText("source=character-removing"),
+		["client-humanoid-died"] = countText("source=humanoid-died"),
+		["client-teleport-state"] = countText("source=teleport-state"),
+		["client-output-errors"] = countText("type=Enum.MessageType.MessageError"),
 	}
 	local events = {}
 	for name, count in pairs(eventCounts) do if count > 0 then events[#events + 1] = name .. "=" .. count end end
