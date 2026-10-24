@@ -5454,6 +5454,8 @@ local cachedPingMs, nextPingAt = 80, 0
 local adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = 1, 0, 60, 0
 local adaptivePingEmaMs, adaptiveFPSEma, adaptiveSpeedEma = 80, 60, 0
 local adaptiveEmaInitialized = false
+-- Safety frame-time EMA is deliberately sample-smoothed: one isolated hitch must not pin the farm at a low cap.
+local adaptiveSafetyFrameDtEma = 1 / 60
 local nextAdaptiveProfileLogAt = 0
 
 -- ===== Estado: detector de ronda + lotes FIJOS de monedas + vuelo (config en CoinEngine) =====
@@ -7581,37 +7583,48 @@ local function ControllerStep(dt)
 	local speed = sliderSpeed
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-	-- El sobre de velocidad responde a cuadros lentos con retencion breve para evitar oscilaciones;
-	-- el ping se aplica despues como limite adicional, sin alterar el slider visible.
-	local holdUntil = tonumber(CoinEngine.SpeedSafetyHoldUntil) or 0
-	local holdCap = tonumber(CoinEngine.SpeedSafetyHoldCap) or 80
-	if sampleDt >= 0.055 then
-		holdCap = math.min(holdCap, 54)
-		holdUntil = math.max(holdUntil, now + 0.45)
-	elseif sampleDt >= 0.040 then
-		holdCap = now < holdUntil and math.min(holdCap, 62) or 62
-		holdUntil = math.max(holdUntil, now + 0.35)
-	elseif sampleDt >= 0.030 then
-		holdCap = now < holdUntil and math.min(holdCap, 72) or 72
-		holdUntil = math.max(holdUntil, now + 0.25)
+	-- Fix de estabilidad V3.22: el limitador previo retenia el cap mas bajo y cada frame de 30-55 ms
+	-- reiniciaba el temporizador. Con tirones intermitentes eso dejaba cmd/phys clavados en 54
+	-- incluso cuando la cadencia volvía a la normalidad. Ahora se usa EMA + cap instantaneo breve.
+	-- La EMA se actualiza por muestra (alpha fijo), para que un unico dt largo no contamine medio segundo.
+	local safeSampleDt = math.clamp(sampleDt, 1 / 240, 0.25)
+	adaptiveSafetyFrameDtEma = adaptiveSafetyFrameDtEma + (safeSampleDt - adaptiveSafetyFrameDtEma) * 0.08
+	local frameDtEma = adaptiveSafetyFrameDtEma
+	local safetyCap = 80
+	if frameDtEma >= 0.055 then
+		safetyCap, safetyReason = 58, "sustained-low-fps-critical"
+	elseif frameDtEma >= 0.045 then
+		safetyCap, safetyReason = 68, "sustained-low-fps"
+	elseif frameDtEma >= 0.035 then
+		safetyCap, safetyReason = 76, "sustained-frame-time"
 	end
-	if now >= holdUntil then
-		holdCap = 80
-	else
-		if holdCap <= 55 then safetyReason = "low-fps-critical" else safetyReason = "low-fps" end
-		speed = math.min(speed, holdCap)
+	-- Una pausa aislada solo limita este comando; el controlador de aceleracion ya suaviza la vuelta
+	-- al objetivo, por lo que no hace falta retener 54 durante 250-450 ms tras cada tiron.
+	local instantCap, instantWhy = 80, nil
+	if sampleDt >= 0.090 then
+		instantCap, instantWhy = 64, "single-frame-stall-critical"
+	elseif sampleDt >= 0.075 then
+		instantCap, instantWhy = 68, "single-frame-stall"
+	elseif sampleDt >= 0.055 then
+		instantCap, instantWhy = 74, "single-frame-lag"
 	end
-	CoinEngine.SpeedSafetyHoldUntil = holdUntil
-	CoinEngine.SpeedSafetyHoldCap = holdCap
-	-- Red de seguridad para picos de latencia: no modifica NoClip ni el slider; solo limita
-	-- temporalmente la velocidad efectiva mientras el ping medido es alto.
+	if instantCap < safetyCap then
+		safetyCap = instantCap
+		safetyReason = instantWhy
+	end
+	speed = math.min(speed, safetyCap)
+	-- Compatibilidad con los campos de diagnostico antiguos; ya no se conserva un cap bajo pegajoso.
+	CoinEngine.SpeedSafetyHoldUntil = 0
+	CoinEngine.SpeedSafetyHoldCap = safetyCap
+	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
+	-- mantener el farm en 64 aunque el ping medio de las dos capturas ronda 117-133 ms.
 	local pingCap, pingWhy = 80, nil
-	if cachedPingMs >= 230 then
-		pingCap, pingWhy = 50, "ping-critical"
+	if cachedPingMs >= 280 then
+		pingCap, pingWhy = 54, "ping-critical"
+	elseif cachedPingMs >= 230 then
+		pingCap, pingWhy = 64, "ping-high"
 	elseif cachedPingMs >= 190 then
-		pingCap, pingWhy = 56, "ping-high"
-	elseif cachedPingMs >= 160 then
-		pingCap, pingWhy = 64, "ping-elevated"
+		pingCap, pingWhy = 72, "ping-elevated"
 	end
 	if pingCap < 80 then
 		speed = math.min(speed, pingCap)
@@ -7626,8 +7639,8 @@ local function ControllerStep(dt)
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
-		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms solid=%d hold=%.2f",
-			sliderSpeed, speed, safetyReason, sampleDt * 1000, solidOverlapActive and 1 or 0, math.max(0, holdUntil - now)))
+		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms solid=%d",
+			sliderSpeed, speed, safetyReason, sampleDt * 1000, frameDtEma * 1000, solidOverlapActive and 1 or 0))
 		CoinEngine.LastSafetyReason = safetyReason
 	end
 	CoinEngine.LastSafetyCap = speed
