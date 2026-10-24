@@ -5442,6 +5442,7 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
+local POST_COLLECT_PAUSE = 0.35 -- espera fija tras cada intento de recogida confirmado por el controlador
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
@@ -7829,6 +7830,18 @@ local function ControllerStep(dt)
 					coinsCollectedTotal += 1
 					LogEvent(collectInfo)
 					hiTag = collectInfo
+
+					-- Parada breve tras cada recogida: elimina el impulso residual y obliga a
+					-- elegir la siguiente moneda desde la posicion actual del personaje.
+					pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
+					currentSpeed = 0
+					lastFlightV = 0
+					CoinEngine.LastCommandVelocity = Vector3.zero
+					CoinEngine.NextTarget = nil
+					nextPrepareAt = pauseUntil
+					velApplied = false
+					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+					LogEvent(string.format("coin-post-collect-pause hold=%.2f next=dynamic-reselect", POST_COLLECT_PAUSE))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 					if not touchedCoins[target] then
