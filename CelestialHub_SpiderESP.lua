@@ -1031,7 +1031,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, FarmPronePose = false, TweenSpeed = 45, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -5393,6 +5393,7 @@ local CoinEngine = {
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
 	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
 	StopDistance = 0.0,          -- V3.11: apunta al punto de contacto sobre la moneda, no se queda a 2 studs
+	PronePoseEnabled = State.FarmPronePose == true, -- solo orientacion corporal; no cambia velocidad ni recogida
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
@@ -7863,7 +7864,13 @@ local function ControllerStep(dt)
 		end
 		local horiz = Vector3.new(dir.X, 0, dir.Z)
 		if horiz.Magnitude > 0.05 and flightGyro then
-			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + horiz)   -- de frente hacia donde vuela, siempre derecho
+			local facing = CFrame.lookAt(rootPos, rootPos + horiz)
+			if CoinEngine.PronePoseEnabled then
+				-- Inclina el avatar horizontalmente mientras vuela; la velocidad y la seleccion de moneda siguen igual.
+				flightGyro.CFrame = facing * CFrame.Angles(math.rad(90), 0, 0)
+			else
+				flightGyro.CFrame = facing -- comportamiento original: de frente hacia donde vuela
+			end
 		end
 	end
 
@@ -11021,6 +11028,11 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				pcall(engine.RecordSpeedChange, oldValue, v)
 			end
 		end)
+		AddToggleToSection(secFarm, "Prone Pose While Farming", State.FarmPronePose, function(v)
+			State.FarmPronePose = v
+			local engine = _G.Celestial and _G.Celestial.CoinEngine
+			if engine then engine.PronePoseEnabled = v == true end
+		end, Color3.fromRGB(130, 100, 220))
 		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
