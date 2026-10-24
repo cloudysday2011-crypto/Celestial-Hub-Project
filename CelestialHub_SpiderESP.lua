@@ -1,7 +1,7 @@
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
--- V3.22 Stability Envelope: retain slider max 80; temporarily cap speed on slow frames / solid overlap and log the active cap.
--- Auto-Farm NoClip is enabled only while the farm flight is active; collisions are restored when flight stops.
+-- V3.22 Stability Envelope Tuned 2: recover from severe frame stalls and avoid rerouting on transient solid overlap.
+-- Auto-Farm NoClip behavior is preserved from the prior version; collisions are restored when flight stops.
 -- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
@@ -5792,7 +5792,7 @@ local nextLogAt, nextFlushAt, coinsCollectedTotal = 0, 0, 0
 local logFinalized = false
 local lastLogPos, lastLogAt = nil, nil
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
-local SOLID_OVERLAP_CONFIRM_TIME = 0.24
+local SOLID_OVERLAP_CONFIRM_TIME = 0.60
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -7068,12 +7068,17 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Tirón de FPS / lag: no acelerar de golpe tras el tiron (se queda flotando quieto)
-	if dt > Param(0.15, 0.1) then
-		LogEvent("lag")
-		pauseUntil = now + 0.6
+	-- Recuperación ante tirones severos: el LOG registró dt de hasta 338.5 ms.
+	-- Congelar brevemente el movimiento evita retomar una orden vieja tras un frame perdido.
+	if tonumber(dt) and dt >= 0.10 then
+		local hitchDt = tonumber(dt) or 0
+		local recovery = hitchDt >= 0.25 and 0.90 or 0.40
+		pauseUntil = math.max(pauseUntil, now + recovery)
 		currentSpeed = 0
+		CoinEngine.LastCommandVelocity = Vector3.zero
 		lastSetPos = nil
+		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f solid=%d",
+			hitchDt * 1000, recovery, solidOverlapActive and 1 or 0))
 		return
 	end
 
@@ -7240,7 +7245,7 @@ local function ControllerStep(dt)
 				local target = CoinEngine.CurrentTarget
 				local targetDistance = target and (target.Position - root.Position).Magnitude or math.huge
 				local actualSpeed = root.AssemblyLinearVelocity.Magnitude
-				if actualSpeed >= 10 and targetDistance > 4 then
+				if actualSpeed >= 10 and targetDistance > 4 and (now - lastProgress) >= 0.45 then
 					LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1", actualSpeed, targetDistance))
 					if target then CoinEngine.Blacklist[target] = now + 2.5 end
 					-- No resetear currentSpeed ni la velocidad física: el siguiente objetivo se procesa
@@ -7286,10 +7291,13 @@ local function ControllerStep(dt)
 	end
 	CoinEngine.SpeedSafetyHoldUntil = holdUntil
 	CoinEngine.SpeedSafetyHoldCap = holdCap
-	-- Dentro de geometria solida el NoClip sigue funcionando, pero se recorta antes y con mayor margen.
-	if solidOverlapActive and speed > 44 then
+	-- Con NoClip activo, el mero solapamiento con una pared puede ser transitorio mientras se atraviesa.
+	-- Recortar velocidad solo si el solapamiento persiste y además no hay progreso hacia el objetivo.
+	local solidStall = solidOverlapActive and solidOverlapSince ~= nil
+		and (now - solidOverlapSince) >= 0.30 and (now - lastProgress) >= 0.45
+	if solidStall and speed > 44 then
 		speed = 44
-		safetyReason = safetyReason == "normal" and "solid-overlap" or (safetyReason .. "+solid")
+		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
 		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms solid=%d hold=%.2f",
