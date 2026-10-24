@@ -4782,7 +4782,91 @@ _G.Celestial.SpiderESPAPI = {
 
 end
 
-_G.Celestial.Highlights = _G.Celestial.Highlights or {}
+-- ====================================================================
+-- INFECTION BARN ROLE ESP (isolated from normal MM2 role colors)
+-- ====================================================================
+local INFECTION_BARN_MAP_ID = "76492571136638"
+local INFECTION_BARN_SURVIVOR_COLOR = Color3.fromRGB(255, 176, 0) -- electric amber
+local INFECTION_BARN_ZOMBIE_COLOR = Color3.fromRGB(57, 255, 20) -- toxic green, distinct from default innocent green
+local InfectionBarnRoundStartedAt = 0
+local InfectionBarnCharacterBaselines = setmetatable({}, {__mode = "k"})
+local InfectionBarnRoleCache = setmetatable({}, {__mode = "k"})
+
+local function CH_IsInfectionBarnMap()
+	local function norm(v)
+		return tostring(v or ""):upper():gsub("[^A-Z0-9]", "")
+	end
+	local function matches(obj)
+		if not obj then return false end
+		if norm(obj.Name) == "INFECTIONBARN" or norm(obj.Name) == "BARNINFECTION" then return true end
+		for _, attr in ipairs({"MapName", "Map", "CurrentMap", "MapId"}) do
+			local ok, value = pcall(function() return obj:GetAttribute(attr) end)
+			if ok and value ~= nil then
+				local val = tostring(value)
+				if norm(val) == "INFECTIONBARN" or norm(val) == "BARNINFECTION"
+					or val:match("(%d+)") == INFECTION_BARN_MAP_ID then return true end
+			end
+		end
+		return false
+	end
+	local candidates = {Workspace:FindFirstChild("Map"), Workspace:FindFirstChild("Normal"),
+		Workspace:FindFirstChild("Round"), Workspace:FindFirstChild("Arena"), Workspace}
+	for _, container in ipairs(candidates) do
+		if container and matches(container) then return true end
+		if container then
+			for _, child in ipairs(container:GetChildren()) do
+				if matches(child) then return true end
+			end
+		end
+	end
+	return false
+end
+
+local function CH_InfectionBarnAvatarChanged(player)
+	local char = player and player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not char or not hum then return false end
+	local values = {}
+	for _, name in ipairs({"BodyHeightScale", "BodyWidthScale", "BodyDepthScale", "HeadScale"}) do
+		local v = hum:FindFirstChild(name)
+		if v and v:IsA("NumberValue") then values[name] = v.Value end
+	end
+	local baseline = InfectionBarnCharacterBaselines[player]
+	if not baseline or baseline.Character ~= char then
+		InfectionBarnCharacterBaselines[player] = {Character = char, Values = values}
+		return false
+	end
+	local changed, count = false, 0
+	for name, value in pairs(values) do
+		local old = baseline.Values[name]
+		if old ~= nil then
+			count += 1
+			if math.abs(value - old) >= 0.12 then changed = true end
+		end
+	end
+	return count >= 2 and changed
+end
+
+local function CH_GetInfectionBarnRole(player, elapsed)
+	local isKnife, isGun = CheckPlayerInventory(player)
+	-- In this mode a knife indicates the infected role; the existing inventory
+	-- detector is reused, while avatar-scale changes act as a secondary signal.
+	if isKnife then
+		InfectionBarnRoleCache[player] = "ZOMBIE"
+		return "ZOMBIE"
+	end
+	if CH_InfectionBarnAvatarChanged(player) and InfectionBarnRoleCache[player] == "SURVIVOR" then
+		InfectionBarnRoleCache[player] = "ZOMBIE"
+		return "ZOMBIE"
+	end
+	if isGun or elapsed >= 10 then
+		if InfectionBarnRoleCache[player] ~= "ZOMBIE" then
+			InfectionBarnRoleCache[player] = "SURVIVOR"
+		end
+	end
+	return InfectionBarnRoleCache[player] or "SURVIVOR"
+end
+
 local lastRoleScan = 0
 local forceRoleScan = false
 
@@ -4805,6 +4889,16 @@ _G.Celestial.ConnectionRoleScanner =
 				_G.Celestial.ESPFolder = folder
 			end
 			local activePlayers = Players:GetPlayers()
+			local infectionBarnActive = CH_IsInfectionBarnMap()
+			local infectionBarnElapsed = 0
+			if infectionBarnActive then
+				if InfectionBarnRoundStartedAt == 0 then InfectionBarnRoundStartedAt = now end
+				infectionBarnElapsed = now - InfectionBarnRoundStartedAt
+			else
+				InfectionBarnRoundStartedAt = 0
+				table.clear(InfectionBarnRoleCache)
+				table.clear(InfectionBarnCharacterBaselines)
+			end
 			local activePlayersMap = {}
 			for _, p in ipairs(activePlayers) do activePlayersMap[p] = true end
 			for plr, hl in pairs(_G.Celestial.Highlights) do
@@ -4936,7 +5030,14 @@ _G.Celestial.ConnectionRoleScanner =
 							hl.Adornee = char
 							local roleColor = COLOR_INNOCENT
 							local isGhostVisual = false
-							if _G.Celestial.GameMode == "MM2" then
+							if infectionBarnActive then
+								local infectionRole = CH_GetInfectionBarnRole(plr, infectionBarnElapsed)
+								if infectionRole == "ZOMBIE" then
+									roleColor = INFECTION_BARN_ZOMBIE_COLOR
+								else
+									roleColor = INFECTION_BARN_SURVIVOR_COLOR
+								end
+							elseif _G.Celestial.GameMode == "MM2" then
 								local name = plr.Name
 								if name == State.MurdererName then
 									roleColor = COLOR_MURDERER
