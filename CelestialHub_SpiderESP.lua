@@ -1535,8 +1535,10 @@ local AntiFlingQuantum = {
 	LastHardDefense = 0,
 	WorldRelocationUntil = 0,
 	PlayerIsolation = {Active = false, Until = 0, Character = nil, Parts = {}, Threats = {}, LastReason = ""},
+	-- QMA protects the local assembly; it deliberately does not rewrite player collision groups.
 	CollisionGroupsReady = false,
 	PersistentSeparation = {Active = false, OriginalGroups = {}},
+	ActiveModeGuard = {Character = nil, LastVelocity = Vector3.zero, LastCorrection = 0},
 	LastPassThroughCheck = 0,
 	FlingAttemptEvidence = {},
 	SelfActionContext = {
@@ -2405,98 +2407,17 @@ local function StabilizeLocalCharacter(root, criticalThreat, force)
 	end
 end
 
+-- QMA collision-group isolation was removed because changing other players' groups can
+-- interfere with touch-based gameplay hit detection. Keep the legacy API names so any
+-- older cleanup calls remain safe, but never assign a special collision group here.
 function AntiFlingQuantum.SetupQMAIsolationGroups()
-	if AntiFlingQuantum.CollisionGroupsReady then return true end
-	local physicsService = game:GetService("PhysicsService")
-	local otherGroup = "QMA_PlayerOther"
-	pcall(function() physicsService:RegisterCollisionGroup(otherGroup) end)
-	pcall(function()
-		local ok, groups = pcall(function() return physicsService:GetRegisteredCollisionGroups() end)
-		if ok and type(groups) == "table" then
-			for _, group in ipairs(groups) do
-				if group.name ~= otherGroup then
-					pcall(function() physicsService:CollisionGroupSetCollidable(group.name, otherGroup, false) end)
-				end
-			end
-		end
-	end)
-	pcall(function() physicsService:CollisionGroupSetCollidable("Default", otherGroup, false) end)
-	AntiFlingQuantum.CollisionGroupsReady = true
-	return true
-end
-
-function AntiFlingQuantum.ApplyLocalPlayerIsolation(allPlayers, untilTime, reason)
-	local data = AntiFlingQuantum.PlayerIsolation
-	data.Active = true
-	data.Until = math.max(data.Until or 0, untilTime or (tick() + AntiFlingQuantum.GetDangerIsolationHold()))
-	data.Character = LocalPlayer.Character
-	data.LastReason = reason or data.LastReason or "QMA Threat"
-end
-
-function AntiFlingQuantum.ClearLocalPlayerIsolation()
-	local data = AntiFlingQuantum.PlayerIsolation
-	if not data then return end
-	for part, original in pairs(data.Parts or {}) do
-		if part and part.Parent then
-			pcall(function()
-				if original.CanTouch ~= nil then part.CanTouch = original.CanTouch end
-			end)
-		end
-	end
-	table.clear(data.Parts or {})
-	table.clear(data.Threats or {})
-	data.Active = false
-	data.Until = 0
-	data.Character = nil
-	data.LastReason = ""
-end
-
-function AntiFlingQuantum.UpdateLocalPlayerIsolation(allPlayers, shouldIsolate, now, reason)
-	local data = AntiFlingQuantum.PlayerIsolation
-	if not shouldIsolate and data and data.Active and now < (data.Until or 0) then
-		shouldIsolate = true
-	end
-	if shouldIsolate then
-		AntiFlingQuantum.ApplyLocalPlayerIsolation(allPlayers, math.max(data.Until or 0, now + AntiFlingQuantum.GetDangerIsolationHold()), reason)
-	elseif data and data.Active then
-		AntiFlingQuantum.ClearLocalPlayerIsolation()
-	end
-end
-
-_G.Celestial.ClearQMAPlayerIsolation = AntiFlingQuantum.ClearLocalPlayerIsolation
-
-function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
-	if not AntiFlingQuantum.SetupQMAIsolationGroups() then return end
-	local psep = AntiFlingQuantum.PersistentSeparation
-	if not psep.OriginalGroups then psep.OriginalGroups = {} end
-	psep.Active = true
-
-	local localChar = LocalPlayer.Character
-	if localChar then
-		for _, obj in ipairs(localChar:GetDescendants()) do
-			if obj:IsA("BasePart") and obj.CollisionGroup == "QMA_SelfSafe" then
-				pcall(function() obj.CollisionGroup = "Default" end)
-			end
-		end
-	end
-
-	for _, plr in ipairs(allPlayers or Players:GetPlayers()) do
-		if plr ~= LocalPlayer and plr.Character then
-			for _, obj in ipairs(plr.Character:GetDescendants()) do
-				if obj:IsA("BasePart") and obj.CollisionGroup ~= "QMA_PlayerOther" then
-					if psep.OriginalGroups[obj] == nil then
-						psep.OriginalGroups[obj] = obj.CollisionGroup
-					end
-					pcall(function() obj.CollisionGroup = "QMA_PlayerOther" end)
-				end
-			end
-		end
-	end
+	AntiFlingQuantum.CollisionGroupsReady = false
+	return false
 end
 
 function AntiFlingQuantum.ClearPlayerPassThrough()
 	local psep = AntiFlingQuantum.PersistentSeparation
-	if not psep or not psep.Active then return end
+	if not psep then return end
 	for part, original in pairs(psep.OriginalGroups or {}) do
 		if part and part.Parent then
 			pcall(function() part.CollisionGroup = original end)
@@ -2506,7 +2427,56 @@ function AntiFlingQuantum.ClearPlayerPassThrough()
 	psep.Active = false
 end
 
+function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
+	-- Legacy function: restore any previous QMA edits instead of applying pass-through.
+	AntiFlingQuantum.ClearPlayerPassThrough()
+end
+
 _G.Celestial.ClearQMPlayerPassThrough = AntiFlingQuantum.ClearPlayerPassThrough
+
+-- QMA threat bookkeeping only. This intentionally never edits CanCollide, CanTouch,
+-- CollisionGroup, character parts, or gameplay hitboxes. Earlier code called this
+-- method from FastTick but the method had been removed; the resulting nil-call was
+-- swallowed by pcall and aborted the remainder of the defense tick.
+function AntiFlingQuantum.UpdateLocalPlayerIsolation(allPlayers, active, now, reason)
+	local record = AntiFlingQuantum.PlayerIsolation
+	if not record then return false end
+	now = tonumber(now) or tick()
+	active = (active == true) and (State.AntiFlingActive == true)
+	if not active then
+		record.Active = false
+		record.Until = 0
+		record.Character = LocalPlayer.Character
+		record.LastReason = ""
+		for key in pairs(record.Parts or {}) do record.Parts[key] = nil end
+		for key in pairs(record.Threats or {}) do record.Threats[key] = nil end
+		return false
+	end
+	record.Active = true
+	record.Until = math.max(tonumber(record.Until) or 0, now + GetProtectionHoldTime())
+	record.Character = LocalPlayer.Character
+	record.LastReason = tostring(reason or "Abnormal physics")
+	for key in pairs(record.Parts or {}) do record.Parts[key] = nil end
+	for player, analysis in pairs(AntiFlingQuantum.ThreatStates) do
+		if player and player.Parent and analysis and analysis.Valid
+			and (analysis.State == "Threat" or analysis.State == "Critical") then
+			record.Threats[player] = analysis.State
+		end
+	end
+	return true
+end
+
+-- Keep old cleanup hooks safe, but never restore or alter collision properties here.
+_G.Celestial.ClearQMAPlayerIsolation = function()
+	local record = AntiFlingQuantum.PlayerIsolation
+	if not record then return end
+	record.Active = false
+	record.Until = 0
+	record.Character = LocalPlayer.Character
+	record.LastReason = ""
+	for key in pairs(record.Parts or {}) do record.Parts[key] = nil end
+	for key in pairs(record.Threats or {}) do record.Threats[key] = nil end
+end
 
 local function CleanupInvalidPlayers()
 	for player, data in pairs(AntiFlingQuantum.ProtectedPlayers) do
@@ -2776,7 +2746,8 @@ local function AntiFlingQuantumFastTick(now)
 	if State.AntiFlingActive then
 		if now - (AntiFlingQuantum.LastPassThroughCheck or 0) >= 0.25 then
 			AntiFlingQuantum.LastPassThroughCheck = now
-			AntiFlingQuantum.EnsurePlayerPassThrough(Players:GetPlayers(), now)
+			-- Never modify other players' collision groups; restore legacy edits if any remain.
+			AntiFlingQuantum.ClearPlayerPassThrough()
 		end
 		
 		local existingDanger = next(AntiFlingQuantum.DangerousPlayers) ~= nil
@@ -3279,19 +3250,102 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 	end
 end)
 
+local function RunActiveModeImpulseGuard(root, ctx, now, allowAirborne)
+	if not root or not root.Parent then return end
+	local guard = AntiFlingQuantum.ActiveModeGuard
+	local character = LocalPlayer.Character
+	if guard.Character ~= character then
+		guard.Character = character
+		guard.LastVelocity = SafeVector(root.AssemblyLinearVelocity)
+		guard.LastCorrection = 0
+		return -- Ignore respawn/character replacement deltas.
+	end
+
+	local rawLinear = root.AssemblyLinearVelocity
+	local rawAngular = root.AssemblyAngularVelocity
+	-- Recover from non-finite/extreme physics values before normalizing vectors.
+	if SafeMagnitude(rawLinear) >= 100000 or SafeMagnitude(rawAngular) >= 100000 then
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end)
+		guard.LastVelocity = Vector3.zero
+		guard.LastCorrection = now
+		return
+	end
+	local linear = SafeVector(rawLinear)
+	local angular = SafeVector(rawAngular)
+	local horizontal = Vector3.new(linear.X, 0, linear.Z)
+	local horizontalSpeed = horizontal.Magnitude
+	local verticalSpeed = math.abs(linear.Y)
+	local previousVelocity = SafeVector(guard.LastVelocity)
+	local speedDelta = (linear - previousVelocity).Magnitude
+	local expectedHorizontal = math.max(24, tonumber(ctx.ExpectedMaxHorizontal) or 60)
+	local expectedVertical = math.max(50, tonumber(ctx.ExpectedMaxVertical) or 100)
+	local farmMode = _G.Celestial.FarmFlying == true
+	local activeMovement = ctx.FlyActive or ctx.NoClipActive
+
+	-- Thresholds are relative to the configured movement envelope. A sudden impulse
+	-- can trigger the guard below the absolute cap, so ordinary farm/Fly motion is not
+	-- mistaken for a fling and the existing speed/NoClip controls remain unchanged.
+	local horizontalTrigger = math.max(activeMovement and 120 or 105, expectedHorizontal * (farmMode and 1.65 or 1.45))
+	local verticalTrigger = math.max(allowAirborne and 180 or 150, expectedVertical * (allowAirborne and 1.70 or 1.35))
+	local impulseTrigger = math.max(85, expectedHorizontal * 0.80)
+	local impulseHorizontalTrigger = math.max(85, expectedHorizontal * 0.95)
+	local impulseVerticalTrigger = math.max(130, expectedVertical * 1.05)
+	local hardAngular = math.clamp(math.max(450, GetQuantumSelfAngular() * 0.45), 450, 750)
+	local abruptImpulse = speedDelta >= impulseTrigger and (
+		horizontalSpeed >= impulseHorizontalTrigger
+		or verticalSpeed >= impulseVerticalTrigger
+	)
+	local shouldCorrect = horizontalSpeed >= horizontalTrigger
+		or verticalSpeed >= verticalTrigger
+		or angular.Magnitude >= hardAngular
+		or abruptImpulse
+
+	if shouldCorrect and now - (guard.LastCorrection or 0) >= 0.025 then
+		guard.LastCorrection = now
+		local horizontalLimit = math.max(45, expectedHorizontal * (farmMode and 1.10 or 1.05))
+		local safeHorizontal = horizontal
+		if horizontalSpeed > horizontalLimit and horizontalSpeed > 0 then
+			safeHorizontal = horizontal.Unit * horizontalLimit
+		end
+		local verticalMultiplier = allowAirborne and 1.25 or 1.10
+		local verticalLimit = math.max(75, expectedVertical * verticalMultiplier)
+		local safeY = math.clamp(linear.Y, -verticalLimit, verticalLimit)
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.new(safeHorizontal.X, safeY, safeHorizontal.Z)
+			if angular.Magnitude >= hardAngular then
+				root.AssemblyAngularVelocity = Vector3.zero
+			end
+		end)
+		linear = SafeVector(root.AssemblyLinearVelocity)
+	end
+	guard.LastVelocity = linear
+end
+
 AntiFlingQuantum.RenderDefenseConnection = RunService.RenderStepped:Connect(function()
 	if not State.AntiFlingActive then return end
 	local root, hum = GetRoot(), GetHumanoid()
 	if not root or not hum or hum.Health <= 0 then return end
+	local now = tick()
 	local ctx = AntiFlingQuantum.SelfActionContext
-	if ctx.FlyActive or ctx.NoClipActive then return end
+	AntiFlingQuantum.RefreshSelfActionContext(now)
+	if ctx.FlyActive or ctx.NoClipActive then
+		RunActiveModeImpulseGuard(root, ctx, now, false)
+		return
+	end
 	local movementState = AntiFlingQuantum.GetMovementState(hum)
-	if movementState == "Jumping" or movementState == "Freefall" then return end
+	if movementState == "Jumping" or movementState == "Freefall" then
+		-- Keep a velocity-spike guard active in the air; do not skip the whole defense.
+		RunActiveModeImpulseGuard(root, ctx, now, true)
+		return
+	end
 	local linear = SafeVector(root.AssemblyLinearVelocity)
 	local angular = SafeMagnitude(root.AssemblyAngularVelocity)
-	local linearThreshold = math.max(260, ctx.ExpectedMaxHorizontal * 2.8)
-	local verticalThreshold = math.max(260, ctx.ExpectedMaxVertical * 2.8)
-	if angular >= 900 or linear.Magnitude >= linearThreshold or math.abs(linear.Y) >= verticalThreshold then
+	local linearThreshold = math.max(220, ctx.ExpectedMaxHorizontal * 2.4)
+	local verticalThreshold = math.max(220, ctx.ExpectedMaxVertical * 2.2)
+	if angular >= 850 or linear.Magnitude >= linearThreshold or math.abs(linear.Y) >= verticalThreshold then
 		AntiFlingQuantum.CriticalMode = true
 		StabilizeLocalCharacter(root, true, true)
 	end
