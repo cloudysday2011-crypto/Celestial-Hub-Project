@@ -1031,7 +1031,7 @@ _G.Celestial.State = {
 	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
-	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, FarmPronePose = false, TweenSpeed = 45, FarmSafeMode = true,
+	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -5393,7 +5393,6 @@ local CoinEngine = {
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
 	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
 	StopDistance = 0.0,          -- V3.11: apunta al punto de contacto sobre la moneda, no se queda a 2 studs
-	PronePoseEnabled = State.FarmPronePose == true, -- solo orientacion corporal; no cambia velocidad ni recogida
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
 	FlightMinSpeed = 8,          -- velocidad minima para no quedarse a medio camino
@@ -7273,7 +7272,13 @@ local function SetCurrent(coin, now)
 	CoinEngine.NextTarget = nil
 	bestDist = math.huge
 	lastProgress = now
-	if coin then nextPrepareAt = 0; PrepareNext(now) end
+	if coin then
+		-- No escanear todas las monedas por segunda vez en el mismo frame de cambio de objetivo.
+		-- La preparación sigue ocurriendo durante el vuelo, con un pequeño margen para repartir el trabajo.
+		nextPrepareAt = now + 0.08
+	else
+		nextPrepareAt = now
+	end
 end
 
 local function AdvanceTarget(root, now)
@@ -7421,16 +7426,17 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Recuperación ante tirones severos: el LOG registró dt de hasta 338.5 ms.
-	-- Congelar brevemente el movimiento evita retomar una orden vieja tras un frame perdido.
+	-- Recuperación ante tirones severos: no reanudar una ruta/moneda posiblemente obsoleta
+	-- después de un frame perdido. El próximo ciclo vuelve a elegir el objetivo desde la posición actual.
 	if tonumber(dt) and dt >= 0.10 then
 		local hitchDt = tonumber(dt) or 0
 		local recovery = hitchDt >= 0.25 and 0.90 or 0.40
 		pauseUntil = math.max(pauseUntil, now + recovery)
 		currentSpeed = 0
 		CoinEngine.LastCommandVelocity = Vector3.zero
-		lastSetPos = nil
-		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f solid=%d",
+		ResetPath()
+		CoinEngine.TargetTrack = nil
+		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f solid=%d target-reset=1",
 			hitchDt * 1000, recovery, solidOverlapActive and 1 or 0))
 		return
 	end
@@ -7642,22 +7648,22 @@ local function ControllerStep(dt)
 
 	local safetyCap = 80
 	if frameDtEma >= 0.055 then
-		safetyCap, safetyReason = 58, "sustained-low-fps-critical"
+		safetyCap, safetyReason = 68, "sustained-low-fps-critical"
 	elseif frameDtEma >= 0.045 then
-		safetyCap, safetyReason = 66, "sustained-low-fps"
+		safetyCap, safetyReason = 73, "sustained-low-fps"
 	elseif frameDtEma >= 0.035 then
-		safetyCap, safetyReason = 74, "sustained-frame-time"
+		safetyCap, safetyReason = 77, "sustained-frame-time"
 	end
 
 	-- La racha reciente limita de forma gradual, aunque el promedio EMA siga siendo bueno.
 	-- Al desaparecer los intervalos lentos, el cap vuelve a subir sin un temporizador pegajoso.
 	local burstCap, burstWhy = 80, nil
 	if slowFramesInWindow >= 8 then
-		burstCap, burstWhy = 56, "rolling-lag-critical"
+		burstCap, burstWhy = 64, "rolling-lag-critical"
 	elseif slowFramesInWindow >= 6 then
-		burstCap, burstWhy = 62, "rolling-lag-burst"
+		burstCap, burstWhy = 69, "rolling-lag-burst"
 	elseif slowFramesInWindow >= 4 then
-		burstCap, burstWhy = 70, "rolling-lag"
+		burstCap, burstWhy = 75, "rolling-lag"
 	end
 	if burstCap < safetyCap then
 		safetyCap = burstCap
@@ -7668,11 +7674,11 @@ local function ControllerStep(dt)
 	-- hace falta conservar un límite más bajo por una racha de tirones.
 	local instantCap, instantWhy = 80, nil
 	if sampleDt >= 0.090 then
-		instantCap, instantWhy = 64, "single-frame-stall-critical"
+		instantCap, instantWhy = 70, "single-frame-stall-critical"
 	elseif sampleDt >= 0.075 then
-		instantCap, instantWhy = 68, "single-frame-stall"
+		instantCap, instantWhy = 74, "single-frame-stall"
 	elseif sampleDt >= 0.055 then
-		instantCap, instantWhy = 74, "single-frame-lag"
+		instantCap, instantWhy = 78, "single-frame-lag"
 	end
 	if instantCap < safetyCap then
 		safetyCap = instantCap
@@ -7688,11 +7694,11 @@ local function ControllerStep(dt)
 	-- Usa el ping suavizado si ya está inicializado: una lectura alta aislada no cambia de perfil.
 	local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
 	if pingForSafety >= 260 then
-		pingCap, pingWhy = 54, "ping-critical"
+		pingCap, pingWhy = 62, "ping-critical"
 	elseif pingForSafety >= 205 then
-		pingCap, pingWhy = 62, "ping-high"
+		pingCap, pingWhy = 68, "ping-high"
 	elseif pingForSafety >= 160 then
-		pingCap, pingWhy = 70, "ping-elevated"
+		pingCap, pingWhy = 74, "ping-elevated"
 	end
 	if pingCap < 80 then
 		speed = math.min(speed, pingCap)
@@ -7864,13 +7870,7 @@ local function ControllerStep(dt)
 		end
 		local horiz = Vector3.new(dir.X, 0, dir.Z)
 		if horiz.Magnitude > 0.05 and flightGyro then
-			local facing = CFrame.lookAt(rootPos, rootPos + horiz)
-			if CoinEngine.PronePoseEnabled then
-				-- Inclina el avatar horizontalmente mientras vuela; la velocidad y la seleccion de moneda siguen igual.
-				flightGyro.CFrame = facing * CFrame.Angles(math.rad(90), 0, 0)
-			else
-				flightGyro.CFrame = facing -- comportamiento original: de frente hacia donde vuela
-			end
+			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + horiz)   -- de frente hacia donde vuela, siempre derecho
 		end
 	end
 
@@ -11028,11 +11028,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				pcall(engine.RecordSpeedChange, oldValue, v)
 			end
 		end)
-		AddToggleToSection(secFarm, "Prone Pose While Farming", State.FarmPronePose, function(v)
-			State.FarmPronePose = v
-			local engine = _G.Celestial and _G.Celestial.CoinEngine
-			if engine then engine.PronePoseEnabled = v == true end
-		end, Color3.fromRGB(130, 100, 220))
 		AddToggleToSection(secFarm, "Safe Mode (extra stability)", State.FarmSafeMode, function(v) State.FarmSafeMode = v end, Color3.fromRGB(60, 160, 90))
 
 		-- ====================================================================
