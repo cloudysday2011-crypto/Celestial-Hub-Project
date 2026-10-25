@@ -1,12 +1,13 @@
--- StabilityLog14: smarter Murderer-threat routing and temporary internal escape-speed boost.
+-- StabilityLog15: FPS-independent AutoFarm movement and targeted runtime performance optimizations.
+-- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
 -- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
--- Infection Barn ESP merged onto this known-good baseline; normal mode ESP and NoClip code left unchanged.
--- Keeps Tuned 3 Auto-Farm movement and NoClip behavior unchanged; no private server APIs are queried.
+-- Infection Barn ESP and normal ESP behavior are preserved; NoClip now uses a cached part list with the same collision toggling.
+-- Preserves the coin collection/pickup pipeline and collision restoration; movement integration is now time-based.
 -- Auto-Farm NoClip behavior is preserved from the prior version; collisions are restored when flight stops.
--- Keeps collision-aware solid-overlap rerouting and existing adaptive steering.
+-- Keeps collision-aware solid-overlap rerouting; movement integration is time-based rather than FPS-capped.
 -- ====================================================================
 -- CELESTIAL FRAMEWORK [MOBILE V19.18.16 - FLING ENGINE STABILITY + CACHE]
 -- + ANTI FLING QUANTUM MASTER INTEGRATION
@@ -649,24 +650,16 @@ local function IsDuelsGreenTeamMarker(plr)
 	end
 	for _, obj in ipairs(character:GetDescendants()) do
 		if obj:IsA("BillboardGui") then
-			if NameSuggestsTeamMarker(obj) then
-				for _, visual in ipairs(obj:GetDescendants()) do
-					if visual:IsA("ImageLabel") or visual:IsA("ImageButton") then
-						if IsGreen(visual.ImageColor3) then return true end
-					elseif visual:IsA("TextLabel") or visual:IsA("TextButton") then
-						if IsGreen(visual.TextColor3) then return true end
-					elseif visual:IsA("Frame") then
-						if IsGreen(visual.BackgroundColor3) then return true end
-					elseif visual:IsA("UIStroke") then
-						if IsGreen(visual.Color) then return true end
-					end
-				end
-			end
+			local namedMarker = NameSuggestsTeamMarker(obj)
+			-- The old code inspected a named BillboardGui's descendants twice. One pass keeps
+			-- the same color predicates while avoiding a second full traversal of that subtree.
 			for _, visual in ipairs(obj:GetDescendants()) do
 				if visual:IsA("ImageLabel") or visual:IsA("ImageButton") then
 					if IsGreen(visual.ImageColor3) then return true end
 				elseif visual:IsA("TextLabel") or visual:IsA("TextButton") then
 					if IsGreen(visual.TextColor3) then return true end
+				elseif visual:IsA("Frame") and namedMarker then
+					if IsGreen(visual.BackgroundColor3) then return true end
 				elseif visual:IsA("UIStroke") then
 					if IsGreen(visual.Color) then return true end
 				end
@@ -6016,9 +6009,9 @@ local CoinEngine = {
 	LastSafetyCap = 80,       -- limite temporal efectivo; el slider visible conserva el maximo 80
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
 	SpeedSafetyHoldUntil = 0, -- evita que un unico frame rapido reactive 80 de golpe tras un tiron
-	SpeedSafetyHoldCap = 80,  -- 68 temporal / 55 tras tiron severo / 80 al recuperarse
+	SpeedSafetyHoldCap = 80,  -- campo de compatibilidad; el FPS ya no reduce este limite
 	CommandAcceleration = 150, -- limita cambios bruscos de la velocidad ordenada; no limita la velocidad final
-	RiskCommandAccelerationFloor = 80, -- aceleracion minima cuando ping/FPS/desajuste empeoran
+	RiskCommandAccelerationFloor = 80, -- aceleracion minima cuando la latencia o la carga de velocidad aumentan
 	NearTargetAccelerationMultiplier = 1.75, -- frena/ajusta con rapidez en el contacto de la moneda
 	RampTime = 0.55,           -- rampa original de aceleracion para el rango 70-80
 	MinCollectInterval = 0.04,
@@ -6098,6 +6091,7 @@ local solidOverlapActive = false          -- ultimo resultado del guard de solid
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
 local cachedPingMs, nextPingAt = 80, 0
 local adaptiveSteerAlpha, adaptiveRiskScore, adaptiveFPS, adaptivePhysicalSpeed = 1, 0, 60, 0
+local adaptiveCommandRiskScore = 0 -- excludes FPS/frame-time so requested movement speed does not depend on render rate
 local adaptivePingEmaMs, adaptiveFPSEma, adaptiveSpeedEma = 80, 60, 0
 local adaptiveEmaInitialized = false
 -- Safety frame-time EMA is deliberately sample-smoothed: one isolated hitch must not pin the farm at a low cap.
@@ -6179,13 +6173,14 @@ local function EnsureFlight(root, hum)
 	CoinEngine.NoclipWanted = true       -- Reactivar NoClip durante el vuelo para atravesar paredes hacia las monedas
 end
 
--- Estabilidad adaptativa V3.14.
--- El ping, los FPS (dt de Heartbeat) y la velocidad fisica modifican SOLO la suavidad del giro.
--- No hay un tope de velocidad dinamico: se conserva la magnitud solicitada cuando existe una
--- direccion horizontal. La frenada por proximidad a la moneda sigue siendo independiente.
+-- Estabilidad adaptativa V3.14, ajustada para ser independiente de los FPS.
+-- El dt real integra el giro y la aceleracion; ping/velocidad pueden suavizar la direccion,
+-- pero los FPS no reducen la velocidad solicitada. El frenado de proximidad sigue independiente.
 local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
-	local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 0.05)
-	local fps = 1 / frameDt
+	local rawFrameDt = tonumber(dt) or (1 / 60)
+	local frameDt = math.clamp(rawFrameDt, 1 / 240, 0.10)
+	-- Keep the diagnostic FPS estimate true even when the integration dt is safety-clamped.
+	local fps = rawFrameDt > 0 and math.clamp(1 / rawFrameDt, 1, 1000) or 60
 	local now = os.clock()
 	if now >= nextPingAt then
 		nextPingAt = now + 0.50
@@ -6231,12 +6226,14 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 	local pingLoad = math.clamp((adaptivePingEmaMs - 55) / 190, 0, 1)
 	local fpsLoad = math.clamp((48 - adaptiveFPSEma) / 28, 0, 1)
 	local speedLoad = math.clamp((math.max(speedSignal, adaptiveSpeedEma) - 45) / 45, 0, 1)
-	-- A sustained physics/command mismatch increases smoothing demand as well as ping/FPS stress.
+	-- Keep FPS in diagnostics, but exclude it from the movement-command risk envelope.
+	-- Integration uses elapsed time, so identical conditions produce the same motion at different FPS.
 	local risk = math.clamp(pingLoad * 0.30 + fpsLoad * 0.25 + speedLoad * 0.20 + motionMismatchLoad * 0.25, 0, 1)
+	adaptiveCommandRiskScore = math.clamp((pingLoad * 0.30 + speedLoad * 0.20) / 0.50, 0, 1)
 
-	-- Higher speed asks for more look-ahead (direction filtering), not a lower velocity cap.
-	-- The response stays bounded so steering does not remain stuck pointing at an old coin.
-	local responseTime = math.clamp(0.020 + pingLoad * 0.018 + fpsLoad * 0.016 + speedLoad * 0.010, 0.018, 0.064)
+	-- Direction filtering is time-based and independent of FPS. Ping and commanded speed may
+	-- request gentler steering; a low frame rate alone must not delay the movement direction.
+	local responseTime = math.clamp(0.020 + pingLoad * 0.018 + speedLoad * 0.010, 0.018, 0.064)
 	local alpha = math.clamp(1 - math.exp(-frameDt / responseTime), 0.10, 0.88)
 	adaptiveSteerAlpha, adaptiveRiskScore = alpha, risk
 	adaptiveFPS, adaptivePhysicalSpeed = fps, physicalSpeed
@@ -6289,10 +6286,12 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 	-- Slew-limit the command vector to prevent one-frame jumps. The configured slider max
 	-- remains 80; only the narrow Murderer-response path may request a temporary higher speed.
 	if CoinEngine.AdaptiveStability then
-		local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 1 / 30)
+		-- Integrate the command limit using real elapsed time (up to 100 ms). The former 1/30 s
+		-- ceiling made acceleration accumulate too slowly at 15-25 FPS.
+		local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 0.10)
 		local baseAccel = tonumber(CoinEngine.CommandAcceleration) or 150
 		local floorAccel = tonumber(CoinEngine.RiskCommandAccelerationFloor) or 80
-		local risk = math.clamp(tonumber(adaptiveRiskScore) or 0, 0, 1)
+		local risk = math.clamp(tonumber(adaptiveCommandRiskScore) or 0, 0, 1)
 		local commandAccel = math.max(floorAccel, baseAccel - (baseAccel - floorAccel) * risk)
 		local activeTarget = CoinEngine.CurrentTarget
 		local root = GetRoot()
@@ -6499,26 +6498,78 @@ end
 -- Corre en Stepped (antes de la fisica) porque el Humanoid reescribe CanCollide en cada paso.
 -- ---------------------------------------------------------------
 
+local noclipCharacter = nil
+local noclipParts, noclipPartSet = {}, {}
+local noclipAddedConn, noclipRemovingConn = nil, nil
+
+local function ClearNoclipPartCache()
+	if noclipAddedConn then pcall(function() noclipAddedConn:Disconnect() end); noclipAddedConn = nil end
+	if noclipRemovingConn then pcall(function() noclipRemovingConn:Disconnect() end); noclipRemovingConn = nil end
+	noclipCharacter = nil
+	table.clear(noclipParts)
+	table.clear(noclipPartSet)
+end
+
+local function TrackNoclipPart(obj)
+	if obj and obj:IsA("BasePart") and not noclipPartSet[obj] then
+		noclipPartSet[obj] = true
+		noclipParts[#noclipParts + 1] = obj
+	end
+end
+
+local function UntrackNoclipPart(obj)
+	if not noclipPartSet[obj] then return end
+	noclipPartSet[obj] = nil
+	for i = #noclipParts, 1, -1 do
+		if noclipParts[i] == obj then table.remove(noclipParts, i); break end
+	end
+	local original = origCollide[obj]
+	if original ~= nil then
+		if obj and obj.Parent then pcall(function() obj.CanCollide = original end) end
+		origCollide[obj] = nil
+	end
+end
+
+local function EnsureNoclipPartCache(char)
+	if char == noclipCharacter and noclipAddedConn and noclipRemovingConn then return end
+	-- If the character changed during respawn, restore every still-existing old part before rebinding.
+	for part, was in pairs(origCollide) do
+		if part and part.Parent then pcall(function() part.CanCollide = was end) end
+	end
+	table.clear(origCollide)
+	ClearNoclipPartCache()
+	noclipCharacter = char
+	for _, obj in ipairs(char:GetDescendants()) do TrackNoclipPart(obj) end
+	noclipAddedConn = char.DescendantAdded:Connect(TrackNoclipPart)
+	noclipRemovingConn = char.DescendantRemoving:Connect(UntrackNoclipPart)
+end
+
 local function RestoreCollisions()
 	for part, was in pairs(origCollide) do
 		if part and part.Parent then pcall(function() part.CanCollide = was end) end
 	end
 	table.clear(origCollide)
 	noclipOn = false
+	ClearNoclipPartCache()
 end
 
 local function NoclipStep()
 	if CoinEngine.NoclipWanted and CoinEngine.Active and State.FarmEnabled then
 		local char = LocalPlayer.Character
-		if not char then return end
-		for _, part in ipairs(char:GetDescendants()) do
-			if part:IsA("BasePart") then
+		if not char then
+			if noclipOn then RestoreCollisions() end
+			return
+		end
+		EnsureNoclipPartCache(char)
+		for i = 1, #noclipParts do
+			local part = noclipParts[i]
+			if part and part.Parent then
 				if origCollide[part] == nil then origCollide[part] = part.CanCollide end
-				part.CanCollide = false
+				if part.CanCollide then part.CanCollide = false end
 			end
 		end
 		noclipOn = true
-	elseif noclipOn then
+	elseif noclipOn or noclipCharacter then
 		RestoreCollisions()
 	end
 end
@@ -6608,6 +6659,8 @@ local hiRes, hiResHead, hiResCount = {}, 0, 0
 local hiTag = nil          -- marca para el frame actual (p. ej. "COLLECT d=2.1 ...")
 local lastLogMs = 0        -- coste (ms) de la llamada a LogStep del frame anterior
 
+-- Store one compact reusable row per Heartbeat. Formatting 30-60+ diagnostic strings each second
+-- created avoidable garbage; render text only when a dump is actually requested.
 local function HiResPush(now, dt, csMs)
 	local root = GetRoot()
 	if not root then return end
@@ -6621,17 +6674,32 @@ local function HiResPush(now, dt, csMs)
 	local commandGap = math.abs(v.Magnitude - commandedVelocity.Magnitude)
 	local verticalGap = math.abs(v.Y - commandedVelocity.Y)
 	hiResHead = hiResHead % HIRES_N + 1
-	hiRes[hiResHead] = string.format(
-		"t=%.3f seg=%d dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
-		now, segment, (dt or 0) * 1000, p.X, p.Y, p.Z, v.X, v.Y, v.Z, v.Magnitude, commandedVelocity.Magnitude, commandedVelocity.Y, commandGap, verticalGap,
-		tgt and (tgt.Position - p).Magnitude or -1, CoinEngine.LastTargetVel or 0, cachedPingMs, csMs or -1, lastLogMs,
-		CoinEngine.LastCbGapMs or -1, CoinEngine.LastLogWallMs or 0,
-		(_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0, now - lastCollectAt,
-		coinsCollectedTotal,
-		tonumber(CoinEngine.LastSafetyCap) or 80, tostring(CoinEngine.LastSafetyReason or "normal"),
-		solidOverlapActive and 1 or 0, hiState, hiPlatform, noclipOn and 1 or 0,
-		hiTag and (" <" .. hiTag .. ">") or "")
-	if _G.Celestial.OTI then _G.Celestial.OTI.LastCostMs = 0 end   -- el coste de OTI solo aparece en el frame donde corrio
+	local row = hiRes[hiResHead]
+	if not row then row = {}; hiRes[hiResHead] = row end
+	row.t = now
+	row.seg = segment
+	row.dtMs = (dt or 0) * 1000
+	row.px, row.py, row.pz = p.X, p.Y, p.Z
+	row.vx, row.vy, row.vz = v.X, v.Y, v.Z
+	row.phys = v.Magnitude
+	row.cmd = commandedVelocity.Magnitude
+	row.cmdY = commandedVelocity.Y
+	row.cmdGap, row.vyGap = commandGap, verticalGap
+	row.toCoin = tgt and (tgt.Position - p).Magnitude or -1
+	row.tv = CoinEngine.LastTargetVel or 0
+	row.ping = cachedPingMs
+	row.csMs, row.lsMs = csMs or -1, lastLogMs
+	row.cbMs = CoinEngine.LastCbGapMs or -1
+	row.lwMs = CoinEngine.LastLogWallMs or 0
+	row.otiMs = (_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0
+	row.sinceCollect = now - lastCollectAt
+	row.coins = coinsCollectedTotal
+	row.speedCap = tonumber(CoinEngine.LastSafetyCap) or 80
+	row.capWhy = tostring(CoinEngine.LastSafetyReason or "normal")
+	row.solidGuard = solidOverlapActive and 1 or 0
+	row.state, row.platform, row.noclip = hiState, hiPlatform, noclipOn and 1 or 0
+	row.tag = hiTag and (" <" .. hiTag .. ">") or ""
+	if _G.Celestial.OTI then _G.Celestial.OTI.LastCostMs = 0 end   -- el coste de OTI solo aparece en la muestra donde corrio
 	hiResCount = math.min(hiResCount + 1, HIRES_N)
 	hiTag = nil
 end
@@ -6640,7 +6708,15 @@ local function HiResDump()
 	local out = {}
 	local start = hiResCount < HIRES_N and 1 or (hiResHead % HIRES_N + 1)
 	for i = 0, hiResCount - 1 do
-		out[#out + 1] = hiRes[(start - 1 + i) % HIRES_N + 1]
+		local row = hiRes[(start - 1 + i) % HIRES_N + 1]
+		if row then
+			out[#out + 1] = string.format(
+				"t=%.3f seg=%d dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
+				row.t, row.seg, row.dtMs, row.px, row.py, row.pz, row.vx, row.vy, row.vz, row.phys,
+				row.cmd, row.cmdY, row.cmdGap, row.vyGap, row.toCoin, row.tv, row.ping, row.csMs, row.lsMs,
+				row.cbMs, row.lwMs, row.otiMs, row.sinceCollect, row.coins, row.speedCap, row.capWhy,
+				row.solidGuard, row.state, row.platform, row.noclip, row.tag)
+		end
 	end
 	return table.concat(out, "\n")
 end
@@ -8404,46 +8480,10 @@ local function ControllerStep(dt)
 	end
 	local slowFramesInWindow = #recentSlowFrameTimes
 
+	-- Frame-time/FPS metrics are retained for diagnosis, but must not lower the requested speed.
+	-- Time-based acceleration and the collision/ping guards below remain active; this avoids
+	-- silently slowing the farm solely because the device renders fewer frames per second.
 	local safetyCap = 80
-	if frameDtEma >= 0.055 then
-		safetyCap, safetyReason = 68, "sustained-low-fps-critical"
-	elseif frameDtEma >= 0.045 then
-		safetyCap, safetyReason = 73, "sustained-low-fps"
-	elseif frameDtEma >= 0.035 then
-		safetyCap, safetyReason = 77, "sustained-frame-time"
-	end
-
-	-- La racha reciente limita de forma gradual, aunque el promedio EMA siga siendo bueno.
-	-- Al desaparecer los intervalos lentos, el cap vuelve a subir sin un temporizador pegajoso.
-	local burstCap, burstWhy = 80, nil
-	if slowFramesInWindow >= 8 then
-		burstCap, burstWhy = 64, "rolling-lag-critical"
-	elseif slowFramesInWindow >= 6 then
-		burstCap, burstWhy = 69, "rolling-lag-burst"
-	elseif slowFramesInWindow >= 4 then
-		burstCap, burstWhy = 75, "rolling-lag"
-	end
-	if burstCap < safetyCap then
-		safetyCap = burstCap
-		safetyReason = burstWhy
-	end
-
-	-- Un intervalo aislado muy largo reduce solo ese comando; la ventana móvil decidirá si
-	-- hace falta conservar un límite más bajo por una racha de tirones.
-	local instantCap, instantWhy = 80, nil
-	if sampleDt >= 0.090 then
-		instantCap, instantWhy = 70, "single-frame-stall-critical"
-	elseif sampleDt >= 0.075 then
-		instantCap, instantWhy = 74, "single-frame-stall"
-	elseif sampleDt >= 0.055 then
-		instantCap, instantWhy = 78, "single-frame-lag"
-	end
-	if instantCap < safetyCap then
-		safetyCap = instantCap
-		safetyReason = instantWhy
-	end
-	speed = math.min(speed, safetyCap)
-	-- Compatibilidad con los campos de diagnostico antiguos; ya no se conserva un cap bajo pegajoso.
 	CoinEngine.SpeedSafetyHoldUntil = 0
 	CoinEngine.SpeedSafetyHoldCap = safetyCap
 	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
@@ -8501,7 +8541,7 @@ local function ControllerStep(dt)
 		CoinEngine.LastSafetyReason = safetyReason
 	end
 	CoinEngine.LastSafetyCap = speed
-	dt = math.clamp(dt, 0, 0.05)
+	dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
@@ -9066,19 +9106,26 @@ local function UpdateMurderAimCamera(deltaTime, predictedPos, stabMode)
 	Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, alpha)
 end
 
+local aimbotResetAlreadyApplied = true
+
 task.spawn(function()
 	pcall(function()
 		RunService.RenderStepped:Connect(function(deltaTime)
 			pcall(function()
+				local stabilizationEnabled = State.AimbotActive and State.SuperStableActive
+				if not stabilizationEnabled then
+					if not aimbotResetAlreadyApplied then ResetAimbotStabilization(); aimbotResetAlreadyApplied = true end
+				else
+					aimbotResetAlreadyApplied = false
+				end
+				-- This callback is permanent, but inventory and Humanoid lookups are unnecessary
+				-- every frame while both aim features are disabled.
+				if not State.AimbotActive and not State.MurderStabAimbotActive then return end
 				local isShiftlockActive = (UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
 				local hasKnife, hasGun = CheckPlayerInventory(LocalPlayer)
 				local localHumanoid = GetHumanoid(LocalPlayer)
 				local localAlive = localHumanoid and localHumanoid.Health > 0
 				local gameMode = _G.Celestial.GameMode
-
-				if not State.AimbotActive or not State.SuperStableActive then
-					ResetAimbotStabilization()
-				end
 
 				if State.AimbotActive and isShiftlockActive and localAlive then
 					local canAim = hasGun or hasKnife
