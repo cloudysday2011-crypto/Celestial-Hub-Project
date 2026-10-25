@@ -1,4 +1,4 @@
--- StabilityLog15: FPS-independent AutoFarm movement and targeted runtime performance optimizations.
+-- StabilityLog16: immediate coin pickup, five-coin rest, and power/dangerometer scan optimizations.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
@@ -3977,6 +3977,9 @@ end
 -- DETECTOR / POWER / TRAP / GUN / SCANNER
 -- ====================================================================
 
+local KNIFE_TOOL_KEYWORDS = {"knife", "dagger", "blade", "cutter", "sword", "shiv", "scaler"}
+local GUN_TOOL_KEYWORDS = {"gun", "revolver", "pistol", "blaster", "sheriff", "peacemaker"}
+
 local function CheckPlayerInventory(plr)
 	local success, isKnife, isGun = pcall(function()
 		if not plr or not plr.Character then return false, false end
@@ -3987,16 +3990,14 @@ local function CheckPlayerInventory(plr)
 		local function scanContainer(container)
 			if not container then return false, false end
 			local ik, ig = false, false
-			local knifeKeywords = {"knife", "dagger", "blade", "cutter", "sword", "shiv", "scaler"}
-			local gunKeywords = {"gun", "revolver", "pistol", "blaster", "sheriff", "peacemaker"}
 			for _, item in ipairs(container:GetChildren()) do
 				if item:IsA("Tool") then
 					local lowerName = string.lower(item.Name)
 					if lowerName ~= "coin" and lowerName ~= "bag" then
-						for _, kw in ipairs(knifeKeywords) do
+						for _, kw in ipairs(KNIFE_TOOL_KEYWORDS) do
 							if lowerName:find(kw) then ik = true; break end
 						end
-						for _, kw in ipairs(gunKeywords) do
+						for _, kw in ipairs(GUN_TOOL_KEYWORDS) do
 							if lowerName:find(kw) then ig = true; break end
 						end
 					end
@@ -4014,14 +4015,13 @@ end
 local function ReadSheriffAimbotMurderer()
 	local found = ""
 	pcall(function()
-		local knifeKeywords = {"knife", "dagger", "blade", "cutter", "sword", "shiv", "scaler"}
 		local function hasKnife(container)
 			if not container then return false end
 			for _, item in ipairs(container:GetChildren()) do
 				if item:IsA("Tool") then
 					local lowerName = string.lower(item.Name)
 					if lowerName ~= "coin" and lowerName ~= "bag" then
-						for _, keyword in ipairs(knifeKeywords) do
+						for _, keyword in ipairs(KNIFE_TOOL_KEYWORDS) do
 							if lowerName:find(keyword, 1, true) then return true end
 						end
 					end
@@ -4112,43 +4112,73 @@ local function SetupPowerWatchers(murderPlayer)
 	PowerWatchPlayer = murderPlayer
 	PowerWatchCharacter = character
 	if not murderPlayer then return end
-	local containers = {
-		murderPlayer, character,
-		murderPlayer:FindFirstChild("Backpack"),
-		murderPlayer:FindFirstChild("PlayerData"),
-		murderPlayer:FindFirstChild("PlayerGui")
-	}
-	for _, container in ipairs(containers) do
-		if container then
-			WatchPowerInstance(container)
-			for _, descendant in ipairs(container:GetDescendants()) do
-				WatchPowerInstance(descendant)
-			end
-			pcall(function()
-				table.insert(PowerWatchConnections, container.DescendantAdded:Connect(function(descendant)
-					WatchPowerInstance(descendant)
-					MarkPowerWatchDirty()
-				end))
-			end)
-		end
+	-- The Player descendant tree already includes the character, Backpack, PlayerData and
+	-- PlayerGui. Walking each nested container separately duplicated expensive tree scans and
+	-- event subscriptions. One traversal and one DescendantAdded watcher cover the same hierarchy.
+	WatchPowerInstance(murderPlayer)
+	for _, descendant in ipairs(murderPlayer:GetDescendants()) do
+		WatchPowerInstance(descendant)
 	end
+	pcall(function()
+		table.insert(PowerWatchConnections, murderPlayer.DescendantAdded:Connect(function(descendant)
+			WatchPowerInstance(descendant)
+			MarkPowerWatchDirty()
+		end))
+	end)
 end
 
+local ghostTransparencyCacheCharacter, ghostTransparencyCacheAt, ghostTransparencyCacheValue = nil, 0, 0
+local ghostTransparencyParts, ghostTransparencyPartIndices = {}, {}
+local ghostTransparencyConnections = {}
+local function UntrackGhostTransparencyPart(instance)
+	local index = ghostTransparencyPartIndices[instance]
+	if not index then return end
+	ghostTransparencyPartIndices[instance] = nil
+	table.remove(ghostTransparencyParts, index)
+	for i = index, #ghostTransparencyParts do ghostTransparencyPartIndices[ghostTransparencyParts[i]] = i end
+end
+local function TrackGhostTransparencyPart(instance)
+	if not instance or not instance:IsA("BasePart") or instance.Name == "HumanoidRootPart"
+		or instance:FindFirstAncestorOfClass("Tool") or ghostTransparencyPartIndices[instance] then return end
+	ghostTransparencyParts[#ghostTransparencyParts + 1] = instance
+	ghostTransparencyPartIndices[instance] = #ghostTransparencyParts
+end
+local function EnsureGhostTransparencyParts(character)
+	if character == ghostTransparencyCacheCharacter then return end
+	for _, connection in ipairs(ghostTransparencyConnections) do pcall(function() connection:Disconnect() end) end
+	table.clear(ghostTransparencyConnections)
+	table.clear(ghostTransparencyParts)
+	table.clear(ghostTransparencyPartIndices)
+	ghostTransparencyCacheCharacter = character
+	ghostTransparencyCacheAt = 0
+	ghostTransparencyCacheValue = 0
+	if not character then return end
+	for _, instance in ipairs(character:GetDescendants()) do TrackGhostTransparencyPart(instance) end
+	table.insert(ghostTransparencyConnections, character.DescendantAdded:Connect(TrackGhostTransparencyPart))
+	table.insert(ghostTransparencyConnections, character.DescendantRemoving:Connect(UntrackGhostTransparencyPart))
+end
 local function GetGhostTransparency(character)
-	if not character then return 0 end
+	if not character then EnsureGhostTransparencyParts(nil); return 0 end
+	EnsureGhostTransparencyParts(character)
+	local now = tick()
+	if now - ghostTransparencyCacheAt < 0.09 then return ghostTransparencyCacheValue end
 	local maxTransparency = 0
 	local partCount = 0
 	local nearlyTransparentCount = 0
-	for _, part in ipairs(character:GetDescendants()) do
-		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and not part:FindFirstAncestorOfClass("Tool") then
+	for i = #ghostTransparencyParts, 1, -1 do
+		local part = ghostTransparencyParts[i]
+		if part and character and part:IsDescendantOf(character) then
 			partCount += 1
 			local effectiveTransparency = math.max(part.Transparency, part.LocalTransparencyModifier)
-			maxTransparency = math.max(maxTransparency, effectiveTransparency)
+			if effectiveTransparency > maxTransparency then maxTransparency = effectiveTransparency end
 			if effectiveTransparency >= 0.98 then nearlyTransparentCount += 1 end
+		else
+			UntrackGhostTransparencyPart(part)
 		end
 	end
-	if partCount >= 3 and nearlyTransparentCount >= math.max(3, math.ceil(partCount * 0.80)) then return 1 end
-	return maxTransparency
+	local result = (partCount >= 3 and nearlyTransparentCount >= math.max(3, math.ceil(partCount * 0.80))) and 1 or maxTransparency
+	ghostTransparencyCacheAt, ghostTransparencyCacheValue = now, result
+	return result
 end
 
 local function NormalizePowerText(value)
@@ -4202,17 +4232,45 @@ local function DetectPowerFromContainer(container)
 	return nil
 end
 
+local POWER_METADATA_ATTRIBUTES = {"Power", "MurderPower", "MurderAbility", "Ability", "Perk", "SelectedPower", "EquippedPower", "PowerName"}
+local function DetectPowerDirectMetadata(container)
+	if not container then return nil end
+	for _, powerName in ipairs(POWER_ORDER) do
+		if PowerAliasMatches(container.Name, POWER_DEFINITIONS[powerName]) then return powerName end
+	end
+	for _, attributeName in ipairs(POWER_METADATA_ATTRIBUTES) do
+		local ok, value = pcall(function() return container:GetAttribute(attributeName) end)
+		if ok and value ~= nil then
+			for _, powerName in ipairs(POWER_ORDER) do
+				if PowerAliasMatches(value, POWER_DEFINITIONS[powerName]) then return powerName end
+			end
+		end
+	end
+	return nil
+end
+
 local function DetectMurderPower(plr)
 	if not plr then return nil end
-	local containers = {plr, plr.Character, plr:FindFirstChild("Backpack"), plr:FindFirstChild("PlayerData"), plr:FindFirstChild("PlayerGui")}
+	-- Preserve power metadata that may be stored directly on Character/Backpack/PlayerData/PlayerGui,
+	-- then inspect the full Player descendant tree only once for named objects and value objects.
+	local containers = {plr, plr.Character, plr:FindFirstChild("Backpack"), plr:FindFirstChild("PlayerData"), plr:FindFirstChildOfClass("PlayerGui")}
 	for _, container in ipairs(containers) do
-		local foundPower = DetectPowerFromContainer(container)
-		if foundPower then return foundPower end
+		local directPower = DetectPowerDirectMetadata(container)
+		if directPower then return directPower end
 	end
-	local playerGui = plr:FindFirstChildOfClass("PlayerGui")
-	if playerGui then
-		local foundPower = DetectPowerFromContainer(playerGui)
-		if foundPower then return foundPower end
+	for _, obj in ipairs(plr:GetDescendants()) do
+		for _, powerName in ipairs(POWER_ORDER) do
+			if PowerAliasMatches(obj.Name, POWER_DEFINITIONS[powerName]) then return powerName end
+		end
+		if obj:IsA("StringValue") then
+			for _, powerName in ipairs(POWER_ORDER) do
+				if PowerAliasMatches(obj.Value, POWER_DEFINITIONS[powerName]) then return powerName end
+			end
+		elseif obj:IsA("ObjectValue") and obj.Value then
+			for _, powerName in ipairs(POWER_ORDER) do
+				if PowerAliasMatches(obj.Value.Name, POWER_DEFINITIONS[powerName]) then return powerName end
+			end
+		end
 	end
 	return nil
 end
@@ -4291,9 +4349,10 @@ function _G.Celestial.ResolveLocalMurderPower()
 	return cache.Power, cache.Active
 end
 
+local POWER_ACTIVE_FLAG_NAMES = {"active","isactive","enabled","isenabled","using","isusing","inuse","isusingpower"}
 local function PowerObjectLooksActive(obj)
 	if not obj then return false end
-	local activeNames = {"active","isactive","enabled","isenabled","using","isusing","inuse","isusingpower"}
+	local activeNames = POWER_ACTIVE_FLAG_NAMES
 	for _, name in ipairs(activeNames) do
 		local ok, value = pcall(function() return obj:GetAttribute(name) end)
 		if ok and value == true then return true end
@@ -4382,26 +4441,31 @@ local function IsPowerCurrentlyActive(plr, powerName)
 			detector.SprintConfirmCount = 0
 			detector.SprintSpikeAt = 0
 		end
-		local innocentWalkSpeeds = {}
-		for _, otherPlr in ipairs(Players:GetPlayers()) do
-			if otherPlr ~= LocalPlayer and otherPlr ~= plr then
-				local hum = GetHumanoid(otherPlr)
-				if hum and hum.Health > 0 then
-					local walkSpeed = tonumber(hum.WalkSpeed) or 0
-					if walkSpeed > 0 and walkSpeed < 100 then table.insert(innocentWalkSpeeds, walkSpeed) end
+		local innocentWalkSpeed = tonumber(detector.SprintCachedInnocentWalkSpeed) or 16
+		if now >= (detector.SprintNextBaselineRefreshAt or 0) then
+			local innocentWalkSpeeds = {}
+			for _, otherPlr in ipairs(Players:GetPlayers()) do
+				if otherPlr ~= LocalPlayer and otherPlr ~= plr then
+					local hum = GetHumanoid(otherPlr)
+					if hum and hum.Health > 0 then
+						local walkSpeed = tonumber(hum.WalkSpeed) or 0
+						if walkSpeed > 0 and walkSpeed < 100 then innocentWalkSpeeds[#innocentWalkSpeeds + 1] = walkSpeed end
+					end
 				end
 			end
-		end
-		local innocentWalkSpeed = 16
-		if #innocentWalkSpeeds > 0 then
-			table.sort(innocentWalkSpeeds)
-			local middle = (#innocentWalkSpeeds + 1) / 2
-			if middle % 1 == 0 then innocentWalkSpeed = innocentWalkSpeeds[middle]
-			else
-				local lower = innocentWalkSpeeds[math.floor(middle)]
-				local upper = innocentWalkSpeeds[math.ceil(middle)]
-				innocentWalkSpeed = (lower + upper) / 2
+			innocentWalkSpeed = 16
+			if #innocentWalkSpeeds > 0 then
+				table.sort(innocentWalkSpeeds)
+				local middle = (#innocentWalkSpeeds + 1) / 2
+				if middle % 1 == 0 then innocentWalkSpeed = innocentWalkSpeeds[middle]
+				else
+					local lower = innocentWalkSpeeds[math.floor(middle)]
+					local upper = innocentWalkSpeeds[math.ceil(middle)]
+					innocentWalkSpeed = (lower + upper) / 2
+				end
 			end
+			detector.SprintCachedInnocentWalkSpeed = innocentWalkSpeed
+			detector.SprintNextBaselineRefreshAt = now + 0.50
 		end
 		if (detector.SprintBaselineWalkSpeed or 0) <= 0 then detector.SprintBaselineWalkSpeed = innocentWalkSpeed end
 		local murdererWalkSpeed = tonumber(murderHumanoid.WalkSpeed) or 0
@@ -4469,12 +4533,14 @@ local function IsPowerCurrentlyActive(plr, powerName)
 					end
 				end
 			end
-			for _, obj in ipairs(container:GetDescendants()) do
-				local objNormalized = NormalizePowerText(obj.Name)
-				if objNormalized == normalizedPower or objNormalized:find(normalizedPower, 1, true) then
-					if PowerObjectLooksActive(obj) then return true end
-				end
-			end
+		end
+	end
+	-- The container attributes above are retained for compatibility; object matching only needs
+	-- one traversal because every nested Character/Backpack/PlayerData object is a Player descendant.
+	for _, obj in ipairs(plr:GetDescendants()) do
+		local objNormalized = NormalizePowerText(obj.Name)
+		if objNormalized == normalizedPower or objNormalized:find(normalizedPower, 1, true) then
+			if PowerObjectLooksActive(obj) then return true end
 		end
 	end
 	return false
@@ -4489,9 +4555,10 @@ _G.Celestial.PowerDetector = {
 	SprintActive = false, SprintRatio = 0, SprintBaselineWalkSpeed = 0,
 	SprintLastWalkSpeed = 0, SprintLastMoveSpeed = 0, SprintLastSampleAt = 0,
 	SprintLastPlayer = nil, SprintLastCharacter = nil, SprintConfirmCount = 0,
-	SprintSpikeAt = 0
+	SprintSpikeAt = 0, SprintCachedInnocentWalkSpeed = 16, SprintNextBaselineRefreshAt = 0
 }
 
+local nextMurdererInventoryScanAt = 0
 local function UpdatePowerDetectorState()
 	if not State.PowerDetectorActive then
 		_G.Celestial.PowerDetector.CurrentPower = nil
@@ -4500,20 +4567,28 @@ local function UpdatePowerDetectorState()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
+	local now = tick()
 	local murderName = State.MurdererName
 	local murderPlayer = murderName ~= "" and Players:FindFirstChild(murderName) or nil
-	if not murderPlayer and detector.CurrentPower == "Ghost"
-		and detector.CurrentPlayer and detector.GhostActive
-		and detector.CurrentPlayer.Parent == Players then
-		murderPlayer = detector.CurrentPlayer
-	end
 	if not murderPlayer then
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if plr ~= LocalPlayer and plr.Character then
-				local hum = GetHumanoid(plr)
-				if hum and hum.Health > 0 then
-					local isKnife = CheckPlayerInventory(plr)
-					if isKnife then murderPlayer = plr; break end
+		local cachedPlayer = detector.CurrentPlayer
+		if cachedPlayer and cachedPlayer ~= LocalPlayer and cachedPlayer.Parent == Players and cachedPlayer.Character then
+			local cachedHumanoid = GetHumanoid(cachedPlayer)
+			if cachedHumanoid and cachedHumanoid.Health > 0 then
+				if (detector.CurrentPower == "Ghost" and detector.GhostActive) or now < nextMurdererInventoryScanAt then
+					murderPlayer = cachedPlayer
+				end
+			end
+		end
+		if not murderPlayer and now >= nextMurdererInventoryScanAt then
+			nextMurdererInventoryScanAt = now + 0.30
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= LocalPlayer and plr.Character then
+					local hum = GetHumanoid(plr)
+					if hum and hum.Health > 0 then
+						local isKnife = CheckPlayerInventory(plr)
+						if isKnife then murderPlayer = plr; break end
+					end
 				end
 			end
 		end
@@ -4540,7 +4615,6 @@ local function UpdatePowerDetectorState()
 		return
 	end
 	SetupPowerWatchers(murderPlayer)
-	local now = tick()
 	local character = murderPlayer.Character
 	local cache = PowerDetectionCache[murderPlayer]
 	local detectedPower
@@ -5444,7 +5518,7 @@ end
 
 local function CH_IsInfectionBarnMapLoaded()
 	local now = tick()
-	if now - InfectionBarnESP.MapCheckedAt < 0.45 then
+	if now - InfectionBarnESP.MapCheckedAt < 1.00 then
 		return InfectionBarnESP.MapLoaded
 	end
 	InfectionBarnESP.MapCheckedAt = now
@@ -6080,12 +6154,13 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local POST_COLLECT_PAUSE = 0.50 -- espera fija tras cada intento de recogida confirmado por el controlador
+local COINS_PER_REST = 5       -- pausa corta solo despues de cinco recogidas consecutivas
+local REST_PAUSE_TIME = 0.25    -- descanso entre grupos de cinco monedas
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
 local coinsSinceRest = 0
-local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
+local arriveTarget, arriveAt = nil, 0     -- seguimiento de llegada para diagnosticos; ya no se espera antes del toque
 local noclipOn = false
 local solidOverlapActive = false          -- ultimo resultado del guard de solidos (cada 0.12 s)
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
@@ -6121,6 +6196,7 @@ end
 
 local function ResetRoundCounters()
 	roundCollected, batchCollected, batchIndex = 0, 0, 1
+	coinsSinceRest = 0
 	table.clear(touchedCoins)
 	batchPausing, batchPausePending, limitReached = false, false, false
 end
@@ -6599,27 +6675,7 @@ local function IsInsideSolid(pos)
 	return false
 end
 
--- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera ese tiempo al llegar
--- a la moneda y ANTES de recogerla: asi la recogida no se valida desde una posicion "vieja/lejana".
-local function GetSettleTime(now)
-	if now >= nextPingAt then
-		nextPingAt = now + 1
-		pcall(function()
-			cachedPingMs = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
-		end)
-	end
-	return math.clamp(cachedPingMs / 2000 + 0.02, CoinEngine.SettleMin, CoinEngine.SettleMax)
-end
-
--- Con PingSettle: espera al menos un ping completo + margen para que el servidor te vea ya parado
--- junto a la moneda antes del toque. Sin el interruptor devuelve el valor original.
-local function GetCollectSettle(now, safe)
-	local base = GetSettleTime(now)   -- V3.3: la espera sigue al ping tambien sin Safe Mode (log: settle=0.03 fijo con ping 175-273 antes del kick)
-	if not CoinEngine.PingSettle then return base end
-	if not safe then GetSettleTime(now) end   -- refresca cachedPingMs tambien fuera de Safe Mode
-	local want = cachedPingMs / 1000 + CoinEngine.PingSettleMargin
-	return math.min(math.max(base, want), CoinEngine.PingSettleMax)
-end
+-- La recogida ya no utiliza una espera de asentamiento basada en ping.
 
 -- ---------------------------------------------------------------
 -- REGISTRO DE DIAGNOSTICO + RECUPERACION ADAPTATIVA
@@ -7010,7 +7066,7 @@ local function LogStep(now, dt, force)
 	local commandedVelocity = CoinEngine.LastCommandVelocity or Vector3.zero
 	local commandGap = math.abs(physicalSpeed - commandedVelocity.Magnitude)
 	local verticalGap = math.abs(physicalVelocity.Y - commandedVelocity.Y)
-	-- Ping: antes solo se refrescaba al llegar a una moneda (GetSettleTime) y podia quedar viejo/80 por defecto.
+	-- Ping: se refresca en un intervalo fijo desde el controlador adaptativo; no bloquea la recogida.
 	if now >= nextLogPingAt then
 		nextLogPingAt = now + 0.5
 		pcall(function()
@@ -8620,13 +8676,12 @@ local function ControllerStep(dt)
 
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
 	if dist <= pickupDistance then
-		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
-		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
+		-- En el radio de recogida, intentar el toque inmediatamente; no esperar un tiempo de asentamiento.
 		if firetouchinterest then
 			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
 			lastProgress = now
 			if CoinEngine.SoftBrake then
-				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
+				-- Frenado visual/fisico conservado, pero no bloquea el intento de recogida.
 				currentSpeed = math.min(currentSpeed, lastFlightV) * CoinEngine.SoftBrakeDecay
 				if currentSpeed > 1 and flightVel and dist > 0.001 then
 					ApplyStableFlightVelocity(delta / dist, currentSpeed, dt)
@@ -8634,13 +8689,13 @@ local function ControllerStep(dt)
 				else
 					currentSpeed = 0
 				end
-			elseif safe then currentSpeed = currentSpeed * 0.5 end
+			elseif safe then
+				currentSpeed = currentSpeed * 0.5
+			end
+
 			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-			local settle = GetCollectSettle(now, safe)
-			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
-				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
-				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
-				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
+			local settle = 0 -- conservado solo como campo diagnostico; ya no introduce una espera.
+			if now - lastCollectAt >= minGap then
 				local collectInfo = string.format("collect d=%.1f spd=%.1f arr=%.2f gap=%.2f settle=%.2f dy=%.1f sb=%d ps=%d sl=%d dn=%d sf=%d",
 					dist, root.AssemblyLinearVelocity.Magnitude, now - arriveAt, now - lastCollectAt, settle,
 					target.Position.Y - rootPos.Y, CoinEngine.SoftBrake and 1 or 0, CoinEngine.PingSettle and 1 or 0,
@@ -8652,30 +8707,33 @@ local function ControllerStep(dt)
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
-					-- Parada breve tras cada recogida: elimina el impulso residual y obliga a
-					-- elegir la siguiente moneda desde la posicion actual del personaje.
-					pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
-					currentSpeed = 0
-					lastFlightV = 0
-					CoinEngine.LastCommandVelocity = Vector3.zero
-					CoinEngine.NextTarget = nil
-					nextPrepareAt = pauseUntil
-					velApplied = false
-					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
-					LogEvent(string.format("coin-post-collect-pause hold=%.2f next=dynamic-reselect", POST_COLLECT_PAUSE))
+					-- Mantener el movimiento entre monedas. Solo tras cinco recogidas confirmadas
+					-- se aplica el descanso breve solicitado.
+					coinsSinceRest += 1
+					if coinsSinceRest >= COINS_PER_REST then
+						coinsSinceRest = 0
+						batchPausing = true
+						pauseUntil = math.max(pauseUntil, now + REST_PAUSE_TIME)
+						currentSpeed = 0
+						lastFlightV = 0
+						CoinEngine.LastCommandVelocity = Vector3.zero
+						CoinEngine.NextTarget = nil
+						nextPrepareAt = pauseUntil
+						velApplied = false
+						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+						LogEvent(string.format("coin-five-rest hold=%.2f count=%d", REST_PAUSE_TIME, COINS_PER_REST))
+					end
 
-					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
+					-- Conteo de monedas unicas por ronda; se mantiene igual que antes.
 					if not touchedCoins[target] then
 						touchedCoins[target] = true
 						roundCollected += 1
 						batchCollected += 1
 					end
-					-- (Eliminado) Ya no hay pausa de 3s entre lotes ni limite de 50 monedas: el farm sigue sin detenerse.
 				end
 			end
 		else
-			-- A distancia de contacto no hay que declarar recogida ni limpiar el objetivo manualmente.
-			-- La moneda desaparecera por el contacto del juego o seguira siendo el objetivo.
+			-- Sin la API de toque, dejar que el contacto fisico normal recoja la moneda.
 			lastProgress = now
 		end
 	else
@@ -10524,12 +10582,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		powerIndicatorStatusConstraint.MinTextSize = 7
 		powerIndicatorStatusConstraint.Parent = PowerIndicatorStatus
 
+		local lastPowerIndicatorActive, lastPowerIndicatorMurderer = nil, nil
+		local lastPowerIndicatorPower, lastPowerIndicatorState = nil, nil
 		local function UpdatePowerIndicator()
-			if not State.DangerometerActive then
-				PowerIndicatorFrame.Visible = false
-				return
-			end
-			PowerIndicatorFrame.Visible = true
 			local currentPower = _G.Celestial.PowerDetector.CurrentPower
 			local currentState = _G.Celestial.PowerDetector.CurrentState
 			if State.MurdererName == LocalPlayer.Name then
@@ -10544,6 +10599,19 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 					end
 				end
 			end
+			if State.DangerometerActive == lastPowerIndicatorActive
+				and State.MurdererName == lastPowerIndicatorMurderer
+				and currentPower == lastPowerIndicatorPower
+				and currentState == lastPowerIndicatorState then return end
+			lastPowerIndicatorActive = State.DangerometerActive
+			lastPowerIndicatorMurderer = State.MurdererName
+			lastPowerIndicatorPower = currentPower
+			lastPowerIndicatorState = currentState
+			if not State.DangerometerActive then
+				if PowerIndicatorFrame.Visible then PowerIndicatorFrame.Visible = false end
+				return
+			end
+			if not PowerIndicatorFrame.Visible then PowerIndicatorFrame.Visible = true end
 			local function SetFallback(icon, status, bg)
 				PowerIndicatorFrame.BackgroundColor3 = bg
 				PowerIndicatorImage.Visible = false
@@ -10584,12 +10652,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		local lastPowerDetection = 0
 		_G.Celestial.ConnectionPowerDetector = RunService.Heartbeat:Connect(function()
 			local now = tick()
+			-- Keep the detector responsive at 80 ms while avoiding 25 Hz full-character scans.
+			-- Ghost transparency and Sprint baseline sampling now have their own small caches.
 			local detectorInterval = 0.08
-			if _G.Celestial.PowerDetector
-				and (_G.Celestial.PowerDetector.CurrentPower == "Ghost"
-					or _G.Celestial.PowerDetector.CurrentPower == "Sprint") then
-				detectorInterval = 0.04
-			end
 			if now - lastPowerDetection < detectorInterval then return end
 			lastPowerDetection = now
 			pcall(function()
@@ -10600,60 +10665,93 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end)
 		end)
 
+		local lastDangerSquareColors = {}
+		local dangerFallbackPlayer, dangerNextFallbackScanAt = nil, 0
+		local function SetDangerSquares(activeCount, activeColor, idleColor)
+			for i = 1, 5 do
+				local wanted = i <= activeCount and activeColor or idleColor
+				if lastDangerSquareColors[i] ~= wanted then
+					dangerSquareBoxes[i].BackgroundColor3 = wanted
+					lastDangerSquareColors[i] = wanted
+				end
+			end
+		end
+		local function SetVisibleIfChanged(object, visible)
+			if object.Visible ~= visible then object.Visible = visible end
+		end
+		local lastDangerDistanceText = nil
+		local function SetDangerDistanceText(value)
+			if value ~= lastDangerDistanceText then
+				DangerDistanceLabel.Text = value
+				lastDangerDistanceText = value
+			end
+		end
+
 		task.spawn(function()
 			while task.wait(0.15) do
 				pcall(function()
-					DangerometerFrame.Visible = State.DangerometerActive
+					-- While hidden, do not resolve players or inspect inventories on every polling pass.
+					if not State.DangerometerActive then
+						SetVisibleIfChanged(DangerometerFrame, false)
+						SetVisibleIfChanged(PowerIndicatorFrame, false)
+						return
+					end
+					SetVisibleIfChanged(DangerometerFrame, true)
 					local myRoot = GetRoot()
-					local isMeMurderer = (State.MurdererName == LocalPlayer.Name)
-					local targetChar = nil
+					local detector = _G.Celestial.PowerDetector
+					local isMeMurderer = State.MurdererName == LocalPlayer.Name
+						or (detector and detector.CurrentPlayer == LocalPlayer and detector.CurrentState == "You are the Murderer")
 					if isMeMurderer then
-						DangerMurderLabel.Visible = true
-						DangerDistanceLabel.Visible = false
-						for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(120, 0, 180) end
+						SetVisibleIfChanged(DangerMurderLabel, true)
+						SetVisibleIfChanged(DangerDistanceLabel, false)
+						SetDangerSquares(5, Color3.fromRGB(120, 0, 180), Color3.fromRGB(120, 0, 180))
+						return
+					end
+					SetVisibleIfChanged(DangerMurderLabel, false)
+					SetVisibleIfChanged(DangerDistanceLabel, true)
+					local mPlr = nil
+					if State.MurdererName ~= "" then mPlr = Players:FindFirstChild(State.MurdererName) end
+					if not mPlr and detector then
+						local candidate = detector.CurrentPlayer
+						if candidate and candidate ~= LocalPlayer and candidate.Parent == Players then mPlr = candidate end
+					end
+					-- The detector is normally the shared source. If it is disabled or has no candidate,
+					-- retain the original inventory-based fallback but scan at most every 0.60 seconds.
+					if not mPlr and tick() >= dangerNextFallbackScanAt then
+						dangerNextFallbackScanAt = tick() + 0.60
+						dangerFallbackPlayer = nil
+						for _, candidate in ipairs(Players:GetPlayers()) do
+							if candidate ~= LocalPlayer then
+								local candidateHumanoid = GetHumanoid(candidate)
+								if candidate.Character and candidateHumanoid and candidateHumanoid.Health > 0 then
+									local hasKnife = CheckPlayerInventory(candidate)
+									if hasKnife then dangerFallbackPlayer = candidate; break end
+								end
+							end
+						end
+					end
+					if not mPlr and dangerFallbackPlayer and dangerFallbackPlayer.Parent == Players then
+						mPlr = dangerFallbackPlayer
+					end
+					local targetChar = nil
+					if mPlr and mPlr.Character then
+						local hum = GetHumanoid(mPlr)
+						if hum and hum.Health > 0 then targetChar = mPlr.Character end
+					end
+					local mRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart") or nil
+					if mRoot and myRoot then
+						local dist = math.floor((myRoot.Position - mRoot.Position).Magnitude)
+						local activeCount, activeColor = 0, Color3.fromRGB(40, 40, 45)
+						if dist <= 15 then activeCount, activeColor = 5, Color3.fromRGB(255, 50, 50)
+						elseif dist <= 30 then activeCount, activeColor = 4, Color3.fromRGB(255, 140, 0)
+						elseif dist <= 50 then activeCount, activeColor = 3, Color3.fromRGB(255, 220, 0)
+						elseif dist <= 80 then activeCount, activeColor = 2, Color3.fromRGB(50, 220, 100)
+						elseif dist <= 110 then activeCount, activeColor = 1, Color3.fromRGB(50, 150, 255) end
+						SetDangerSquares(activeCount, activeColor, Color3.fromRGB(40, 40, 45))
+						SetDangerDistanceText(string.format("%d studs", dist))
 					else
-						DangerMurderLabel.Visible = false
-						DangerDistanceLabel.Visible = true
-						DangerDistanceLabel.Position = UDim2.new(0, 6, 0.55, 0)
-						if State.MurdererName ~= "" then
-							local mPlr = Players:FindFirstChild(State.MurdererName)
-							if mPlr and mPlr.Character and GetHumanoid(mPlr) and GetHumanoid(mPlr).Health > 0 then
-								targetChar = mPlr.Character
-							end
-						end
-						if not targetChar then
-							for _, plr in ipairs(Players:GetPlayers()) do
-								if plr ~= LocalPlayer then
-									local hum = GetHumanoid(plr)
-									if plr.Character and hum and hum.Health > 0 then
-										local isKnife, _ = CheckPlayerInventory(plr)
-										if isKnife then targetChar = plr.Character; break end
-									end
-								end
-							end
-						end
-						if targetChar and myRoot then
-							local mRoot = targetChar:FindFirstChild("HumanoidRootPart")
-							if mRoot then
-								local dist = math.floor((myRoot.Position - mRoot.Position).Magnitude)
-								local activeCount, activeColor = 0, Color3.fromRGB(40, 40, 45)
-								if dist <= 15 then activeCount, activeColor = 5, Color3.fromRGB(255, 50, 50)
-								elseif dist <= 30 then activeCount, activeColor = 4, Color3.fromRGB(255, 140, 0)
-								elseif dist <= 50 then activeCount, activeColor = 3, Color3.fromRGB(255, 220, 0)
-								elseif dist <= 80 then activeCount, activeColor = 2, Color3.fromRGB(50, 220, 100)
-								elseif dist <= 110 then activeCount, activeColor = 1, Color3.fromRGB(50, 150, 255) end
-								for i = 1, 5 do
-									dangerSquareBoxes[i].BackgroundColor3 = i <= activeCount and activeColor or Color3.fromRGB(40, 40, 45)
-								end
-								DangerDistanceLabel.Text = string.format("%d studs", dist)
-							else
-								for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(220, 220, 220) end
-								DangerDistanceLabel.Text = "No murder"
-							end
-						else
-							for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(220, 220, 220) end
-							DangerDistanceLabel.Text = "No murder"
-						end
+						SetDangerSquares(0, Color3.fromRGB(220, 220, 220), Color3.fromRGB(220, 220, 220))
+						SetDangerDistanceText("No murder")
 					end
 				end)
 			end
