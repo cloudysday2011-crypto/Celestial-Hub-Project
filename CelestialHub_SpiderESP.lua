@@ -2702,28 +2702,58 @@ local QMAScheduler = {
 	NextBatchTime = 0,
 	TimePerBatch = 1.0,
 	LastPlayerCount = 0,
+	RosterInitialized = false,
+	CycleComplete = false,
+	RosterSet = {},
+	ProcessedThisCycle = {},
+	CycleSerial = 0,
 }
 
 function QMAScheduler.RebuildQueue(allPlayers)
 	table.clear(QMAScheduler.Queue)
+	table.clear(QMAScheduler.RosterSet)
+	table.clear(QMAScheduler.ProcessedThisCycle)
+	-- Snapshot the real, current roster once. Deduplicate by Player instance so
+	-- each server player occupies exactly one queue slot in this scan cycle.
 	for _, plr in ipairs(allPlayers) do
-		if plr ~= LocalPlayer then
+		if plr and not QMAScheduler.RosterSet[plr] then
+			QMAScheduler.RosterSet[plr] = true
 			table.insert(QMAScheduler.Queue, plr)
 		end
 	end
 	local N = #QMAScheduler.Queue
 	if N > 0 then
-		QMAScheduler.BatchSize = math.max(2, math.ceil(N / 6))
+		QMAScheduler.BatchSize = math.max(1, math.ceil(N / 6))
 		local cycleTime = math.max(0.55 * N, 1.0)
 		local numBatches = math.ceil(N / QMAScheduler.BatchSize)
 		QMAScheduler.TimePerBatch = cycleTime / numBatches
 	else
-		QMAScheduler.BatchSize = 2
+		QMAScheduler.BatchSize = 1
 		QMAScheduler.TimePerBatch = 1.0
 	end
 	QMAScheduler.Index = 1
 	QMAScheduler.NextBatchTime = tick()
 	QMAScheduler.LastPlayerCount = N
+	QMAScheduler.RosterInitialized = true
+	QMAScheduler.CycleComplete = false
+	QMAScheduler.CycleSerial += 1
+end
+
+function QMAScheduler.HasRosterChanged(allPlayers)
+	if not QMAScheduler.RosterInitialized or #allPlayers ~= #QMAScheduler.Queue then
+		return true
+	end
+	local current = {}
+	for _, plr in ipairs(allPlayers) do
+		if plr then current[plr] = true end
+	end
+	for _, plr in ipairs(QMAScheduler.Queue) do
+		if not current[plr] then return true end
+	end
+	for plr in pairs(current) do
+		if not QMAScheduler.RosterSet[plr] then return true end
+	end
+	return false
 end
 
 function QMAScheduler.GetSharedData(allPlayers, now)
@@ -2833,28 +2863,38 @@ local OTI = {
 }
 _G.Celestial.OTI = OTI
 
-local RealPlayerScan = {Count = 0, CycleLimit = 0, LastPlayerCount = 0, PauseUntil = 0}
+local RealPlayerScan = {
+	Count = 0,
+	CycleLimit = 0,
+	LastPlayerCount = 0,
+	PauseUntil = 0,
+	SeenPlayers = {},
+}
 _G.Celestial.RealPlayerScan = RealPlayerScan
 
-local function RecordRealPlayerScanPlayer(playerCount)
-	playerCount = tonumber(playerCount) or 0
-	if playerCount <= 0 then return end
-	local now = tick()
-	if now < (RealPlayerScan.PauseUntil or 0) then return end
-	if RealPlayerScan.LastPlayerCount ~= playerCount then
-		RealPlayerScan.Count = 0
-		RealPlayerScan.LastPlayerCount = playerCount
-		RealPlayerScan.CycleLimit = playerCount * playerCount
-	end
-	local cycleLimit = playerCount * playerCount
-	RealPlayerScan.CycleLimit = cycleLimit
-	if RealPlayerScan.Count >= cycleLimit then return end
-	RealPlayerScan.Count += 1
+local function UpdateRealPlayerScanLabel()
 	local label = _G.Celestial.ScannedPlayersLabel
 	if label and label.Parent then
 		label.Text = "Scanned Players: " .. tostring(RealPlayerScan.Count)
 	end
-	if RealPlayerScan.Count >= cycleLimit then RealPlayerScan.PauseUntil = now + 15 end
+end
+
+local function BeginRealPlayerScanCycle(allPlayers)
+	table.clear(RealPlayerScan.SeenPlayers)
+	RealPlayerScan.Count = 0
+	RealPlayerScan.CycleLimit = #allPlayers
+	RealPlayerScan.LastPlayerCount = #allPlayers
+	RealPlayerScan.PauseUntil = 0
+	UpdateRealPlayerScanLabel()
+end
+
+local function RecordRealPlayerScanPlayer(player)
+	if not player or not player.Parent then return end
+	-- Count each roster member once in the current cycle; never use N * N.
+	if RealPlayerScan.SeenPlayers[player] then return end
+	RealPlayerScan.SeenPlayers[player] = true
+	RealPlayerScan.Count = math.min(RealPlayerScan.Count + 1, RealPlayerScan.CycleLimit)
+	UpdateRealPlayerScanLabel()
 end
 
 local function ResetRealPlayerScanDisplay()
@@ -2862,8 +2902,8 @@ local function ResetRealPlayerScanDisplay()
 	RealPlayerScan.CycleLimit = 0
 	RealPlayerScan.LastPlayerCount = 0
 	RealPlayerScan.PauseUntil = 0
-	local label = _G.Celestial.ScannedPlayersLabel
-	if label and label.Parent then label.Text = "Scanned Players: 0" end
+	table.clear(RealPlayerScan.SeenPlayers)
+	UpdateRealPlayerScanLabel()
 end
 
 local function OTI_IsHeldOrInteractive(obj)
@@ -3197,12 +3237,18 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 	end
 	
 	local allPlayers = Players:GetPlayers()
-	local N = #allPlayers - 1
-	if N ~= QMAScheduler.LastPlayerCount then
+	if QMAScheduler.HasRosterChanged(allPlayers) then
 		QMAScheduler.RebuildQueue(allPlayers)
+		BeginRealPlayerScanCycle(allPlayers)
 	end
 	
 	if now >= QMAScheduler.NextBatchTime then
+		if QMAScheduler.CycleComplete then
+			-- Begin a fresh pass over the current roster, not an N-by-N pass.
+			QMAScheduler.CycleComplete = false
+			table.clear(QMAScheduler.ProcessedThisCycle)
+			BeginRealPlayerScanCycle(allPlayers)
+		end
 		local processed = 0
 		local myRoot = GetRoot()
 		if myRoot then
@@ -3211,10 +3257,20 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 			while processed < QMAScheduler.BatchSize and QMAScheduler.Index <= #QMAScheduler.Queue do
 				local player = QMAScheduler.Queue[QMAScheduler.Index]
 				QMAScheduler.Index = QMAScheduler.Index + 1
-				processed = processed + 1
 				
-				if player and player.Parent and player.Character then
-					RecordRealPlayerScanPlayer(#allPlayers)
+				-- Hard guard: one queue entry can be processed only once per cycle.
+				-- A changed roster triggers RebuildQueue above and starts a fresh cycle.
+				if player and not QMAScheduler.ProcessedThisCycle[player] then
+					QMAScheduler.ProcessedThisCycle[player] = true
+					processed = processed + 1
+					if player.Parent then
+						RecordRealPlayerScanPlayer(player)
+					end
+				else
+					-- Defensive guard against duplicate queue entries; don't count them.
+					continue
+				end
+				if player and player ~= LocalPlayer and player.Parent and player.Character then
 					local analysis = AnalyzePlayer(player, myRoot, now, State.AntiFlingScanInterval or 0.08, allPlayers, shared)
 					if analysis.Valid then
 						local history = GetHistory(player)
@@ -3301,6 +3357,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 		
 		if QMAScheduler.Index > #QMAScheduler.Queue then
 			QMAScheduler.Index = 1
+			QMAScheduler.CycleComplete = true
 		end
 		
 		QMAScheduler.NextBatchTime = now + QMAScheduler.TimePerBatch
