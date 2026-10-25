@@ -1,4 +1,5 @@
--- StabilityLog12: queue CH auto-load for manual Rejoin/Server Hop as well as automatic low-player Server Hop.
+-- StabilityLog14: smarter Murderer-threat routing and temporary internal escape-speed boost.
+-- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
 -- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
@@ -1117,23 +1118,34 @@ do
 	local httpService = game:GetService("HttpService")
 	local teleportService = game:GetService("TeleportService")
 	local mm2PlaceId = 142823291
+	local clearAutoHopState -- forward declaration used by teleport failure callbacks
+	local function isFullServerFailure(result, message)
+		local detail = string.lower(tostring(result or "") .. " " .. tostring(message or ""))
+		return detail:find("server is full", 1, true) ~= nil
+			or detail:find("server full", 1, true) ~= nil
+			or detail:find("game is full", 1, true) ~= nil
+			or detail:find("gamefull", 1, true) ~= nil
+			or detail:find("max players", 1, true) ~= nil
+			or detail:find("full", 1, true) ~= nil
+	end
 	if _G.Celestial.ServerTeleportFailureConnection then
 		pcall(function() _G.Celestial.ServerTeleportFailureConnection:Disconnect() end)
 	end
-	-- Keep teleport failures visible. Do not silently fall back to a random server,
-	-- because that violates the explicit Rejoin Same Server destination.
+	-- Route failures to the active operation so it can retry or unlock the button.
 	_G.Celestial.PendingServerTeleport = nil
-	local clearAutoHopState -- forward declaration used by teleport failure callbacks
 	_G.Celestial.ServerTeleportFailureConnection = teleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
 		if player ~= LocalPlayer then return end
 		local pending = _G.Celestial.PendingServerTeleport
 		if placeId and tonumber(placeId) ~= game.PlaceId then return end
 		local kind = type(pending) == "table" and pending.kind or "Teleport"
 		warn("[Celestial Hub][" .. tostring(kind) .. "] TeleportInitFailed: " .. tostring(result) .. " — " .. tostring(message))
+		if type(pending) == "table" and pending.waitingForFailure and pending.failureSignal then
+			local okFire = pcall(function() pending.failureSignal:Fire(result, message, false) end)
+			if okFire then return end
+		end
 		_G.Celestial.PendingServerTeleport = nil
 		if clearAutoHopState then clearAutoHopState() end
 	end)
-
 	clearAutoHopState = function()
 		pcall(function()
 			if type(delfile) == "function" then delfile(stateFile)
@@ -1222,7 +1234,7 @@ do
 		return candidates, nil
 	end
 
-	local function queueTeleportRelaunch(targetJobId, mode)
+	local function queueTeleportRelaunch(targetJobId, mode, enqueueBootstrap)
 		local allowedModes = {auto_server_hop = true, manual_server_hop = true, rejoin_same_server = true}
 		if not allowedModes[mode] then return false, "unsupported teleport resume mode" end
 		if type(writefile) ~= "function" then return false, "executor lacks writefile" end
@@ -1240,6 +1252,8 @@ do
 		if not okEncode or type(encoded) ~= "string" then return false, "could not serialize CH settings" end
 		local okWrite = pcall(writefile, stateFile, encoded)
 		if not okWrite then return false, "could not save CH settings" end
+		-- Retry attempts update the destination marker but reuse the queued bootstrap.
+		if enqueueBootstrap == false then return true end
 
 		local env, queueFunction = nil, nil
 		pcall(function() if type(getgenv) == "function" then env = getgenv() end end)
@@ -1360,6 +1374,47 @@ print("[Celestial Hub][Auto-load] CH source executed for " .. tostring(d.mode))
 		return true
 	end
 
+	local function finishManualTeleport(operation, message)
+		if _G.Celestial.PendingServerTeleport == operation then _G.Celestial.PendingServerTeleport = nil end
+		operation.waitingForFailure = false
+		if operation.failureSignal then pcall(function() operation.failureSignal:Destroy() end); operation.failureSignal = nil end
+		clearAutoHopState()
+		if message and message ~= "" then warn("[Celestial Hub][" .. tostring(operation.kind) .. "] " .. tostring(message)) end
+	end
+
+	local function beginAttemptWait(operation, timeoutSeconds)
+		local failureSignal = Instance.new("BindableEvent")
+		local resultReady = Instance.new("BindableEvent")
+		local timeoutToken = {}
+		local outcome, completed = nil, false
+		local connection = failureSignal.Event:Connect(function(result, message, extra)
+			if completed then return end
+			completed = true
+			outcome = {result = result, message = message, timedOut = extra == timeoutToken}
+			resultReady:Fire()
+		end)
+		operation.failureSignal, operation.waitingForFailure = failureSignal, true
+		task.delay(timeoutSeconds, function()
+			if operation.waitingForFailure and operation.failureSignal == failureSignal then
+				pcall(function() failureSignal:Fire(nil, "Teleport attempt timed out", timeoutToken) end)
+			end
+		end)
+		local function cleanup()
+			operation.waitingForFailure = false
+			if operation.failureSignal == failureSignal then operation.failureSignal = nil end
+			pcall(function() connection:Disconnect() end)
+			pcall(function() failureSignal:Destroy() end)
+			pcall(function() resultReady:Destroy() end)
+		end
+		local function awaitResult()
+			if not completed then resultReady.Event:Wait() end
+			local current = outcome or {}
+			cleanup()
+			return current.result, current.message, current.timedOut == true
+		end
+		return awaitResult, cleanup
+	end
+
 	local function manualRejoin()
 		local placeId, jobId = game.PlaceId, game.JobId
 		if not jobId or jobId == "" then
@@ -1370,28 +1425,29 @@ print("[Celestial Hub][Auto-load] CH source executed for " .. tostring(d.mode))
 			warn("[Celestial Hub][Rejoin Same Server] A teleport is already pending.")
 			return false, "Another teleport is pending"
 		end
-		local prepared, prepareError = queueTeleportRelaunch(jobId, "rejoin_same_server")
-		if not prepared then
-			warn("[Celestial Hub][Rejoin Same Server] Auto-load could not be queued: " .. tostring(prepareError))
-			return false, tostring(prepareError)
-		end
-		_G.Celestial.PendingServerTeleport = {kind = "Rejoin Same Server", targetJobId = jobId, startedAt = tick()}
-		local okTeleport, teleportErr = pcall(function()
-			teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
-		end)
-		if not okTeleport then
-			_G.Celestial.PendingServerTeleport = nil
-			clearAutoHopState()
-			warn("[Celestial Hub][Rejoin Same Server] Request failed: " .. tostring(teleportErr))
-			return false, tostring(teleportErr)
-		end
-		print("[Celestial Hub][Rejoin Same Server] Requested instance " .. tostring(jobId) .. " and queued CH auto-load. Roblox may reject a request to the already-current instance; see TeleportInitFailed if no transition occurs.")
-		task.delay(30, function()
-			local pending = _G.Celestial.PendingServerTeleport
-			if type(pending) == "table" and pending.kind == "Rejoin Same Server" and pending.targetJobId == jobId then
-				warn("[Celestial Hub][Rejoin Same Server] No server transition was observed after 30 seconds; Roblox may have ignored the same-instance request.")
-				_G.Celestial.PendingServerTeleport = nil
-				clearAutoHopState()
+		local operation = {kind = "Rejoin Same Server", targetJobId = jobId, startedAt = tick(), attempts = 0}
+		_G.Celestial.PendingServerTeleport = operation
+		task.spawn(function()
+			local bootstrapQueued = false
+			for attempt = 1, 3 do
+				if _G.Celestial.PendingServerTeleport ~= operation then return end
+				operation.attempts = attempt
+				local prepared, prepareError = queueTeleportRelaunch(jobId, "rejoin_same_server", not bootstrapQueued)
+				if not prepared then finishManualTeleport(operation, "Auto-load could not be queued: " .. tostring(prepareError)); return end
+				bootstrapQueued = true
+				operation.targetJobId = jobId
+				local awaitResult, cancelWait = beginAttemptWait(operation, 12)
+				local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer) end)
+				local result, message, timedOut
+				if okTeleport then result, message, timedOut = awaitResult() else cancelWait(); result, message, timedOut = nil, tostring(teleportErr), false end
+				if attempt < 3 and _G.Celestial.PendingServerTeleport == operation then
+					warn("[Celestial Hub][Rejoin Same Server] Attempt " .. tostring(attempt) .. "/3 failed; retrying the same JobId.")
+					task.wait(1)
+				else
+					local reason = timedOut and "No teleport confirmation after 3 attempts; the button has been reset." or ("Rejoin failed after 3 attempts: " .. tostring(message or result or teleportErr) .. ". The button has been reset.")
+					finishManualTeleport(operation, reason)
+					return
+				end
 			end
 		end)
 		return true
@@ -1402,44 +1458,60 @@ print("[Celestial Hub][Auto-load] CH source executed for " .. tostring(d.mode))
 			warn("[Celestial Hub][Server Hop] A teleport is already pending.")
 			return false, "Another teleport is pending"
 		end
-		local candidates, listError = collectServerCandidates(#Players:GetPlayers())
-		if #candidates == 0 then
-			warn("[Celestial Hub][Server Hop] Could not load eligible public servers: " .. tostring(listError or "unknown server-list error"))
-			return false, listError or "No eligible public servers"
-		end
-		-- Prefer populated servers so a hop does not routinely send the player into an empty lobby.
-		local populated = {}
-		for _, candidate in ipairs(candidates) do
-			if candidate.playing > 0 then table.insert(populated, candidate) end
-		end
-		local pool = #populated > 0 and populated or candidates
-		for i = #pool, 2, -1 do
-			local j = math.random(1, i)
-			pool[i], pool[j] = pool[j], pool[i]
-		end
-		local selected = pool[1]
-		local prepared, prepareError = queueTeleportRelaunch(selected.id, "manual_server_hop")
-		if not prepared then
-			warn("[Celestial Hub][Server Hop] Auto-load could not be queued; teleport cancelled: " .. tostring(prepareError))
-			return false, tostring(prepareError)
-		end
-		_G.Celestial.PendingServerTeleport = {kind = "Server Hop", targetJobId = selected.id, startedAt = tick()}
-		local okTeleport, teleportErr = pcall(function()
-			teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer)
-		end)
-		if not okTeleport then
-			_G.Celestial.PendingServerTeleport = nil
-			clearAutoHopState()
-			warn("[Celestial Hub][Server Hop] Request to server " .. tostring(selected.id) .. " failed: " .. tostring(teleportErr))
-			return false, tostring(teleportErr)
-		end
-		print("[Celestial Hub][Server Hop] Requested server " .. tostring(selected.id) .. " (" .. tostring(selected.playing) .. "/" .. tostring(selected.maxPlayers) .. " players). If you remain in this server, check TeleportInitFailed in the console.")
-		task.delay(20, function()
-			local pending = _G.Celestial.PendingServerTeleport
-			if type(pending) == "table" and pending.kind == "Server Hop" and pending.targetJobId == selected.id then
-				warn("[Celestial Hub][Server Hop] No server transition was observed after 20 seconds; the target may have closed or Roblox rejected the teleport.")
-				_G.Celestial.PendingServerTeleport = nil
-				clearAutoHopState()
+		local operation = {kind = "Server Hop", startedAt = tick(), attempts = 0, triedServers = {}}
+		_G.Celestial.PendingServerTeleport = operation
+		task.spawn(function()
+			local bootstrapQueued = false
+			for attempt = 1, 3 do
+				if _G.Celestial.PendingServerTeleport ~= operation then return end
+				local candidates, listError = collectServerCandidates(#Players:GetPlayers())
+				local available = {}
+				for _, candidate in ipairs(candidates) do
+					if not operation.triedServers[candidate.id] then table.insert(available, candidate) end
+				end
+				if #available == 0 then
+					if attempt < 3 then
+						warn("[Celestial Hub][Server Hop] No untried public server is available; refreshing the list (" .. tostring(attempt) .. "/3). " .. tostring(listError or ""))
+						task.wait(1.25)
+					else
+						finishManualTeleport(operation, "No eligible untried public server was found after 3 searches; the button has been reset.")
+						return
+					end
+				else
+					local populated = {}
+					for _, candidate in ipairs(available) do if candidate.playing > 0 then table.insert(populated, candidate) end end
+					local pool = #populated > 0 and populated or available
+					local selected = pool[math.random(1, #pool)]
+					operation.attempts, operation.targetJobId = attempt, selected.id
+					local prepared, prepareError = queueTeleportRelaunch(selected.id, "manual_server_hop", not bootstrapQueued)
+					if not prepared then finishManualTeleport(operation, "Auto-load could not be queued; teleport cancelled: " .. tostring(prepareError)); return end
+					bootstrapQueued = true
+					local awaitResult, cancelWait = beginAttemptWait(operation, 15)
+					local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer) end)
+					local result, message, timedOut
+					if okTeleport then result, message, timedOut = awaitResult() else cancelWait(); result, message, timedOut = nil, tostring(teleportErr), false end
+					local fullFailure = isFullServerFailure(result, message or teleportErr)
+					if not okTeleport then fullFailure = isFullServerFailure(nil, teleportErr) end
+					if fullFailure then
+						operation.triedServers[selected.id] = true
+						clearAutoHopState()
+						if attempt < 3 then
+							warn("[Celestial Hub][Server Hop] Target server was full; searching for another server (" .. tostring(attempt) .. "/3).")
+							task.wait(1)
+						else
+							finishManualTeleport(operation, "Three server-full failures occurred; the button has been reset and can be pressed again.")
+							return
+						end
+					elseif timedOut then
+						finishManualTeleport(operation, "No teleport result was received within 15 seconds; the button has been reset. Press Server Hop to try again.")
+						return
+					elseif not okTeleport or result ~= nil or message ~= nil then
+						finishManualTeleport(operation, "Teleport failed for a reason other than a full server: " .. tostring(message or result or teleportErr) .. ". The button has been reset.")
+						return
+					else
+						return
+					end
+				end
 			end
 		end)
 		return true
@@ -6214,8 +6286,8 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 	local horizontal = horizontalDirection and horizontalDirection * horizontalBudget or Vector3.zero
 	local targetVelocity = horizontal + Vector3.new(0, y, 0)
 
-	-- Slew-limit the command vector, not its eventual magnitude. This reduces one-frame
-	-- jumps between velocity vectors while preserving the configured max speed of 80.
+	-- Slew-limit the command vector to prevent one-frame jumps. The configured slider max
+	-- remains 80; only the narrow Murderer-response path may request a temporary higher speed.
 	if CoinEngine.AdaptiveStability then
 		local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 1 / 30)
 		local baseAccel = tonumber(CoinEngine.CommandAcceleration) or 150
@@ -7726,6 +7798,37 @@ local function PickThreatCoin(fromPos, exclude, now)
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 
+	-- Predict a short, bounded horizontal movement of the Murderer. The cap prevents a
+	-- single physics spike from sending the coin selector toward an unrealistic prediction.
+	local predictedMurderPos = murderPos
+	pcall(function()
+		local velocity = murderRoot.AssemblyLinearVelocity
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+		if horizontal.Magnitude > 30 then horizontal = horizontal.Unit * 30 end
+		predictedMurderPos = murderPos + horizontal * 0.35
+	end)
+
+	local function ScoreThreatCandidate(coinPos)
+		local currentGap = (coinPos - murderPos).Magnitude
+		local predictedGap = (coinPos - predictedMurderPos).Magnitude
+		local safetyGap = math.min(currentGap, predictedGap)
+		local routeVector = coinPos - fromPos
+		local awayVector = fromPos - murderPos
+		local awayDot = 0
+		if routeVector.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
+			awayDot = routeVector.Unit:Dot(awayVector.Unit)
+		end
+
+		-- Short routes still matter, but a clearly safer/farther coin now wins more often.
+		-- The directional term penalizes routes toward the Murderer; the separation reward
+		-- favors coins farther from both the current and short-term predicted threat position.
+		local directionPenalty = (1 - awayDot) * 16
+		local riskPenalty = math.max(0, threat.PreferredSeparation - safetyGap) * 10
+		local separationReward = math.min(safetyGap, 120) * 0.55
+		local score = CoinTravelScore(fromPos, coinPos) + directionPenalty + riskPenalty - separationReward
+		return score, safetyGap, currentGap, predictedGap
+	end
+
 	local function FindCandidate(verticalLimit, requireSeparation)
 		local best, bestScore = nil, math.huge
 		for coin in pairs(CoinEngine.CoinCache) do
@@ -7741,21 +7844,13 @@ local function PickThreatCoin(fromPos, exclude, now)
 					local delta = coin.Position - fromPos
 					local verticalGap = math.abs(delta.Y)
 					local distance = delta.Magnitude
-					local murderGap = (coin.Position - murderPos).Magnitude
+					local score, safetyGap = ScoreThreatCandidate(coin.Position)
 					if not blacklistedUntil and IsSafeCoinPosition(coin.Position)
 						and verticalGap <= verticalLimit and distance <= maxDistance
-						and (not requireSeparation or murderGap >= threat.PreferredSeparation) then
-						if IsGrounded(coin) then
-							local routeVector = coin.Position - fromPos
-							local awayVector = fromPos - murderPos
-							local directionPenalty = 0
-							if routeVector.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
-								local awayDot = routeVector.Unit:Dot(awayVector.Unit)
-								directionPenalty = math.max(0, 0.25 - awayDot) * 24
-							end
-							local score = CoinTravelScore(fromPos, coin.Position) + directionPenalty
-							if score < bestScore then best, bestScore = coin, score end
-						else
+						and (not requireSeparation or safetyGap >= threat.PreferredSeparation) then
+						if IsGrounded(coin) and score < bestScore then
+							best, bestScore = coin, score
+						elseif not IsGrounded(coin) then
 							CoinEngine.Blacklist[coin] = now + 6
 						end
 					end
@@ -7765,35 +7860,31 @@ local function PickThreatCoin(fromPos, exclude, now)
 		return best
 	end
 
-	-- First try coins with room from the Murderer on the current floor, then other floors.
+	-- Prefer a reachable coin that is safe relative to both the current and predicted path.
 	local candidate = FindCandidate(preferredGap, true)
 	if candidate then return candidate end
 	candidate = FindCandidate(maxGap, true)
 	if candidate then return candidate end
 
-	-- If every available coin is close to the threat, choose a reachable coin using a
-	-- distance penalty. This degrades gracefully instead of stopping coin collection.
+	-- If every candidate is close to the threat, keep collection running but rank the options
+	-- by predicted separation and escape direction instead of stopping the farm.
 	local fallback, fallbackScore = nil, math.huge
 	for coin in pairs(CoinEngine.CoinCache) do
-		if coin ~= exclude and coin.Parent and IsInRecognizedCoinSource(coin) and IsValidCoin(coin) then
-			local bl = CoinEngine.Blacklist[coin]
-			if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-			local delta = coin.Position - fromPos
-			local murderGap = (coin.Position - murderPos).Magnitude
-			if not bl and IsSafeCoinPosition(coin.Position)
-				and math.abs(delta.Y) <= maxGap and delta.Magnitude <= maxDistance then
-				if IsGrounded(coin) then
-					local riskPenalty = math.max(0, threat.PreferredSeparation - murderGap) * 8
-					local awayVector = fromPos - murderPos
-					local directionPenalty = 0
-					if delta.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
-						local awayDot = delta.Unit:Dot(awayVector.Unit)
-						directionPenalty = math.max(0, 0.25 - awayDot) * 24
+		if coin ~= exclude then
+			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+				UnregisterCoin(coin)
+			else
+				local bl = CoinEngine.Blacklist[coin]
+				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
+				local delta = coin.Position - fromPos
+				if not bl and IsSafeCoinPosition(coin.Position)
+					and math.abs(delta.Y) <= maxGap and delta.Magnitude <= maxDistance then
+					if IsGrounded(coin) then
+						local score = ScoreThreatCandidate(coin.Position)
+						if score < fallbackScore then fallback, fallbackScore = coin, score end
+					else
+						CoinEngine.Blacklist[coin] = now + 6
 					end
-					local score = CoinTravelScore(fromPos, coin.Position) + riskPenalty + directionPenalty
-					if score < fallbackScore then fallback, fallbackScore = coin, score end
-				else
-					CoinEngine.Blacklist[coin] = now + 6
 				end
 			end
 		end
@@ -8217,8 +8308,34 @@ local function ControllerStep(dt)
 				shouldSwitch = true
 				LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1")
 			end
-			if CoinEngine.ThreatResponse.Active and not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
-				shouldSwitch = true
+			if CoinEngine.ThreatResponse.Active then
+				local threat = CoinEngine.ThreatResponse
+				if not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
+					shouldSwitch = true
+				else
+					local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
+					if murderRoot then
+						local murderPos = murderRoot.Position
+						local currentGap = (cur.Position - murderPos).Magnitude
+						local candidateGap = (cand.Position - murderPos).Magnitude
+						local away = root.Position - murderPos
+						local currentRoute = cur.Position - root.Position
+						local candidateRoute = cand.Position - root.Position
+						local currentAwayDot, candidateAwayDot = 0, 0
+						if away.Magnitude > 0.01 and currentRoute.Magnitude > 0.01 then
+							currentAwayDot = currentRoute.Unit:Dot(away.Unit)
+						end
+						if away.Magnitude > 0.01 and candidateRoute.Magnitude > 0.01 then
+							candidateAwayDot = candidateRoute.Unit:Dot(away.Unit)
+						end
+						-- Switch if the candidate opens a meaningful distance gap, or is noticeably
+						-- more aligned with escape while not sacrificing much separation.
+						if candidateGap >= currentGap + 6
+							or (candidateAwayDot >= currentAwayDot + 0.45 and candidateGap >= currentGap - 4) then
+							shouldSwitch = true
+						end
+					end
+				end
 			end
 			if shouldSwitch then SetCurrent(cand, now) end
 		end
@@ -8352,6 +8469,30 @@ local function ControllerStep(dt)
 	if solidStall and speed > 50 then
 		speed = 50
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
+	end
+
+	-- Threat-only internal boost: the visible Tween Speed slider/state is never changed.
+	-- Ordinary/Haste threat response adds 25 speed units (25->50, 50->75, 75->100).
+	-- Sprint gets at least +25 and scales up to +55% of the selected base speed.
+	-- The existing adaptive/latency safety reduction is retained proportionally; boosts are
+	-- suppressed during a confirmed solid-stall to avoid pushing harder into blocked geometry.
+	local threat = CoinEngine.ThreatResponse
+	if threat.Active and threat.Murderer and not solidStall then
+		local detector = _G.Celestial and _G.Celestial.PowerDetector
+		local isSprintMurderer = detector and detector.CurrentPlayer == threat.Murderer
+			and detector.CurrentPower == "Sprint"
+		local desiredThreatSpeed = sliderSpeed + 25
+		local boostReason = "murder-escape"
+		if isSprintMurderer then
+			desiredThreatSpeed = sliderSpeed + math.max(25, sliderSpeed * 0.55)
+			boostReason = "murder-escape-sprint"
+		end
+		local safetyScale = sliderSpeed > 0 and math.clamp(speed / sliderSpeed, 0, 1) or 0
+		local additionalSpeed = math.max(0, desiredThreatSpeed - sliderSpeed) * safetyScale
+		if additionalSpeed > 0 then
+			speed = math.min(speed + additionalSpeed, 124)
+			safetyReason = safetyReason == "normal" and boostReason or (safetyReason .. "+" .. boostReason)
+		end
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
 		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms slowFrames=%d pingEma=%.0f solid=%d",
