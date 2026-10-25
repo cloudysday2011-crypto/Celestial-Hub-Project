@@ -122,6 +122,20 @@ _G.Celestial.ShowScanningGui = function()
 	return scanGui
 end
 
+-- Create the startup loader immediately after its factory exists. This deliberately
+-- precedes cleanup/scanning/setup code so an early runtime failure cannot hide it.
+if not _G.Celestial.AutoHopResume then
+	local loaderOk, loaderOrError = pcall(_G.Celestial.ShowScanningGui)
+	if loaderOk then
+		_G.Celestial.ScanGui = loaderOrError
+	else
+		warn("Celestial Hub startup loader failed: " .. tostring(loaderOrError))
+		_G.Celestial.ScanGui = nil
+	end
+else
+	_G.Celestial.ScanGui = nil
+end
+
 -- Reset-log recovery intentionally does not read files here. It runs only after the
 -- Hub startup screen/UI has finished, so the order is Hub -> Loading Reset Log -> content.
 _G.Celestial.PreviousFarmResetLogSnapshot = nil
@@ -264,13 +278,6 @@ end
 
 local existingESP = CoreGui:FindFirstChild("CelestialESP")
 if existingESP then existingESP:Destroy() end
-
--- Manual execution retains the startup loader; auto-hop re-entry skips only this loader.
-if not _G.Celestial.AutoHopResume then
-	_G.Celestial.ScanGui = _G.Celestial.ShowScanningGui()
-else
-	_G.Celestial.ScanGui = nil
-end
 
 _G.Celestial.ESPFolder = Instance.new("Folder")
 _G.Celestial.ESPFolder.Name = "CelestialESP"
