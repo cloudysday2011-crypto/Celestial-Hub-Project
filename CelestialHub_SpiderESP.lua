@@ -70,7 +70,7 @@ end
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
 
-local function ShowScanningGui()
+_G.Celestial.ShowScanningGui = function()
 	local scanGui = Instance.new("ScreenGui")
 	scanGui.Name = "CelestialScanGui"
 	scanGui.ResetOnSpawn = false
@@ -9952,7 +9952,7 @@ end
 
 local scanGui = nil
 if not _G.Celestial.AutoHopResume then
-	scanGui = ShowScanningGui()
+	scanGui = _G.Celestial.ShowScanningGui()
 	_G.Celestial.ScanGui = scanGui
 end
 local scanStartTime = tick()
