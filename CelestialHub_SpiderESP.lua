@@ -32,6 +32,59 @@ end
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
+
+_G.Celestial.ShowScanningGui = function()
+	local scanGui = Instance.new("ScreenGui")
+	scanGui.Name = "CelestialScanGui"
+	scanGui.ResetOnSpawn = false
+	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	scanGui.IgnoreGuiInset = true
+	scanGui.Parent = CoreGui
+
+	local mainFrame = Instance.new("Frame")
+	mainFrame.Name = "ScanningFrame"
+	mainFrame.Size = UDim2.new(0, 300, 0, 192)
+	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	mainFrame.BackgroundTransparency = 0.25
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Parent = scanGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 16)
+	corner.Parent = mainFrame
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "ScanImage"
+	image.Size = UDim2.new(0, 140, 0, 140)
+	image.Position = UDim2.new(0.5, -70, 0, 10)
+	image.BackgroundTransparency = 1
+	image.Image = "rbxassetid://91431616848054"
+	image.ScaleType = Enum.ScaleType.Fit
+	image.Parent = mainFrame
+
+	local text = Instance.new("TextLabel")
+	text.Name = "ScanText"
+	text.Size = UDim2.new(1, -20, 0, 25)
+	text.Position = UDim2.new(0, 10, 1, -32)
+	text.BackgroundTransparency = 1
+	text.Text = "Loading Celestial Hub..."
+	text.TextColor3 = Color3.fromRGB(255, 255, 255)
+	text.Font = Enum.Font.GothamBold
+	text.TextSize = 18
+	text.Parent = mainFrame
+
+	_G.Celestial.ScanGui = scanGui
+
+	task.spawn(function()
+		while scanGui.Parent do
+			task.wait(0.02)
+			image.Rotation = (image.Rotation + 5) % 360
+		end
+	end)
+	return scanGui
+end
+
 -- Reset-log recovery intentionally does not read files here. It runs only after the
 -- Hub startup screen/UI has finished, so the order is Hub -> Loading Reset Log -> content.
 _G.Celestial.PreviousFarmResetLogSnapshot = nil
@@ -174,6 +227,9 @@ end
 
 local existingESP = CoreGui:FindFirstChild("CelestialESP")
 if existingESP then existingESP:Destroy() end
+
+-- Create the startup loader after cleanup so it survives the initial reset.
+_G.Celestial.ScanGui = _G.Celestial.ShowScanningGui()
 
 _G.Celestial.ESPFolder = Instance.new("Folder")
 _G.Celestial.ESPFolder.Name = "CelestialESP"
@@ -712,59 +768,6 @@ end
 -- ====================================================================
 -- SCANNING GUI
 -- ====================================================================
-
-local function ShowScanningGui()
-	local scanGui = Instance.new("ScreenGui")
-	scanGui.Name = "CelestialScanGui"
-	scanGui.ResetOnSpawn = false
-	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	scanGui.IgnoreGuiInset = true
-	scanGui.Parent = CoreGui
-
-	local mainFrame = Instance.new("Frame")
-	mainFrame.Name = "ScanningFrame"
-	mainFrame.Size = UDim2.new(0, 300, 0, 192)
-	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
-	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	mainFrame.BackgroundTransparency = 0.25
-	mainFrame.BorderSizePixel = 0
-	mainFrame.Parent = scanGui
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 16)
-	corner.Parent = mainFrame
-
-	local image = Instance.new("ImageLabel")
-	image.Name = "ScanImage"
-	image.Size = UDim2.new(0, 140, 0, 140)
-	image.Position = UDim2.new(0.5, -70, 0, 10)
-	image.BackgroundTransparency = 1
-	image.Image = "rbxassetid://91431616848054"
-	image.ScaleType = Enum.ScaleType.Fit
-	image.Parent = mainFrame
-
-	local text = Instance.new("TextLabel")
-	text.Name = "ScanText"
-	text.Size = UDim2.new(1, -20, 0, 25)
-	text.Position = UDim2.new(0, 10, 1, -32)
-	text.BackgroundTransparency = 1
-	text.Text = "Loading Celestial Hub..."
-	text.TextColor3 = Color3.fromRGB(255, 255, 255)
-	text.Font = Enum.Font.GothamBold
-	text.TextSize = 18
-	text.Parent = mainFrame
-
-	_G.Celestial.ScanGui = scanGui
-
-	task.spawn(function()
-		while scanGui.Parent do
-			task.wait(0.02)
-			image.Rotation = (image.Rotation + 5) % 360
-		end
-	end)
-	return scanGui
-end
-
 
 -- Uses the same visual loader as the normal Hub startup; only the text and GUI name differ.
 local function ShowKickLogLoadingGui()
@@ -2411,12 +2414,12 @@ end
 -- QMA player-only physical separation. Uses pairwise NoCollisionConstraint objects:
 -- does not rewrite CanCollide/CanTouch or collision groups, and never pairs character
 -- parts with map geometry or coins. Tool parts are excluded to avoid modifying weapon parts.
-local QMAPassThroughFolder = nil
-local function QMAPartKey(part)
+AntiFlingQuantum.QMAPassThroughFolder = nil
+function AntiFlingQuantum.QMAPartKey(part)
 	local ok, id = pcall(function() return part:GetDebugId() end)
 	return ok and tostring(id) or part:GetFullName()
 end
-local function IsInsideTool(part)
+function AntiFlingQuantum.IsInsideTool(part)
 	local node = part and part.Parent
 	while node and node ~= workspace do
 		if node:IsA("Tool") then return true end
@@ -2432,9 +2435,9 @@ end
 
 function AntiFlingQuantum.ClearPlayerPassThrough()
 	local psep = AntiFlingQuantum.PersistentSeparation
-	if QMAPassThroughFolder then
-		pcall(function() QMAPassThroughFolder:Destroy() end)
-		QMAPassThroughFolder = nil
+	if AntiFlingQuantum.QMAPassThroughFolder then
+		pcall(function() AntiFlingQuantum.QMAPassThroughFolder:Destroy() end)
+		AntiFlingQuantum.QMAPassThroughFolder = nil
 	end
 	if psep then psep.OriginalGroups = {}; psep.Active = false; psep.Constraints = {} end
 end
@@ -2448,10 +2451,10 @@ function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
 		AntiFlingQuantum.ClearPlayerPassThrough()
 		return
 	end
-	if not QMAPassThroughFolder or not QMAPassThroughFolder.Parent then
-		QMAPassThroughFolder = Instance.new("Folder")
-		QMAPassThroughFolder.Name = "QMA_PlayerOnlySeparation"
-		QMAPassThroughFolder.Parent = localCharacter
+	if not AntiFlingQuantum.QMAPassThroughFolder or not AntiFlingQuantum.QMAPassThroughFolder.Parent then
+		AntiFlingQuantum.QMAPassThroughFolder = Instance.new("Folder")
+		AntiFlingQuantum.QMAPassThroughFolder.Name = "QMA_PlayerOnlySeparation"
+		AntiFlingQuantum.QMAPassThroughFolder.Parent = localCharacter
 		psep.Constraints = {}
 	end
 	local wanted = {}
@@ -2460,21 +2463,21 @@ function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
 		if otherCharacter and otherCharacter.Parent then
 			local localParts, otherParts = {}, {}
 			for _, part in ipairs(localCharacter:GetDescendants()) do
-				if part:IsA("BasePart") and not IsInsideTool(part) then table.insert(localParts, part) end
+				if part:IsA("BasePart") and not AntiFlingQuantum.IsInsideTool(part) then table.insert(localParts, part) end
 			end
 			for _, part in ipairs(otherCharacter:GetDescendants()) do
-				if part:IsA("BasePart") and not IsInsideTool(part) then table.insert(otherParts, part) end
+				if part:IsA("BasePart") and not AntiFlingQuantum.IsInsideTool(part) then table.insert(otherParts, part) end
 			end
 			for _, a in ipairs(localParts) do
 				for _, b in ipairs(otherParts) do
-					local key = QMAPartKey(a) .. "|" .. QMAPartKey(b)
+					local key = AntiFlingQuantum.QMAPartKey(a) .. "|" .. AntiFlingQuantum.QMAPartKey(b)
 					wanted[key] = true
 					if not psep.Constraints[key] then
 						local constraint = Instance.new("NoCollisionConstraint")
 						constraint.Name = "QMA_PlayerPair"
 						constraint.Part0 = a
 						constraint.Part1 = b
-						constraint.Parent = QMAPassThroughFolder
+						constraint.Parent = AntiFlingQuantum.QMAPassThroughFolder
 						psep.Constraints[key] = constraint
 					end
 				end
@@ -2873,29 +2876,29 @@ local RealPlayerScan = {
 }
 _G.Celestial.RealPlayerScan = RealPlayerScan
 
-local function UpdateRealPlayerScanLabel()
+_G.Celestial.UpdateRealPlayerScanLabel = function()
 	local label = _G.Celestial.ScannedPlayersLabel
 	if label and label.Parent then
 		label.Text = "Scanned Players: " .. tostring(RealPlayerScan.Count)
 	end
 end
 
-local function BeginRealPlayerScanCycle(allPlayers)
+_G.Celestial.BeginRealPlayerScanCycle = function(allPlayers)
 	table.clear(RealPlayerScan.SeenPlayers)
 	RealPlayerScan.Count = 0
 	RealPlayerScan.CycleLimit = #allPlayers
 	RealPlayerScan.LastPlayerCount = #allPlayers
 	RealPlayerScan.PauseUntil = 0
-	UpdateRealPlayerScanLabel()
+	_G.Celestial.UpdateRealPlayerScanLabel()
 end
 
-local function RecordRealPlayerScanPlayer(player)
+_G.Celestial.RecordRealPlayerScanPlayer = function(player)
 	if not player or not player.Parent then return end
 	-- Count each roster member once in the current cycle; never use N * N.
 	if RealPlayerScan.SeenPlayers[player] then return end
 	RealPlayerScan.SeenPlayers[player] = true
 	RealPlayerScan.Count = math.min(RealPlayerScan.Count + 1, RealPlayerScan.CycleLimit)
-	UpdateRealPlayerScanLabel()
+	_G.Celestial.UpdateRealPlayerScanLabel()
 end
 
 local function ResetRealPlayerScanDisplay()
@@ -2904,7 +2907,7 @@ local function ResetRealPlayerScanDisplay()
 	RealPlayerScan.LastPlayerCount = 0
 	RealPlayerScan.PauseUntil = 0
 	table.clear(RealPlayerScan.SeenPlayers)
-	UpdateRealPlayerScanLabel()
+	_G.Celestial.UpdateRealPlayerScanLabel()
 end
 
 local function OTI_IsHeldOrInteractive(obj)
@@ -3240,7 +3243,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 	local allPlayers = Players:GetPlayers()
 	if QMAScheduler.HasRosterChanged(allPlayers) then
 		QMAScheduler.RebuildQueue(allPlayers)
-		BeginRealPlayerScanCycle(allPlayers)
+		_G.Celestial.BeginRealPlayerScanCycle(allPlayers)
 	end
 	
 	if now >= QMAScheduler.NextBatchTime then
@@ -3248,7 +3251,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 			-- Begin a fresh pass over the current roster, not an N-by-N pass.
 			QMAScheduler.CycleComplete = false
 			table.clear(QMAScheduler.ProcessedThisCycle)
-			BeginRealPlayerScanCycle(allPlayers)
+			_G.Celestial.BeginRealPlayerScanCycle(allPlayers)
 		end
 		local processed = 0
 		local myRoot = GetRoot()
@@ -3265,7 +3268,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 					QMAScheduler.ProcessedThisCycle[player] = true
 					processed = processed + 1
 					if player.Parent then
-						RecordRealPlayerScanPlayer(player)
+						_G.Celestial.RecordRealPlayerScanPlayer(player)
 					end
 				else
 					-- Defensive guard against duplicate queue entries; don't count them.
@@ -9293,7 +9296,7 @@ end
 -- GAME DETECTION INITIALIZATION + DEFERRED UI LOADING
 -- ====================================================================
 
-local scanGui = ShowScanningGui()
+local scanGui = _G.Celestial.ScanGui or _G.Celestial.ShowScanningGui()
 local scanStartTime = tick()
 local minScanTime = 5.0
 local maxScanTime = 7.0
@@ -9313,8 +9316,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		task.wait(0.25)
 	end
 	_G.Celestial.GameMode = detectedMode
-	if scanGui and scanGui.Parent then scanGui:Destroy() end
-	_G.Celestial.ScanGui = nil
 	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
 	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
 		_G.Celestial.GameDetectionConnection = LocalPlayer.OnTeleport:Connect(function(teleportState)
@@ -13484,6 +13485,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		_G.Celestial.HubLoaded = true
 	end
 
+	-- Release the boot loader only after the UI build has succeeded or failed.
+	if scanGui then pcall(function() scanGui:Destroy() end) end
+	if _G.Celestial.ScanGui == scanGui then _G.Celestial.ScanGui = nil end
 
 	_G.Celestial.ScanCounter = 0
 	_G.Celestial.ScanCounterThread = task.spawn(function()
