@@ -1,3 +1,4 @@
+-- StabilityLog10: Rejoin/Server Hop repair, Movement Anti-AFK, and low-player auto-hop with one-shot config restore.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
 -- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
@@ -29,6 +30,36 @@ local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 if not _G.Celestial then
 	_G.Celestial = {}
 end
+
+-- One-shot marker used only by the automatic low-player Server Hop.
+do
+	local stateFile = "CelestialAutoHopState.json"
+	local httpService = game:GetService("HttpService")
+	_G.Celestial.AutoHopResumePayload = nil
+	_G.Celestial.AutoHopResume = false
+	if type(readfile) == "function" then
+		local okRead, raw = pcall(readfile, stateFile)
+		if okRead and type(raw) == "string" and raw ~= "" then
+			local okDecode, payload = pcall(function() return httpService:JSONDecode(raw) end)
+			if okDecode and type(payload) == "table" and payload.version == 1
+				and payload.mode == "auto_server_hop" and tonumber(payload.placeId) == game.PlaceId
+				and type(payload.createdAt) == "number" and (os.time() - payload.createdAt) >= 0
+				and (os.time() - payload.createdAt) <= 180 and payload.sourceJobId ~= game.JobId
+				and payload.targetJobId == game.JobId and type(payload.state) == "table" then
+				_G.Celestial.AutoHopResumePayload = payload
+				_G.Celestial.AutoHopResume = true
+			end
+		end
+	end
+	-- Consume the file on this execution so later manual teleports don't inherit auto-resume.
+	if _G.Celestial.AutoHopResume then
+		pcall(function()
+			if type(delfile) == "function" then delfile(stateFile)
+			elseif type(writefile) == "function" then writefile(stateFile, "{\"consumed\":true}") end
+		end)
+	end
+end
+
 -- Reset readiness flags for this script execution so log recovery cannot race Hub startup.
 _G.Celestial.HubLoaded = false
 _G.Celestial.HubLoadFailed = false
@@ -228,8 +259,12 @@ end
 local existingESP = CoreGui:FindFirstChild("CelestialESP")
 if existingESP then existingESP:Destroy() end
 
--- Create the startup loader after cleanup so it survives the initial reset.
-_G.Celestial.ScanGui = _G.Celestial.ShowScanningGui()
+-- Manual execution retains the startup loader; auto-hop re-entry skips only this loader.
+if not _G.Celestial.AutoHopResume then
+	_G.Celestial.ScanGui = _G.Celestial.ShowScanningGui()
+else
+	_G.Celestial.ScanGui = nil
+end
 
 _G.Celestial.ESPFolder = Instance.new("Folder")
 _G.Celestial.ESPFolder.Name = "CelestialESP"
@@ -1036,6 +1071,7 @@ _G.Celestial.State = {
 	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
 	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
+	AntiAFKEnabled = false, AutoServerHopLowPlayers = false,
 	FlingMurdererOnScreen = false, FlingSheriffOnScreen = false, FlingStableMode = false,
 	FlingAutoResetOptimize = false, FlingCacheBytes = 0, FlingCompletedCount = 0,
 	WalkSpeed = 16, JumpPower = 50, FlySpeed = 50, BoostPower = 300,
@@ -1049,6 +1085,277 @@ _G.Celestial.State = {
 }
 
 local State = _G.Celestial.State
+
+-- Restore scalar settings only after an automatic Server Hop. Transient role/player values are excluded.
+do
+	local excludedRestoreKeys = {
+		MurdererName = true, AimbotMurdererName = true, SheriffName = true, HeroName = true,
+		OriginalSheriff = true, HasGunBeenDropped = true,
+	}
+	local pending = _G.Celestial.AutoHopResumePayload
+	if _G.Celestial.AutoHopResume and type(pending) == "table" and type(pending.state) == "table" then
+		for key, value in pairs(pending.state) do
+			local defaultValue = State[key]
+			local valueType = type(value)
+			if not excludedRestoreKeys[key] and defaultValue ~= nil and type(defaultValue) == valueType
+				and (valueType == "boolean" or valueType == "string" or valueType == "number") then
+				if valueType ~= "number" or (value == value and value > -math.huge and value < math.huge) then State[key] = value end
+			end
+		end
+	end
+
+	if _G.Celestial.AntiAFKConnection then pcall(function() _G.Celestial.AntiAFKConnection:Disconnect() end); _G.Celestial.AntiAFKConnection = nil end
+	_G.Celestial.AutoServerHopGeneration = (_G.Celestial.AutoServerHopGeneration or 0) + 1
+	local autoHopBusy, antiAFKConnection = false, nil
+	local stateFile = "CelestialAutoHopState.json"
+	-- This must point to the raw hosted copy of the modified CH source file.
+	local autoHopScriptUrl = "https://raw.githubusercontent.com/cloudysday2011-crypto/Celestial-Hub-Project/main/CelestialHub_SpiderESP.lua"
+	local httpService = game:GetService("HttpService")
+	local teleportService = game:GetService("TeleportService")
+	local mm2PlaceId = 142823291
+	if _G.Celestial.ServerTeleportFailureConnection then
+		pcall(function() _G.Celestial.ServerTeleportFailureConnection:Disconnect() end)
+	end
+	_G.Celestial.ManualTeleportFallbackPending = false
+	_G.Celestial.ServerTeleportFailureConnection = teleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
+		if player ~= LocalPlayer or (placeId and tonumber(placeId) ~= game.PlaceId) then return end
+		warn("[Celestial Hub][Teleport] Init failed: " .. tostring(message or result))
+		if _G.Celestial.ManualTeleportFallbackPending and tick() <= (_G.Celestial.ManualTeleportFallbackDeadline or 0) then
+			_G.Celestial.ManualTeleportFallbackPending = false
+			task.spawn(function()
+				task.wait(0.35)
+				local okFallback, fallbackErr = pcall(function() teleportService:Teleport(game.PlaceId, LocalPlayer) end)
+				if not okFallback then warn("[Celestial Hub][Teleport] Fallback failed: " .. tostring(fallbackErr)) end
+			end)
+		end
+	end)
+
+	local function clearAutoHopState()
+		pcall(function()
+			if type(delfile) == "function" then delfile(stateFile)
+			elseif type(writefile) == "function" then writefile(stateFile, "{\"consumed\":true}") end
+		end)
+	end
+
+	local function getRequestFunction()
+		local requestFunction = nil
+		pcall(function()
+			local env = type(getgenv) == "function" and getgenv() or nil
+			if type(env) == "table" then
+				requestFunction = env.request or env.http_request or env.requestAsync
+				if not requestFunction and type(env.syn) == "table" then requestFunction = env.syn.request end
+				if not requestFunction and type(env.fluxus) == "table" then requestFunction = env.fluxus.request end
+			end
+		end)
+		if type(requestFunction) ~= "function" then
+			pcall(function() requestFunction = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request) end)
+		end
+		return requestFunction
+	end
+
+	local function fetchServerPage(cursor)
+		local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Desc&limit=100"
+		if cursor and cursor ~= "" then url = url .. "&cursor=" .. httpService:UrlEncode(cursor) end
+		local raw = nil
+		local requestFunction = getRequestFunction()
+		if requestFunction then
+			local okRequest, response = pcall(function() return requestFunction({Url = url, Method = "GET"}) end)
+			if okRequest and type(response) == "table" then
+				raw = response.Body or response.body or response.bodyText
+				local status = tonumber(response.StatusCode or response.Status or response.status_code)
+				if status and status >= 400 then raw = nil end
+			end
+		end
+		if type(raw) ~= "string" or raw == "" then
+			local okHttp, result = pcall(function() return game:HttpGet(url) end)
+			if okHttp and type(result) == "string" then raw = result end
+		end
+		if type(raw) ~= "string" or raw == "" then return nil end
+		local okDecode, result = pcall(function() return httpService:JSONDecode(raw) end)
+		if okDecode and type(result) == "table" and type(result.data) == "table" then return result end
+		return nil
+	end
+
+	local function collectServerCandidates(currentPlayers)
+		local candidates, cursor = {}, nil
+		for _ = 1, 5 do
+			local page = fetchServerPage(cursor)
+			if not page then break end
+			for _, server in ipairs(page.data) do
+				local playing = tonumber(server and server.playing) or 0
+				local maxPlayers = tonumber(server and server.maxPlayers) or 0
+				if server and type(server.id) == "string" and server.id ~= "" and server.id ~= game.JobId
+					and maxPlayers > 0 and playing < maxPlayers then
+					table.insert(candidates, {id = server.id, playing = playing, maxPlayers = maxPlayers,
+						moreThanCurrent = playing > (tonumber(currentPlayers) or 0)})
+				end
+			end
+			cursor = page.nextPageCursor
+			if type(cursor) ~= "string" or cursor == "" then break end
+		end
+		return candidates
+	end
+
+	local function queueAutoHopRelaunch(targetJobId)
+		if type(writefile) ~= "function" then return false, "executor lacks writefile" end
+		if type(readfile) ~= "function" then return false, "executor lacks readfile" end
+		if type(autoHopScriptUrl) ~= "string" or not autoHopScriptUrl:match("^https://raw%.githubusercontent%.com/") then return false, "CH auto-reload URL is not configured" end
+		local snapshot = {}
+		for key, value in pairs(State) do
+			local valueType = type(value)
+			if not excludedRestoreKeys[key] and (valueType == "boolean" or valueType == "string" or valueType == "number") then
+				if valueType ~= "number" or (value == value and value > -math.huge and value < math.huge) then snapshot[key] = value end
+			end
+		end
+		local payload = {version = 1, mode = "auto_server_hop", placeId = game.PlaceId, sourceJobId = game.JobId, targetJobId = targetJobId, createdAt = os.time(), state = snapshot}
+		local okEncode, encoded = pcall(function() return httpService:JSONEncode(payload) end)
+		if not okEncode or type(encoded) ~= "string" then return false, "could not serialize CH settings" end
+		local okWrite = pcall(writefile, stateFile, encoded)
+		if not okWrite then return false, "could not save CH settings" end
+
+		local env, queueFunction = nil, nil
+		pcall(function() if type(getgenv) == "function" then env = getgenv() end end)
+		if type(env) == "table" then queueFunction = env.queue_on_teleport or env.queueonteleport end
+		if type(queueFunction) ~= "function" then pcall(function() queueFunction = queue_on_teleport or queueonteleport end) end
+		if type(queueFunction) ~= "function" then pcall(function() if type(syn) == "table" then queueFunction = syn.queue_on_teleport end end) end
+		if type(queueFunction) ~= "function" then pcall(function() if type(fluxus) == "table" then queueFunction = fluxus.queue_on_teleport end end) end
+		if type(queueFunction) ~= "function" then
+			clearAutoHopState()
+			return false, "executor lacks queue_on_teleport"
+		end
+
+		local bootstrap = string.format([[
+local ok,p=pcall(function()
+ local raw=readfile(%q)
+ local d=game:GetService("HttpService"):JSONDecode(raw)
+ if type(d)=="table" and d.version==1 and d.mode=="auto_server_hop" and tonumber(d.placeId)==game.PlaceId and d.sourceJobId~=game.JobId and d.targetJobId==game.JobId and type(d.createdAt)=="number" and os.time()-d.createdAt>=0 and os.time()-d.createdAt<=180 then
+  local src=game:HttpGet(%q)
+  if type(src)=="string" and #src>1000 then local f=loadstring or load; local chunk=f(src); if type(chunk)=="function" then chunk() end end
+ end
+end)
+]], stateFile, autoHopScriptUrl)
+		local okQueue = pcall(queueFunction, bootstrap)
+		if not okQueue then
+			clearAutoHopState()
+			return false, "queue_on_teleport rejected the bootstrap"
+		end
+		return true
+	end
+
+	local function setAntiAFKEnabled(enabled)
+		State.AntiAFKEnabled = enabled == true
+		if antiAFKConnection then pcall(function() antiAFKConnection:Disconnect() end); antiAFKConnection = nil end
+		if _G.Celestial.AntiAFKConnection then pcall(function() _G.Celestial.AntiAFKConnection:Disconnect() end); _G.Celestial.AntiAFKConnection = nil end
+		if not State.AntiAFKEnabled then return true end
+		local okConnect, connection = pcall(function()
+			return LocalPlayer.Idled:Connect(function()
+				local okPulse, errPulse = pcall(function()
+					local virtualUser = game:GetService("VirtualUser")
+					virtualUser:CaptureController()
+					virtualUser:ClickButton2(Vector2.new(0, 0))
+				end)
+				if not okPulse then warn("[Celestial Hub][Anti-AFK] Input method unavailable: " .. tostring(errPulse)) end
+			end)
+		end)
+		if okConnect then antiAFKConnection = connection; _G.Celestial.AntiAFKConnection = connection; return true end
+		warn("[Celestial Hub][Anti-AFK] Could not connect Player.Idled: " .. tostring(connection))
+		return false
+	end
+
+	local function setAutoServerHopEnabled(enabled)
+		State.AutoServerHopLowPlayers = enabled == true
+		_G.Celestial.AutoServerHopGeneration = (_G.Celestial.AutoServerHopGeneration or 0) + 1
+		local generation = _G.Celestial.AutoServerHopGeneration
+		if not State.AutoServerHopLowPlayers then autoHopBusy = false; return true end
+		task.spawn(function()
+			while generation == _G.Celestial.AutoServerHopGeneration and State.AutoServerHopLowPlayers do
+				task.wait(20)
+				if generation ~= _G.Celestial.AutoServerHopGeneration or not State.AutoServerHopLowPlayers then break end
+				if game.PlaceId ~= mm2PlaceId or #Players:GetPlayers() >= 3 or autoHopBusy then continue end
+				autoHopBusy = true
+				local currentCount = #Players:GetPlayers()
+				local candidates = collectServerCandidates(currentCount)
+				local best = nil
+				for _, candidate in ipairs(candidates) do
+					if candidate.moreThanCurrent and candidate.playing >= 3 and (not best or candidate.playing > best.playing) then best = candidate end
+				end
+				if best then
+					local prepared, reason = queueAutoHopRelaunch(best.id)
+					if prepared then
+						local failureConnection = nil
+						pcall(function()
+							failureConnection = teleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
+								if player ~= LocalPlayer or (placeId and tonumber(placeId) ~= game.PlaceId) then return end
+								if failureConnection then pcall(function() failureConnection:Disconnect() end); failureConnection = nil end
+								warn("[Celestial Hub][Auto Server Hop] TeleportInitFailed: " .. tostring(message or result))
+								clearAutoHopState()
+								autoHopBusy = false
+							end)
+						end)
+						local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(game.PlaceId, best.id, LocalPlayer) end)
+						if not okTeleport then
+							if failureConnection then pcall(function() failureConnection:Disconnect() end); failureConnection = nil end
+							warn("[Celestial Hub][Auto Server Hop] Teleport failed: " .. tostring(teleportErr))
+							clearAutoHopState()
+							autoHopBusy = false
+						else
+							task.delay(45, function()
+								if failureConnection then pcall(function() failureConnection:Disconnect() end); failureConnection = nil end
+							end)
+						end
+					else
+						warn("[Celestial Hub][Auto Server Hop] Not hopping: " .. tostring(reason))
+						autoHopBusy = false
+					end
+				else
+					warn("[Celestial Hub][Auto Server Hop] No public server with more than " .. tostring(currentCount) .. " players was found.")
+					autoHopBusy = false
+				end
+			end
+		end)
+		return true
+	end
+
+	local function manualRejoin()
+		local placeId, jobId = game.PlaceId, game.JobId
+		if not jobId or jobId == "" then warn("[Celestial Hub][Rejoin] Current server ID is unavailable."); return end
+		_G.Celestial.ManualTeleportFallbackPending = true
+		_G.Celestial.ManualTeleportFallbackDeadline = tick() + 45
+		task.delay(46, function() _G.Celestial.ManualTeleportFallbackPending = false end)
+		local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer) end)
+		if not okTeleport then
+			_G.Celestial.ManualTeleportFallbackPending = false
+			warn("[Celestial Hub][Rejoin] TeleportToPlaceInstance failed: " .. tostring(teleportErr))
+			local okFallback, fallbackErr = pcall(function() teleportService:Teleport(placeId, LocalPlayer) end)
+			if not okFallback then warn("[Celestial Hub][Rejoin] Fallback failed: " .. tostring(fallbackErr)) end
+		end
+	end
+
+	local function manualServerHop()
+		local candidates = collectServerCandidates(#Players:GetPlayers())
+		if #candidates == 0 then warn("[Celestial Hub][Server Hop] Could not load eligible public servers."); return end
+		for i = #candidates, 2, -1 do
+			local j = math.random(1, i)
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		end
+		local selected = candidates[1]
+		_G.Celestial.ManualTeleportFallbackPending = true
+		_G.Celestial.ManualTeleportFallbackDeadline = tick() + 45
+		task.delay(46, function() _G.Celestial.ManualTeleportFallbackPending = false end)
+		local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer) end)
+		if not okTeleport then
+			_G.Celestial.ManualTeleportFallbackPending = false
+			warn("[Celestial Hub][Server Hop] TeleportToPlaceInstance failed: " .. tostring(teleportErr))
+			local okFallback, fallbackErr = pcall(function() teleportService:Teleport(game.PlaceId, LocalPlayer) end)
+			if not okFallback then warn("[Celestial Hub][Server Hop] Fallback failed: " .. tostring(fallbackErr)) end
+		end
+	end
+
+	_G.Celestial.SetAntiAFKEnabled = setAntiAFKEnabled
+	_G.Celestial.SetAutoServerHopEnabled = setAutoServerHopEnabled
+	_G.Celestial.RejoinServer = manualRejoin
+	_G.Celestial.ServerHop = manualServerHop
+end
 
 do
 local CHCrosshair = {}
@@ -9296,7 +9603,8 @@ end
 -- GAME DETECTION INITIALIZATION + DEFERRED UI LOADING
 -- ====================================================================
 
-local scanGui = _G.Celestial.ScanGui or _G.Celestial.ShowScanningGui()
+local scanGui = _G.Celestial.ScanGui
+if not scanGui and not _G.Celestial.AutoHopResume then scanGui = _G.Celestial.ShowScanningGui() end
 local scanStartTime = tick()
 local minScanTime = 5.0
 local maxScanTime = 7.0
@@ -11260,6 +11568,10 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddToggleToSection(secPlayer, "Wall Jump", State.WallJumpActive, function(v) State.WallJumpActive = v end)
 		AddToggleToSection(secPlayer, "Bomb Boost", State.BombBoostActive, function(v) State.BombBoostActive = v end)
 		AddSliderToSection(secPlayer, "Boost Power", "How hard the blast throws you.", 50, 600, State.BoostPower, function(v) State.BoostPower = v end)
+		AddSpacer(secPlayer, 4)
+		AddToggleToSection(secPlayer, "Anti-AFK", State.AntiAFKEnabled, function(v)
+			if _G.Celestial.SetAntiAFKEnabled then _G.Celestial.SetAntiAFKEnabled(v) end
+		end, Color3.fromRGB(75, 170, 210))
 
 		-- ====================================================================
 		-- FARM TAB
@@ -13395,58 +13707,18 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddTabButton("MISC", secMisc, 125144052381568)
 		AddCategoryHeader(secMisc, "Server & UI Options")
 		AddSpacer(secMisc, 2)
+		AddToggleToSection(secMisc, "Auto-Server Hop when theres low players number", State.AutoServerHopLowPlayers, function(v)
+			if _G.Celestial.SetAutoServerHopEnabled then _G.Celestial.SetAutoServerHopEnabled(v) end
+		end, Color3.fromRGB(60, 160, 110))
+		AddSpacer(secMisc, 4)
 		AddButtonToSection(secMisc, "🔄 Rejoin Server", Color3.fromRGB(60, 60, 90), function()
 			task.spawn(function()
-				local TeleportService = game:GetService("TeleportService")
-				local placeId = game.PlaceId
-				local jobId = game.JobId
-				if not jobId or jobId == "" then return end
-				pcall(function() TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer) end)
+				if _G.Celestial.RejoinServer then _G.Celestial.RejoinServer() end
 			end)
 		end)
 		AddButtonToSection(secMisc, "🌐 Server Hop", Color3.fromRGB(60, 90, 60), function()
 			task.spawn(function()
-				local TeleportService = game:GetService("TeleportService")
-				local HttpService = game:GetService("HttpService")
-				local placeId = game.PlaceId
-				local currentJobId = game.JobId
-				local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
-				local function getPage(cursor)
-					local url = "https://games.roblox.com/v1/games/" .. tostring(placeId) .. "/servers/Public?sortOrder=Asc&limit=100"
-					if cursor and cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
-					local ok, raw = pcall(function()
-						if req then
-							local response = req({Url = url, Method = "GET"})
-							if response and response.Body then return response.Body end
-							return nil
-						end
-						return game:HttpGet(url)
-					end)
-					if not ok or not raw then return nil end
-					local decodedOk, result = pcall(function() return HttpService:JSONDecode(raw) end)
-					if decodedOk and result then return result end
-					return nil
-				end
-				local candidates = {}
-				local cursor = nil
-				for _ = 1, 5 do
-					local result = getPage(cursor)
-					if not result or type(result.data) ~= "table" then break end
-					for _, server in ipairs(result.data) do
-						if server and server.id and server.id ~= currentJobId
-							and tonumber(server.playing or 0) < tonumber(server.maxPlayers or 0) then
-							table.insert(candidates, server.id)
-						end
-					end
-					cursor = result.nextPageCursor
-					if not cursor or cursor == "" then break end
-				end
-				if #candidates == 0 then return end
-				for i = #candidates, 2, -1 do
-					local j = math.random(1, i)
-					candidates[i], candidates[j] = candidates[j], candidates[i]
-				end
-				pcall(function() TeleportService:TeleportToPlaceInstance(placeId, candidates[1], LocalPlayer) end)
+				if _G.Celestial.ServerHop then _G.Celestial.ServerHop() end
 			end)
 		end)
 		AddButtonToSection(secMisc, "❌ Close & Destroy Hub", Color3.fromRGB(180, 40, 40), function()
@@ -13483,6 +13755,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 	else
 		-- Set only after the Hub's UI-building pcall has completely finished.
 		_G.Celestial.HubLoaded = true
+		if State.AntiAFKEnabled and _G.Celestial.SetAntiAFKEnabled then _G.Celestial.SetAntiAFKEnabled(true) end
+		if State.AutoServerHopLowPlayers and _G.Celestial.SetAutoServerHopEnabled then _G.Celestial.SetAutoServerHopEnabled(true) end
+		if _G.Celestial.AutoHopResume and State.FlyActive then pcall(function() ToggleFly(true) end) end
 	end
 
 	-- Release the boot loader only after the UI build has succeeded or failed.
