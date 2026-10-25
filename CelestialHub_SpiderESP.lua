@@ -1116,18 +1116,16 @@ do
 	if _G.Celestial.ServerTeleportFailureConnection then
 		pcall(function() _G.Celestial.ServerTeleportFailureConnection:Disconnect() end)
 	end
-	_G.Celestial.ManualTeleportFallbackPending = false
+	-- Keep teleport failures visible. Do not silently fall back to a random server,
+	-- because that violates the explicit Rejoin Same Server destination.
+	_G.Celestial.PendingServerTeleport = nil
 	_G.Celestial.ServerTeleportFailureConnection = teleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
-		if player ~= LocalPlayer or (placeId and tonumber(placeId) ~= game.PlaceId) then return end
-		warn("[Celestial Hub][Teleport] Init failed: " .. tostring(message or result))
-		if _G.Celestial.ManualTeleportFallbackPending and tick() <= (_G.Celestial.ManualTeleportFallbackDeadline or 0) then
-			_G.Celestial.ManualTeleportFallbackPending = false
-			task.spawn(function()
-				task.wait(0.35)
-				local okFallback, fallbackErr = pcall(function() teleportService:Teleport(game.PlaceId, LocalPlayer) end)
-				if not okFallback then warn("[Celestial Hub][Teleport] Fallback failed: " .. tostring(fallbackErr)) end
-			end)
-		end
+		if player ~= LocalPlayer then return end
+		local pending = _G.Celestial.PendingServerTeleport
+		if placeId and tonumber(placeId) ~= game.PlaceId then return end
+		local kind = type(pending) == "table" and pending.kind or "Teleport"
+		warn("[Celestial Hub][" .. tostring(kind) .. "] TeleportInitFailed: " .. tostring(result) .. " — " .. tostring(message))
+		_G.Celestial.PendingServerTeleport = nil
 	end)
 
 	local function clearAutoHopState()
@@ -1154,46 +1152,68 @@ do
 	end
 
 	local function fetchServerPage(cursor)
-		local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Desc&limit=100"
-		if cursor and cursor ~= "" then url = url .. "&cursor=" .. httpService:UrlEncode(cursor) end
-		local raw = nil
+		local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
+		if cursor and cursor ~= "" then url = url .. "&cursor=" .. httpService:UrlEncode(tostring(cursor)) end
+		local raw, lastError = nil, "public server API returned no data"
 		local requestFunction = getRequestFunction()
 		if requestFunction then
-			local okRequest, response = pcall(function() return requestFunction({Url = url, Method = "GET"}) end)
+			local okRequest, response = pcall(function()
+				return requestFunction({Url = url, Method = "GET", Headers = {Accept = "application/json"}})
+			end)
 			if okRequest and type(response) == "table" then
-				raw = response.Body or response.body or response.bodyText
 				local status = tonumber(response.StatusCode or response.Status or response.status_code)
-				if status and status >= 400 then raw = nil end
+				local success = response.Success
+				raw = response.Body or response.body or response.bodyText or response.ResponseBody
+				if status and (status < 200 or status >= 300) then
+					lastError = "public server API HTTP " .. tostring(status)
+					raw = nil
+				elseif success == false then
+					lastError = "executor HTTP request reported failure"
+					raw = nil
+				end
+			elseif not okRequest then
+				lastError = "executor HTTP request failed: " .. tostring(response)
 			end
 		end
 		if type(raw) ~= "string" or raw == "" then
 			local okHttp, result = pcall(function() return game:HttpGet(url) end)
-			if okHttp and type(result) == "string" then raw = result end
+			if okHttp and type(result) == "string" and result ~= "" then
+				raw = result
+			else
+				lastError = "game:HttpGet failed: " .. tostring(result)
+			end
 		end
-		if type(raw) ~= "string" or raw == "" then return nil end
+		if type(raw) ~= "string" or raw == "" then return nil, lastError end
 		local okDecode, result = pcall(function() return httpService:JSONDecode(raw) end)
 		if okDecode and type(result) == "table" and type(result.data) == "table" then return result end
-		return nil
+		return nil, "server API returned invalid JSON or an unexpected response"
 	end
 
 	local function collectServerCandidates(currentPlayers)
-		local candidates, cursor = {}, nil
-		for _ = 1, 5 do
-			local page = fetchServerPage(cursor)
-			if not page then break end
+		local candidates, cursor, seenCursors = {}, nil, {}
+		local pageCount = 0
+		for _ = 1, 8 do
+			local page, pageError = fetchServerPage(cursor)
+			if not page then
+				if #candidates == 0 then return candidates, pageError end
+				break -- A partial server list is still useful if a later page fails.
+			end
+			pageCount += 1
 			for _, server in ipairs(page.data) do
-				local playing = tonumber(server and server.playing) or 0
-				local maxPlayers = tonumber(server and server.maxPlayers) or 0
+				local playing = tonumber(server and server.playing)
+				local maxPlayers = tonumber(server and server.maxPlayers)
 				if server and type(server.id) == "string" and server.id ~= "" and server.id ~= game.JobId
-					and maxPlayers > 0 and playing < maxPlayers then
+					and playing and maxPlayers and maxPlayers > 0 and playing < maxPlayers then
 					table.insert(candidates, {id = server.id, playing = playing, maxPlayers = maxPlayers,
 						moreThanCurrent = playing > (tonumber(currentPlayers) or 0)})
 				end
 			end
 			cursor = page.nextPageCursor
-			if type(cursor) ~= "string" or cursor == "" then break end
+			if type(cursor) ~= "string" or cursor == "" or seenCursors[cursor] then break end
+			seenCursors[cursor] = true
 		end
-		return candidates
+		if #candidates == 0 then return candidates, "no joinable public servers were returned after " .. tostring(pageCount) .. " page(s)" end
+		return candidates, nil
 	end
 
 	local function queueAutoHopRelaunch(targetJobId)
@@ -1274,7 +1294,7 @@ end)
 				if game.PlaceId ~= mm2PlaceId or #Players:GetPlayers() >= 3 or autoHopBusy then continue end
 				autoHopBusy = true
 				local currentCount = #Players:GetPlayers()
-				local candidates = collectServerCandidates(currentCount)
+				local candidates, listError = collectServerCandidates(currentCount)
 				local best = nil
 				for _, candidate in ipairs(candidates) do
 					if candidate.moreThanCurrent and candidate.playing >= 3 and (not best or candidate.playing > best.playing) then best = candidate end
@@ -1308,7 +1328,7 @@ end)
 						autoHopBusy = false
 					end
 				else
-					warn("[Celestial Hub][Auto Server Hop] No public server with more than " .. tostring(currentCount) .. " players was found.")
+					warn("[Celestial Hub][Auto Server Hop] No eligible server was found. " .. tostring(listError or ("No server had more than " .. tostring(currentCount) .. " players.")))
 					autoHopBusy = false
 				end
 			end
@@ -1318,37 +1338,73 @@ end)
 
 	local function manualRejoin()
 		local placeId, jobId = game.PlaceId, game.JobId
-		if not jobId or jobId == "" then warn("[Celestial Hub][Rejoin] Current server ID is unavailable."); return end
-		_G.Celestial.ManualTeleportFallbackPending = true
-		_G.Celestial.ManualTeleportFallbackDeadline = tick() + 45
-		task.delay(46, function() _G.Celestial.ManualTeleportFallbackPending = false end)
-		local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer) end)
-		if not okTeleport then
-			_G.Celestial.ManualTeleportFallbackPending = false
-			warn("[Celestial Hub][Rejoin] TeleportToPlaceInstance failed: " .. tostring(teleportErr))
-			local okFallback, fallbackErr = pcall(function() teleportService:Teleport(placeId, LocalPlayer) end)
-			if not okFallback then warn("[Celestial Hub][Rejoin] Fallback failed: " .. tostring(fallbackErr)) end
+		if not jobId or jobId == "" then
+			warn("[Celestial Hub][Rejoin Same Server] Roblox did not expose the current JobId.")
+			return false, "Current server ID is unavailable"
 		end
+		if _G.Celestial.PendingServerTeleport then
+			warn("[Celestial Hub][Rejoin Same Server] A teleport is already pending.")
+			return false, "Another teleport is pending"
+		end
+		_G.Celestial.PendingServerTeleport = {kind = "Rejoin Same Server", targetJobId = jobId, startedAt = tick()}
+		local okTeleport, teleportErr = pcall(function()
+			teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+		end)
+		if not okTeleport then
+			_G.Celestial.PendingServerTeleport = nil
+			warn("[Celestial Hub][Rejoin Same Server] Request failed: " .. tostring(teleportErr))
+			return false, tostring(teleportErr)
+		end
+		print("[Celestial Hub][Rejoin Same Server] Requested current instance " .. tostring(jobId) .. ". Roblox may reject rejoining the exact instance from inside itself; check TeleportInitFailed if you remain here.")
+		task.delay(15, function()
+			local pending = _G.Celestial.PendingServerTeleport
+			if type(pending) == "table" and pending.kind == "Rejoin Same Server" and pending.targetJobId == jobId then
+				warn("[Celestial Hub][Rejoin Same Server] Still in the current session after 15 seconds; the same-instance request may have been ignored by Roblox.")
+				_G.Celestial.PendingServerTeleport = nil
+			end
+		end)
+		return true
 	end
 
 	local function manualServerHop()
-		local candidates = collectServerCandidates(#Players:GetPlayers())
-		if #candidates == 0 then warn("[Celestial Hub][Server Hop] Could not load eligible public servers."); return end
-		for i = #candidates, 2, -1 do
+		if _G.Celestial.PendingServerTeleport then
+			warn("[Celestial Hub][Server Hop] A teleport is already pending.")
+			return false, "Another teleport is pending"
+		end
+		local candidates, listError = collectServerCandidates(#Players:GetPlayers())
+		if #candidates == 0 then
+			warn("[Celestial Hub][Server Hop] Could not load eligible public servers: " .. tostring(listError or "unknown server-list error"))
+			return false, listError or "No eligible public servers"
+		end
+		-- Prefer populated servers so a hop does not routinely send the player into an empty lobby.
+		local populated = {}
+		for _, candidate in ipairs(candidates) do
+			if candidate.playing > 0 then table.insert(populated, candidate) end
+		end
+		local pool = #populated > 0 and populated or candidates
+		for i = #pool, 2, -1 do
 			local j = math.random(1, i)
-			candidates[i], candidates[j] = candidates[j], candidates[i]
+			pool[i], pool[j] = pool[j], pool[i]
 		end
-		local selected = candidates[1]
-		_G.Celestial.ManualTeleportFallbackPending = true
-		_G.Celestial.ManualTeleportFallbackDeadline = tick() + 45
-		task.delay(46, function() _G.Celestial.ManualTeleportFallbackPending = false end)
-		local okTeleport, teleportErr = pcall(function() teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer) end)
+		local selected = pool[1]
+		_G.Celestial.PendingServerTeleport = {kind = "Server Hop", targetJobId = selected.id, startedAt = tick()}
+		local okTeleport, teleportErr = pcall(function()
+			teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer)
+		end)
 		if not okTeleport then
-			_G.Celestial.ManualTeleportFallbackPending = false
-			warn("[Celestial Hub][Server Hop] TeleportToPlaceInstance failed: " .. tostring(teleportErr))
-			local okFallback, fallbackErr = pcall(function() teleportService:Teleport(game.PlaceId, LocalPlayer) end)
-			if not okFallback then warn("[Celestial Hub][Server Hop] Fallback failed: " .. tostring(fallbackErr)) end
+			_G.Celestial.PendingServerTeleport = nil
+			warn("[Celestial Hub][Server Hop] Request to server " .. tostring(selected.id) .. " failed: " .. tostring(teleportErr))
+			return false, tostring(teleportErr)
 		end
+		print("[Celestial Hub][Server Hop] Requested server " .. tostring(selected.id) .. " (" .. tostring(selected.playing) .. "/" .. tostring(selected.maxPlayers) .. " players). If you remain in this server, check TeleportInitFailed in the console.")
+		task.delay(20, function()
+			local pending = _G.Celestial.PendingServerTeleport
+			if type(pending) == "table" and pending.kind == "Server Hop" and pending.targetJobId == selected.id then
+				warn("[Celestial Hub][Server Hop] No server transition was observed after 20 seconds; the target may have closed or Roblox rejected the teleport.")
+				_G.Celestial.PendingServerTeleport = nil
+			end
+		end)
+		return true
 	end
 
 	_G.Celestial.SetAntiAFKEnabled = setAntiAFKEnabled
@@ -13711,7 +13767,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			if _G.Celestial.SetAutoServerHopEnabled then _G.Celestial.SetAutoServerHopEnabled(v) end
 		end, Color3.fromRGB(60, 160, 110))
 		AddSpacer(secMisc, 4)
-		AddButtonToSection(secMisc, "🔄 Rejoin Server", Color3.fromRGB(60, 60, 90), function()
+		AddButtonToSection(secMisc, "🔄 Rejoin Same Server", Color3.fromRGB(60, 60, 90), function()
 			task.spawn(function()
 				if _G.Celestial.RejoinServer then _G.Celestial.RejoinServer() end
 			end)
