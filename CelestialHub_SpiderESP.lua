@@ -38,75 +38,6 @@ _G.Celestial.PreviousFarmResetLogSnapshot = nil
 _G.Celestial.LogLifecycleBusy = false
 _G.Celestial.LogLifecycleOwner = nil
 
-local function ShowScanningGui()
-	local oldLoader = nil
-	pcall(function() oldLoader = CoreGui:FindFirstChild("CelestialScanGui") end)
-	if oldLoader then pcall(function() oldLoader:Destroy() end) end
-
-	local scanGui = Instance.new("ScreenGui")
-	scanGui.Name = "CelestialScanGui"
-	scanGui.DisplayOrder = 10000
-	scanGui.ResetOnSpawn = false
-	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	scanGui.IgnoreGuiInset = true
-
-	local mainFrame = Instance.new("Frame")
-	mainFrame.Name = "ScanningFrame"
-	mainFrame.Size = UDim2.new(0, 300, 0, 192)
-	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
-	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	mainFrame.BackgroundTransparency = 0.25
-	mainFrame.BorderSizePixel = 0
-	mainFrame.Parent = scanGui
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 16)
-	corner.Parent = mainFrame
-
-	local image = Instance.new("ImageLabel")
-	image.Name = "ScanImage"
-	image.Size = UDim2.new(0, 140, 0, 140)
-	image.Position = UDim2.new(0.5, -70, 0, 10)
-	image.BackgroundTransparency = 1
-	image.Image = "rbxassetid://91431616848054"
-	image.ScaleType = Enum.ScaleType.Fit
-	image.Parent = mainFrame
-
-	local text = Instance.new("TextLabel")
-	text.Name = "ScanText"
-	text.Size = UDim2.new(1, -20, 0, 25)
-	text.Position = UDim2.new(0, 10, 1, -32)
-	text.BackgroundTransparency = 1
-	text.Text = "Loading Celestial Hub..."
-	text.TextColor3 = Color3.fromRGB(255, 255, 255)
-	text.Font = Enum.Font.GothamBold
-	text.TextSize = 18
-	text.Parent = mainFrame
-
-	-- Match the old loader's CoreGui behavior, with fallbacks if this container is unavailable.
-	local mounted = pcall(function() scanGui.Parent = CoreGui end)
-	if not mounted or not scanGui.Parent then
-		pcall(function()
-			if type(gethui) == "function" then scanGui.Parent = gethui() end
-		end)
-	end
-	if not scanGui.Parent then
-		pcall(function() scanGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end)
-	end
-
-	_G.Celestial.ScanGui = scanGui
-	task.spawn(function()
-		while scanGui.Parent do
-			task.wait(0.02)
-			image.Rotation = (image.Rotation + 5) % 360
-		end
-	end)
-	return scanGui
-end
-
--- Show the boot loader immediately rather than waiting until all framework setup is defined.
-local scanGui = ShowScanningGui()
-
 if _G.Celestial.CrosshairCleanup then
 	pcall(_G.Celestial.CrosshairCleanup)
 	_G.Celestial.CrosshairCleanup = nil
@@ -781,6 +712,58 @@ end
 -- ====================================================================
 -- SCANNING GUI
 -- ====================================================================
+
+local function ShowScanningGui()
+	local scanGui = Instance.new("ScreenGui")
+	scanGui.Name = "CelestialScanGui"
+	scanGui.ResetOnSpawn = false
+	scanGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	scanGui.IgnoreGuiInset = true
+	scanGui.Parent = CoreGui
+
+	local mainFrame = Instance.new("Frame")
+	mainFrame.Name = "ScanningFrame"
+	mainFrame.Size = UDim2.new(0, 300, 0, 192)
+	mainFrame.Position = UDim2.new(0.5, -150, 0.5, -96)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	mainFrame.BackgroundTransparency = 0.25
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Parent = scanGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 16)
+	corner.Parent = mainFrame
+
+	local image = Instance.new("ImageLabel")
+	image.Name = "ScanImage"
+	image.Size = UDim2.new(0, 140, 0, 140)
+	image.Position = UDim2.new(0.5, -70, 0, 10)
+	image.BackgroundTransparency = 1
+	image.Image = "rbxassetid://91431616848054"
+	image.ScaleType = Enum.ScaleType.Fit
+	image.Parent = mainFrame
+
+	local text = Instance.new("TextLabel")
+	text.Name = "ScanText"
+	text.Size = UDim2.new(1, -20, 0, 25)
+	text.Position = UDim2.new(0, 10, 1, -32)
+	text.BackgroundTransparency = 1
+	text.Text = "Loading Celestial Hub..."
+	text.TextColor3 = Color3.fromRGB(255, 255, 255)
+	text.Font = Enum.Font.GothamBold
+	text.TextSize = 18
+	text.Parent = mainFrame
+
+	_G.Celestial.ScanGui = scanGui
+
+	task.spawn(function()
+		while scanGui.Parent do
+			task.wait(0.02)
+			image.Rotation = (image.Rotation + 5) % 360
+		end
+	end)
+	return scanGui
+end
 
 
 -- Uses the same visual loader as the normal Hub startup; only the text and GUI name differ.
@@ -9310,7 +9293,7 @@ end
 -- GAME DETECTION INITIALIZATION + DEFERRED UI LOADING
 -- ====================================================================
 
--- scanGui was mounted at bootstrap; keep it visible through UI construction.
+local scanGui = ShowScanningGui()
 local scanStartTime = tick()
 local minScanTime = 5.0
 local maxScanTime = 7.0
@@ -9330,6 +9313,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		task.wait(0.25)
 	end
 	_G.Celestial.GameMode = detectedMode
+	if scanGui and scanGui.Parent then scanGui:Destroy() end
+	_G.Celestial.ScanGui = nil
 	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
 	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
 		_G.Celestial.GameDetectionConnection = LocalPlayer.OnTeleport:Connect(function(teleportState)
@@ -13499,9 +13484,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		_G.Celestial.HubLoaded = true
 	end
 
-	-- Release the startup loader only after the main Hub UI has finished construction.
-	if scanGui then pcall(function() scanGui:Destroy() end) end
-	if _G.Celestial.ScanGui == scanGui then _G.Celestial.ScanGui = nil end
 
 	_G.Celestial.ScanCounter = 0
 	_G.Celestial.ScanCounterThread = task.spawn(function()
