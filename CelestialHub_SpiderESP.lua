@@ -1,4 +1,4 @@
--- StabilityLog16: immediate coin pickup, five-coin rest, and power/dangerometer scan optimizations.
+-- StabilityLog19: startup recovery; restores the pre-StabilityLog17 cache implementation from the last known-opening baseline.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
@@ -120,20 +120,6 @@ _G.Celestial.ShowScanningGui = function()
 		end
 	end)
 	return scanGui
-end
-
--- Create the startup loader immediately after its factory exists. This deliberately
--- precedes cleanup/scanning/setup code so an early runtime failure cannot hide it.
-if not _G.Celestial.AutoHopResume then
-	local loaderOk, loaderOrError = pcall(_G.Celestial.ShowScanningGui)
-	if loaderOk then
-		_G.Celestial.ScanGui = loaderOrError
-	else
-		warn("Celestial Hub startup loader failed: " .. tostring(loaderOrError))
-		_G.Celestial.ScanGui = nil
-	end
-else
-	_G.Celestial.ScanGui = nil
 end
 
 -- Reset-log recovery intentionally does not read files here. It runs only after the
@@ -278,6 +264,13 @@ end
 
 local existingESP = CoreGui:FindFirstChild("CelestialESP")
 if existingESP then existingESP:Destroy() end
+
+-- Manual execution retains the startup loader; auto-hop re-entry skips only this loader.
+if not _G.Celestial.AutoHopResume then
+	_G.Celestial.ScanGui = _G.Celestial.ShowScanningGui()
+else
+	_G.Celestial.ScanGui = nil
+end
 
 _G.Celestial.ESPFolder = Instance.new("Folder")
 _G.Celestial.ESPFolder.Name = "CelestialESP"
@@ -3984,21 +3977,8 @@ end
 -- DETECTOR / POWER / TRAP / GUN / SCANNER
 -- ====================================================================
 
--- Keep optimization caches in one local to avoid exhausting Luau's main-chunk local limit.
--- This is storage-only: the detector, cache timings, and collection behavior are unchanged.
-local ST16Cache = {
-    KNIFE_TOOL_KEYWORDS = {"knife", "dagger", "blade", "cutter", "sword", "shiv", "scaler"},
-    GUN_TOOL_KEYWORDS = {"gun", "revolver", "pistol", "blaster", "sheriff", "peacemaker"},
-    ghostTransparencyCacheCharacter = nil,
-    ghostTransparencyCacheAt = 0,
-    ghostTransparencyCacheValue = 0,
-    ghostTransparencyParts = {},
-    ghostTransparencyPartIndices = {},
-    ghostTransparencyConnections = {},
-    POWER_METADATA_ATTRIBUTES = {"Power", "MurderPower", "MurderAbility", "Ability", "Perk", "SelectedPower", "EquippedPower", "PowerName"},
-    POWER_ACTIVE_FLAG_NAMES = {"active", "isactive", "enabled", "isenabled", "using", "isusing", "inuse", "isusingpower"},
-    nextMurdererInventoryScanAt = 0,
-}
+local KNIFE_TOOL_KEYWORDS = {"knife", "dagger", "blade", "cutter", "sword", "shiv", "scaler"}
+local GUN_TOOL_KEYWORDS = {"gun", "revolver", "pistol", "blaster", "sheriff", "peacemaker"}
 
 local function CheckPlayerInventory(plr)
 	local success, isKnife, isGun = pcall(function()
@@ -4014,10 +3994,10 @@ local function CheckPlayerInventory(plr)
 				if item:IsA("Tool") then
 					local lowerName = string.lower(item.Name)
 					if lowerName ~= "coin" and lowerName ~= "bag" then
-						for _, kw in ipairs(ST16Cache.KNIFE_TOOL_KEYWORDS) do
+						for _, kw in ipairs(KNIFE_TOOL_KEYWORDS) do
 							if lowerName:find(kw) then ik = true; break end
 						end
-						for _, kw in ipairs(ST16Cache.GUN_TOOL_KEYWORDS) do
+						for _, kw in ipairs(GUN_TOOL_KEYWORDS) do
 							if lowerName:find(kw) then ig = true; break end
 						end
 					end
@@ -4041,7 +4021,7 @@ local function ReadSheriffAimbotMurderer()
 				if item:IsA("Tool") then
 					local lowerName = string.lower(item.Name)
 					if lowerName ~= "coin" and lowerName ~= "bag" then
-						for _, keyword in ipairs(ST16Cache.KNIFE_TOOL_KEYWORDS) do
+						for _, keyword in ipairs(KNIFE_TOOL_KEYWORDS) do
 							if lowerName:find(keyword, 1, true) then return true end
 						end
 					end
@@ -4147,56 +4127,57 @@ local function SetupPowerWatchers(murderPlayer)
 	end)
 end
 
-ST16Cache.UntrackGhostTransparencyPart = function(instance)
-	local index = ST16Cache.ghostTransparencyPartIndices[instance]
+local ghostTransparencyCacheCharacter, ghostTransparencyCacheAt, ghostTransparencyCacheValue = nil, 0, 0
+local ghostTransparencyParts, ghostTransparencyPartIndices = {}, {}
+local ghostTransparencyConnections = {}
+local function UntrackGhostTransparencyPart(instance)
+	local index = ghostTransparencyPartIndices[instance]
 	if not index then return end
-	ST16Cache.ghostTransparencyPartIndices[instance] = nil
-	table.remove(ST16Cache.ghostTransparencyParts, index)
-	for i = index, #ST16Cache.ghostTransparencyParts do
-		ST16Cache.ghostTransparencyPartIndices[ST16Cache.ghostTransparencyParts[i]] = i
-	end
+	ghostTransparencyPartIndices[instance] = nil
+	table.remove(ghostTransparencyParts, index)
+	for i = index, #ghostTransparencyParts do ghostTransparencyPartIndices[ghostTransparencyParts[i]] = i end
 end
-ST16Cache.TrackGhostTransparencyPart = function(instance)
+local function TrackGhostTransparencyPart(instance)
 	if not instance or not instance:IsA("BasePart") or instance.Name == "HumanoidRootPart"
-		or instance:FindFirstAncestorOfClass("Tool") or ST16Cache.ghostTransparencyPartIndices[instance] then return end
-	ST16Cache.ghostTransparencyParts[#ST16Cache.ghostTransparencyParts + 1] = instance
-	ST16Cache.ghostTransparencyPartIndices[instance] = #ST16Cache.ghostTransparencyParts
+		or instance:FindFirstAncestorOfClass("Tool") or ghostTransparencyPartIndices[instance] then return end
+	ghostTransparencyParts[#ghostTransparencyParts + 1] = instance
+	ghostTransparencyPartIndices[instance] = #ghostTransparencyParts
 end
-ST16Cache.EnsureGhostTransparencyParts = function(character)
-	if character == ST16Cache.ghostTransparencyCacheCharacter then return end
-	for _, connection in ipairs(ST16Cache.ghostTransparencyConnections) do pcall(function() connection:Disconnect() end) end
-	table.clear(ST16Cache.ghostTransparencyConnections)
-	table.clear(ST16Cache.ghostTransparencyParts)
-	table.clear(ST16Cache.ghostTransparencyPartIndices)
-	ST16Cache.ghostTransparencyCacheCharacter = character
-	ST16Cache.ghostTransparencyCacheAt = 0
-	ST16Cache.ghostTransparencyCacheValue = 0
+local function EnsureGhostTransparencyParts(character)
+	if character == ghostTransparencyCacheCharacter then return end
+	for _, connection in ipairs(ghostTransparencyConnections) do pcall(function() connection:Disconnect() end) end
+	table.clear(ghostTransparencyConnections)
+	table.clear(ghostTransparencyParts)
+	table.clear(ghostTransparencyPartIndices)
+	ghostTransparencyCacheCharacter = character
+	ghostTransparencyCacheAt = 0
+	ghostTransparencyCacheValue = 0
 	if not character then return end
-	for _, instance in ipairs(character:GetDescendants()) do ST16Cache.TrackGhostTransparencyPart(instance) end
-	table.insert(ST16Cache.ghostTransparencyConnections, character.DescendantAdded:Connect(ST16Cache.TrackGhostTransparencyPart))
-	table.insert(ST16Cache.ghostTransparencyConnections, character.DescendantRemoving:Connect(ST16Cache.UntrackGhostTransparencyPart))
+	for _, instance in ipairs(character:GetDescendants()) do TrackGhostTransparencyPart(instance) end
+	table.insert(ghostTransparencyConnections, character.DescendantAdded:Connect(TrackGhostTransparencyPart))
+	table.insert(ghostTransparencyConnections, character.DescendantRemoving:Connect(UntrackGhostTransparencyPart))
 end
 local function GetGhostTransparency(character)
-	if not character then ST16Cache.EnsureGhostTransparencyParts(nil); return 0 end
-	ST16Cache.EnsureGhostTransparencyParts(character)
+	if not character then EnsureGhostTransparencyParts(nil); return 0 end
+	EnsureGhostTransparencyParts(character)
 	local now = tick()
-	if now - ST16Cache.ghostTransparencyCacheAt < 0.09 then return ST16Cache.ghostTransparencyCacheValue end
+	if now - ghostTransparencyCacheAt < 0.09 then return ghostTransparencyCacheValue end
 	local maxTransparency = 0
 	local partCount = 0
 	local nearlyTransparentCount = 0
-	for i = #ST16Cache.ghostTransparencyParts, 1, -1 do
-		local part = ST16Cache.ghostTransparencyParts[i]
+	for i = #ghostTransparencyParts, 1, -1 do
+		local part = ghostTransparencyParts[i]
 		if part and character and part:IsDescendantOf(character) then
 			partCount += 1
 			local effectiveTransparency = math.max(part.Transparency, part.LocalTransparencyModifier)
 			if effectiveTransparency > maxTransparency then maxTransparency = effectiveTransparency end
 			if effectiveTransparency >= 0.98 then nearlyTransparentCount += 1 end
 		else
-			ST16Cache.UntrackGhostTransparencyPart(part)
+			UntrackGhostTransparencyPart(part)
 		end
 	end
 	local result = (partCount >= 3 and nearlyTransparentCount >= math.max(3, math.ceil(partCount * 0.80))) and 1 or maxTransparency
-	ST16Cache.ghostTransparencyCacheAt, ST16Cache.ghostTransparencyCacheValue = now, result
+	ghostTransparencyCacheAt, ghostTransparencyCacheValue = now, result
 	return result
 end
 
@@ -4251,12 +4232,13 @@ local function DetectPowerFromContainer(container)
 	return nil
 end
 
-ST16Cache.DetectPowerDirectMetadata = function(container)
+local POWER_METADATA_ATTRIBUTES = {"Power", "MurderPower", "MurderAbility", "Ability", "Perk", "SelectedPower", "EquippedPower", "PowerName"}
+local function DetectPowerDirectMetadata(container)
 	if not container then return nil end
 	for _, powerName in ipairs(POWER_ORDER) do
 		if PowerAliasMatches(container.Name, POWER_DEFINITIONS[powerName]) then return powerName end
 	end
-	for _, attributeName in ipairs(ST16Cache.POWER_METADATA_ATTRIBUTES) do
+	for _, attributeName in ipairs(POWER_METADATA_ATTRIBUTES) do
 		local ok, value = pcall(function() return container:GetAttribute(attributeName) end)
 		if ok and value ~= nil then
 			for _, powerName in ipairs(POWER_ORDER) do
@@ -4273,7 +4255,7 @@ local function DetectMurderPower(plr)
 	-- then inspect the full Player descendant tree only once for named objects and value objects.
 	local containers = {plr, plr.Character, plr:FindFirstChild("Backpack"), plr:FindFirstChild("PlayerData"), plr:FindFirstChildOfClass("PlayerGui")}
 	for _, container in ipairs(containers) do
-		local directPower = ST16Cache.DetectPowerDirectMetadata(container)
+		local directPower = DetectPowerDirectMetadata(container)
 		if directPower then return directPower end
 	end
 	for _, obj in ipairs(plr:GetDescendants()) do
@@ -4367,9 +4349,10 @@ function _G.Celestial.ResolveLocalMurderPower()
 	return cache.Power, cache.Active
 end
 
+local POWER_ACTIVE_FLAG_NAMES = {"active","isactive","enabled","isenabled","using","isusing","inuse","isusingpower"}
 local function PowerObjectLooksActive(obj)
 	if not obj then return false end
-	local activeNames = ST16Cache.POWER_ACTIVE_FLAG_NAMES
+	local activeNames = POWER_ACTIVE_FLAG_NAMES
 	for _, name in ipairs(activeNames) do
 		local ok, value = pcall(function() return obj:GetAttribute(name) end)
 		if ok and value == true then return true end
@@ -4575,6 +4558,7 @@ _G.Celestial.PowerDetector = {
 	SprintSpikeAt = 0, SprintCachedInnocentWalkSpeed = 16, SprintNextBaselineRefreshAt = 0
 }
 
+local nextMurdererInventoryScanAt = 0
 local function UpdatePowerDetectorState()
 	if not State.PowerDetectorActive then
 		_G.Celestial.PowerDetector.CurrentPower = nil
@@ -4591,13 +4575,13 @@ local function UpdatePowerDetectorState()
 		if cachedPlayer and cachedPlayer ~= LocalPlayer and cachedPlayer.Parent == Players and cachedPlayer.Character then
 			local cachedHumanoid = GetHumanoid(cachedPlayer)
 			if cachedHumanoid and cachedHumanoid.Health > 0 then
-				if (detector.CurrentPower == "Ghost" and detector.GhostActive) or now < ST16Cache.nextMurdererInventoryScanAt then
+				if (detector.CurrentPower == "Ghost" and detector.GhostActive) or now < nextMurdererInventoryScanAt then
 					murderPlayer = cachedPlayer
 				end
 			end
 		end
-		if not murderPlayer and now >= ST16Cache.nextMurdererInventoryScanAt then
-			ST16Cache.nextMurdererInventoryScanAt = now + 0.30
+		if not murderPlayer and now >= nextMurdererInventoryScanAt then
+			nextMurdererInventoryScanAt = now + 0.30
 			for _, plr in ipairs(Players:GetPlayers()) do
 				if plr ~= LocalPlayer and plr.Character then
 					local hum = GetHumanoid(plr)
