@@ -2407,29 +2407,86 @@ local function StabilizeLocalCharacter(root, criticalThreat, force)
 	end
 end
 
--- QMA collision-group isolation was removed because changing other players' groups can
--- interfere with touch-based gameplay hit detection. Keep the legacy API names so any
--- older cleanup calls remain safe, but never assign a special collision group here.
-function AntiFlingQuantum.SetupQMAIsolationGroups()
-	AntiFlingQuantum.CollisionGroupsReady = false
+-- QMA player-only physical separation. Uses pairwise NoCollisionConstraint objects:
+-- does not rewrite CanCollide/CanTouch or collision groups, and never pairs character
+-- parts with map geometry or coins. Tool parts are excluded to avoid modifying weapon parts.
+local QMAPassThroughFolder = nil
+local function QMAPartKey(part)
+	local ok, id = pcall(function() return part:GetDebugId() end)
+	return ok and tostring(id) or part:GetFullName()
+end
+local function IsInsideTool(part)
+	local node = part and part.Parent
+	while node and node ~= workspace do
+		if node:IsA("Tool") then return true end
+		node = node.Parent
+	end
 	return false
+end
+
+function AntiFlingQuantum.SetupQMAIsolationGroups()
+	AntiFlingQuantum.CollisionGroupsReady = true
+	return true
 end
 
 function AntiFlingQuantum.ClearPlayerPassThrough()
 	local psep = AntiFlingQuantum.PersistentSeparation
-	if not psep then return end
-	for part, original in pairs(psep.OriginalGroups or {}) do
-		if part and part.Parent then
-			pcall(function() part.CollisionGroup = original end)
-		end
+	if QMAPassThroughFolder then
+		pcall(function() QMAPassThroughFolder:Destroy() end)
+		QMAPassThroughFolder = nil
 	end
-	psep.OriginalGroups = {}
-	psep.Active = false
+	if psep then psep.OriginalGroups = {}; psep.Active = false; psep.Constraints = {} end
 end
 
 function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
-	-- Legacy function: restore any previous QMA edits instead of applying pass-through.
-	AntiFlingQuantum.ClearPlayerPassThrough()
+	local psep = AntiFlingQuantum.PersistentSeparation
+	if not psep then return end
+	allPlayers = allPlayers or Players:GetPlayers()
+	local localCharacter = LocalPlayer.Character
+	if not localCharacter or not localCharacter.Parent then
+		AntiFlingQuantum.ClearPlayerPassThrough()
+		return
+	end
+	if not QMAPassThroughFolder or not QMAPassThroughFolder.Parent then
+		QMAPassThroughFolder = Instance.new("Folder")
+		QMAPassThroughFolder.Name = "QMA_PlayerOnlySeparation"
+		QMAPassThroughFolder.Parent = localCharacter
+		psep.Constraints = {}
+	end
+	local wanted = {}
+	for _, other in ipairs(allPlayers) do
+		local otherCharacter = other ~= LocalPlayer and other.Character
+		if otherCharacter and otherCharacter.Parent then
+			local localParts, otherParts = {}, {}
+			for _, part in ipairs(localCharacter:GetDescendants()) do
+				if part:IsA("BasePart") and not IsInsideTool(part) then table.insert(localParts, part) end
+			end
+			for _, part in ipairs(otherCharacter:GetDescendants()) do
+				if part:IsA("BasePart") and not IsInsideTool(part) then table.insert(otherParts, part) end
+			end
+			for _, a in ipairs(localParts) do
+				for _, b in ipairs(otherParts) do
+					local key = QMAPartKey(a) .. "|" .. QMAPartKey(b)
+					wanted[key] = true
+					if not psep.Constraints[key] then
+						local constraint = Instance.new("NoCollisionConstraint")
+						constraint.Name = "QMA_PlayerPair"
+						constraint.Part0 = a
+						constraint.Part1 = b
+						constraint.Parent = QMAPassThroughFolder
+						psep.Constraints[key] = constraint
+					end
+				end
+			end
+		end
+	end
+	for key, constraint in pairs(psep.Constraints) do
+		if not wanted[key] or not constraint or not constraint.Parent then
+			if constraint then pcall(function() constraint:Destroy() end) end
+			psep.Constraints[key] = nil
+		end
+	end
+	psep.Active = true
 end
 
 _G.Celestial.ClearQMPlayerPassThrough = AntiFlingQuantum.ClearPlayerPassThrough
@@ -2746,8 +2803,8 @@ local function AntiFlingQuantumFastTick(now)
 	if State.AntiFlingActive then
 		if now - (AntiFlingQuantum.LastPassThroughCheck or 0) >= 0.25 then
 			AntiFlingQuantum.LastPassThroughCheck = now
-			-- Never modify other players' collision groups; restore legacy edits if any remain.
-			AntiFlingQuantum.ClearPlayerPassThrough()
+			-- Isolate only character-to-character physical collision; map and coin parts are untouched.
+			AntiFlingQuantum.EnsurePlayerPassThrough(Players:GetPlayers(), now)
 		end
 		
 		local existingDanger = next(AntiFlingQuantum.DangerousPlayers) ~= nil
@@ -7514,14 +7571,41 @@ local function ControllerStep(dt)
 	-- (SafeControllerStep ya garantiza velocidad cero cuando velApplied=false) y recalcula la ruta.
 	if tonumber(dt) and dt >= 0.085 then
 		local hitchDt = tonumber(dt) or 0
-		local recovery = hitchDt >= 0.25 and 0.90 or (hitchDt >= 0.12 and 0.55 or 0.35)
+		-- Escalate recovery only when this hitch is part of a recent slow-frame burst.
+		-- A single isolated hitch gets a short hold; repeated hitches get more time to settle.
+		local recentSlowCount = 0
+		for i = #recentSlowFrameTimes, 1, -1 do
+			if now - recentSlowFrameTimes[i] <= slowFrameWindowSeconds then
+				recentSlowCount += 1
+			else
+				break
+			end
+		end
+		local recovery = hitchDt >= 0.25 and 0.90 or (hitchDt >= 0.12 and 0.55 or 0.25)
+		if recentSlowCount >= 4 then recovery = math.max(recovery, 0.65) end
+		if recentSlowCount >= 7 then recovery = math.max(recovery, 0.85) end
 		pauseUntil = math.max(pauseUntil, now + recovery)
 		currentSpeed = 0
 		CoinEngine.LastCommandVelocity = Vector3.zero
+		-- If the current coin is still behind solid geometry after a hitch, blacklist it briefly
+		-- so the next target scan can choose another route instead of resuming into the obstruction.
+		local hitchRoot = GetRoot()
+		local hitchTarget = CoinEngine.CurrentTarget
+		local blockedTarget = false
+		if hitchRoot and hitchTarget and hitchTarget.Parent then
+			local ok, blocked = pcall(function()
+				return not HasClearCoinRoute(hitchRoot.Position, hitchTarget)
+			end)
+			blockedTarget = ok and blocked == true
+		end
+		if blockedTarget then
+			CoinEngine.Blacklist[hitchTarget] = now + 2.0
+			SetCurrent(nil, now)
+		end
 		ResetPath()
 		CoinEngine.TargetTrack = nil
-		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f solid=%d target-reset=1",
-			hitchDt * 1000, recovery, solidOverlapActive and 1 or 0))
+		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f slowBurst=%d solid=%d target-reset=1 blocked-target=%d",
+			hitchDt * 1000, recovery, recentSlowCount, solidOverlapActive and 1 or 0, blockedTarget and 1 or 0))
 		return
 	end
 
