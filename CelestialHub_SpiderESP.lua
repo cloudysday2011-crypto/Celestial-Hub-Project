@@ -1,4 +1,4 @@
--- StabilityLog10: Rejoin/Server Hop repair, Movement Anti-AFK, and low-player auto-hop with one-shot config restore.
+-- StabilityLog12: queue CH auto-load for manual Rejoin/Server Hop as well as automatic low-player Server Hop.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
 -- V3.22 Incident Intelligence: client-visible incident context, recent output signals, ranked hypotheses, and compact diagnostic loaders.
@@ -31,28 +31,32 @@ if not _G.Celestial then
 	_G.Celestial = {}
 end
 
--- One-shot marker used only by the automatic low-player Server Hop.
+-- One-shot teleport marker: all supported teleport modes restore settings; only auto low-player hop skips the startup loader.
 do
 	local stateFile = "CelestialAutoHopState.json"
 	local httpService = game:GetService("HttpService")
-	_G.Celestial.AutoHopResumePayload = nil
+	_G.Celestial.AutoHopResumePayload = nil -- legacy-compatible payload name
+	_G.Celestial.TeleportResumePayload = nil
 	_G.Celestial.AutoHopResume = false
 	if type(readfile) == "function" then
 		local okRead, raw = pcall(readfile, stateFile)
 		if okRead and type(raw) == "string" and raw ~= "" then
 			local okDecode, payload = pcall(function() return httpService:JSONDecode(raw) end)
-			if okDecode and type(payload) == "table" and payload.version == 1
-				and payload.mode == "auto_server_hop" and tonumber(payload.placeId) == game.PlaceId
+			local validMode = type(payload) == "table" and (payload.mode == "auto_server_hop" or payload.mode == "manual_server_hop" or payload.mode == "rejoin_same_server")
+			local sourceMatches = type(payload) == "table" and (payload.mode == "rejoin_same_server" or payload.sourceJobId ~= game.JobId)
+			if okDecode and validMode and tonumber(payload.placeId) == game.PlaceId
 				and type(payload.createdAt) == "number" and (os.time() - payload.createdAt) >= 0
-				and (os.time() - payload.createdAt) <= 180 and payload.sourceJobId ~= game.JobId
+				and (os.time() - payload.createdAt) <= 180 and sourceMatches
 				and payload.targetJobId == game.JobId and type(payload.state) == "table" then
 				_G.Celestial.AutoHopResumePayload = payload
-				_G.Celestial.AutoHopResume = true
+				_G.Celestial.TeleportResumePayload = payload
+				-- Only automatic low-player hops skip the regular loading screen.
+				_G.Celestial.AutoHopResume = payload.mode == "auto_server_hop"
 			end
 		end
 	end
-	-- Consume the file on this execution so later manual teleports don't inherit auto-resume.
-	if _G.Celestial.AutoHopResume then
+	-- Consume any recognized teleport marker, including manual hop/rejoin markers.
+	if _G.Celestial.TeleportResumePayload then
 		pcall(function()
 			if type(delfile) == "function" then delfile(stateFile)
 			elseif type(writefile) == "function" then writefile(stateFile, "{\"consumed\":true}") end
@@ -1086,14 +1090,14 @@ _G.Celestial.State = {
 
 local State = _G.Celestial.State
 
--- Restore scalar settings only after an automatic Server Hop. Transient role/player values are excluded.
+-- Restore serializable settings after a recognized teleport. Transient role/player values are excluded.
 do
 	local excludedRestoreKeys = {
 		MurdererName = true, AimbotMurdererName = true, SheriffName = true, HeroName = true,
 		OriginalSheriff = true, HasGunBeenDropped = true,
 	}
-	local pending = _G.Celestial.AutoHopResumePayload
-	if _G.Celestial.AutoHopResume and type(pending) == "table" and type(pending.state) == "table" then
+	local pending = _G.Celestial.TeleportResumePayload or _G.Celestial.AutoHopResumePayload
+	if type(pending) == "table" and type(pending.state) == "table" then
 		for key, value in pairs(pending.state) do
 			local defaultValue = State[key]
 			local valueType = type(value)
@@ -1119,6 +1123,7 @@ do
 	-- Keep teleport failures visible. Do not silently fall back to a random server,
 	-- because that violates the explicit Rejoin Same Server destination.
 	_G.Celestial.PendingServerTeleport = nil
+	local clearAutoHopState -- forward declaration used by teleport failure callbacks
 	_G.Celestial.ServerTeleportFailureConnection = teleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
 		if player ~= LocalPlayer then return end
 		local pending = _G.Celestial.PendingServerTeleport
@@ -1126,9 +1131,10 @@ do
 		local kind = type(pending) == "table" and pending.kind or "Teleport"
 		warn("[Celestial Hub][" .. tostring(kind) .. "] TeleportInitFailed: " .. tostring(result) .. " — " .. tostring(message))
 		_G.Celestial.PendingServerTeleport = nil
+		if clearAutoHopState then clearAutoHopState() end
 	end)
 
-	local function clearAutoHopState()
+	clearAutoHopState = function()
 		pcall(function()
 			if type(delfile) == "function" then delfile(stateFile)
 			elseif type(writefile) == "function" then writefile(stateFile, "{\"consumed\":true}") end
@@ -1216,7 +1222,9 @@ do
 		return candidates, nil
 	end
 
-	local function queueAutoHopRelaunch(targetJobId)
+	local function queueTeleportRelaunch(targetJobId, mode)
+		local allowedModes = {auto_server_hop = true, manual_server_hop = true, rejoin_same_server = true}
+		if not allowedModes[mode] then return false, "unsupported teleport resume mode" end
 		if type(writefile) ~= "function" then return false, "executor lacks writefile" end
 		if type(readfile) ~= "function" then return false, "executor lacks readfile" end
 		if type(autoHopScriptUrl) ~= "string" or not autoHopScriptUrl:match("^https://raw%.githubusercontent%.com/") then return false, "CH auto-reload URL is not configured" end
@@ -1227,7 +1235,7 @@ do
 				if valueType ~= "number" or (value == value and value > -math.huge and value < math.huge) then snapshot[key] = value end
 			end
 		end
-		local payload = {version = 1, mode = "auto_server_hop", placeId = game.PlaceId, sourceJobId = game.JobId, targetJobId = targetJobId, createdAt = os.time(), state = snapshot}
+		local payload = {version = 1, mode = mode, placeId = game.PlaceId, sourceJobId = game.JobId, targetJobId = targetJobId, createdAt = os.time(), state = snapshot}
 		local okEncode, encoded = pcall(function() return httpService:JSONEncode(payload) end)
 		if not okEncode or type(encoded) ~= "string" then return false, "could not serialize CH settings" end
 		local okWrite = pcall(writefile, stateFile, encoded)
@@ -1245,14 +1253,30 @@ do
 		end
 
 		local bootstrap = string.format([[
-local ok,p=pcall(function()
- local raw=readfile(%q)
- local d=game:GetService("HttpService"):JSONDecode(raw)
- if type(d)=="table" and d.version==1 and d.mode=="auto_server_hop" and tonumber(d.placeId)==game.PlaceId and d.sourceJobId~=game.JobId and d.targetJobId==game.JobId and type(d.createdAt)=="number" and os.time()-d.createdAt>=0 and os.time()-d.createdAt<=180 then
-  local src=game:HttpGet(%q)
-  if type(src)=="string" and #src>1000 then local f=loadstring or load; local chunk=f(src); if type(chunk)=="function" then chunk() end end
- end
-end)
+local stateFile = %q
+local sourceUrl = %q
+local function log(message)
+ pcall(function() warn("[Celestial Hub][Auto-load] " .. tostring(message)) end)
+end
+local okRead, raw = pcall(function() return readfile(stateFile) end)
+if not okRead or type(raw) ~= "string" or raw == "" then log("resume state file could not be read"); return end
+local okDecode, d = pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
+if not okDecode or type(d) ~= "table" then log("resume state file is invalid JSON"); return end
+local allowed = d.mode == "auto_server_hop" or d.mode == "manual_server_hop" or d.mode == "rejoin_same_server"
+local sourceMatches = d.mode == "rejoin_same_server" or d.sourceJobId ~= game.JobId
+if not allowed or tonumber(d.placeId) ~= game.PlaceId or not sourceMatches or d.targetJobId ~= game.JobId or type(d.createdAt) ~= "number" or os.time()-d.createdAt < 0 or os.time()-d.createdAt > 180 then
+ log("resume marker does not match this destination; CH was not reloaded")
+ return
+end
+local okSource, src = pcall(function() return game:HttpGet(sourceUrl) end)
+if not okSource or type(src) ~= "string" or #src < 1000 then log("could not download the configured CH source URL: " .. tostring(src)); return end
+local compiler = loadstring or load
+if type(compiler) ~= "function" then log("executor has no loadstring/load compiler"); return end
+local okCompile, chunk, compileError = pcall(compiler, src)
+if not okCompile or type(chunk) ~= "function" then log("CH source failed to compile: " .. tostring(compileError or chunk)); return end
+local okRun, runError = pcall(chunk)
+if not okRun then log("CH source failed while starting: " .. tostring(runError)); return end
+print("[Celestial Hub][Auto-load] CH source executed for " .. tostring(d.mode))
 ]], stateFile, autoHopScriptUrl)
 		local okQueue = pcall(queueFunction, bootstrap)
 		if not okQueue then
@@ -1300,7 +1324,7 @@ end)
 					if candidate.moreThanCurrent and candidate.playing >= 3 and (not best or candidate.playing > best.playing) then best = candidate end
 				end
 				if best then
-					local prepared, reason = queueAutoHopRelaunch(best.id)
+					local prepared, reason = queueTeleportRelaunch(best.id, "auto_server_hop")
 					if prepared then
 						local failureConnection = nil
 						pcall(function()
@@ -1346,21 +1370,28 @@ end)
 			warn("[Celestial Hub][Rejoin Same Server] A teleport is already pending.")
 			return false, "Another teleport is pending"
 		end
+		local prepared, prepareError = queueTeleportRelaunch(jobId, "rejoin_same_server")
+		if not prepared then
+			warn("[Celestial Hub][Rejoin Same Server] Auto-load could not be queued: " .. tostring(prepareError))
+			return false, tostring(prepareError)
+		end
 		_G.Celestial.PendingServerTeleport = {kind = "Rejoin Same Server", targetJobId = jobId, startedAt = tick()}
 		local okTeleport, teleportErr = pcall(function()
 			teleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
 		end)
 		if not okTeleport then
 			_G.Celestial.PendingServerTeleport = nil
+			clearAutoHopState()
 			warn("[Celestial Hub][Rejoin Same Server] Request failed: " .. tostring(teleportErr))
 			return false, tostring(teleportErr)
 		end
-		print("[Celestial Hub][Rejoin Same Server] Requested current instance " .. tostring(jobId) .. ". Roblox may reject rejoining the exact instance from inside itself; check TeleportInitFailed if you remain here.")
-		task.delay(15, function()
+		print("[Celestial Hub][Rejoin Same Server] Requested instance " .. tostring(jobId) .. " and queued CH auto-load. Roblox may reject a request to the already-current instance; see TeleportInitFailed if no transition occurs.")
+		task.delay(30, function()
 			local pending = _G.Celestial.PendingServerTeleport
 			if type(pending) == "table" and pending.kind == "Rejoin Same Server" and pending.targetJobId == jobId then
-				warn("[Celestial Hub][Rejoin Same Server] Still in the current session after 15 seconds; the same-instance request may have been ignored by Roblox.")
+				warn("[Celestial Hub][Rejoin Same Server] No server transition was observed after 30 seconds; Roblox may have ignored the same-instance request.")
 				_G.Celestial.PendingServerTeleport = nil
+				clearAutoHopState()
 			end
 		end)
 		return true
@@ -1387,12 +1418,18 @@ end)
 			pool[i], pool[j] = pool[j], pool[i]
 		end
 		local selected = pool[1]
+		local prepared, prepareError = queueTeleportRelaunch(selected.id, "manual_server_hop")
+		if not prepared then
+			warn("[Celestial Hub][Server Hop] Auto-load could not be queued; teleport cancelled: " .. tostring(prepareError))
+			return false, tostring(prepareError)
+		end
 		_G.Celestial.PendingServerTeleport = {kind = "Server Hop", targetJobId = selected.id, startedAt = tick()}
 		local okTeleport, teleportErr = pcall(function()
 			teleportService:TeleportToPlaceInstance(game.PlaceId, selected.id, LocalPlayer)
 		end)
 		if not okTeleport then
 			_G.Celestial.PendingServerTeleport = nil
+			clearAutoHopState()
 			warn("[Celestial Hub][Server Hop] Request to server " .. tostring(selected.id) .. " failed: " .. tostring(teleportErr))
 			return false, tostring(teleportErr)
 		end
@@ -1402,6 +1439,7 @@ end)
 			if type(pending) == "table" and pending.kind == "Server Hop" and pending.targetJobId == selected.id then
 				warn("[Celestial Hub][Server Hop] No server transition was observed after 20 seconds; the target may have closed or Roblox rejected the teleport.")
 				_G.Celestial.PendingServerTeleport = nil
+				clearAutoHopState()
 			end
 		end)
 		return true
