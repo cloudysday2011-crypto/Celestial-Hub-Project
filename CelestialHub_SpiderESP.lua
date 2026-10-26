@@ -9043,32 +9043,64 @@ local function ControllerStep(dt)
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
-					-- Cadena de monedas: aprovecha la siguiente moneda precalculada si sigue disponible
-					-- y tiene ruta despejada. Mantiene una pausa corta y evita un barrido completo entre toques.
+					-- Cadena continua: intenta usar el objetivo precalculado; si ya no sirve,
+					-- elige otra moneda inmediatamente. La ruta bloqueada no cancela la cadena:
+					-- UpdateAutoNoclip decide si corresponde un cruce temporal coordinado.
+					local maxChainDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+					local maxChainVertical = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 					local chainNext = preparedNextCoin and preparedNextCoin ~= target
 						and IsAvailable(preparedNextCoin, now)
-						and (preparedNextCoin.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-						and math.abs(preparedNextCoin.Position.Y - root.Position.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
-						and HasClearCoinRoute(root.Position, preparedNextCoin)
+						and (preparedNextCoin.Position - root.Position).Magnitude <= maxChainDistance
+						and math.abs(preparedNextCoin.Position.Y - root.Position.Y) <= maxChainVertical
+						and IsThreatSafeCoin(preparedNextCoin)
+					if not chainNext then
+						local immediateNext
+						if CoinEngine.ThreatResponse.Active then
+							immediateNext = PickThreatCoin(root.Position, target, now)
+						else
+							immediateNext = PickNearest(root.Position, target, now)
+						end
+						if immediateNext and IsAvailable(immediateNext, now)
+							and (immediateNext.Position - root.Position).Magnitude <= maxChainDistance
+							and math.abs(immediateNext.Position.Y - root.Position.Y) <= maxChainVertical
+							and IsThreatSafeCoin(immediateNext) then
+							preparedNextCoin = immediateNext
+							chainNext = true
+						end
+					end
 					if POST_COLLECT_PAUSE_ENABLED then
 						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
 					end
 					if chainNext then
 						SetCurrent(preparedNextCoin, now)
-						currentSpeed = math.min(currentSpeed, CoinEngine.FlightMinSpeed)
-						lastFlightV = math.min(lastFlightV, CoinEngine.FlightMinSpeed)
-						nextPrepareAt = now + 0.03
-						LogEvent("coin-chain-next clear-route=1")
+						-- No frenar a la velocidad minima entre monedas; conservar el impulso
+						-- evita el paron visible cuando hay grupos de monedas.
+						currentSpeed = math.max(currentSpeed, CoinEngine.FlightMinSpeed)
+						lastFlightV = math.max(lastFlightV, CoinEngine.FlightMinSpeed)
+						nextPrepareAt = now + 0.01
+						LogEvent("coin-chain-next continuous=1 routeCheckedByNoclip=1")
 					else
-						currentSpeed = 0
-						lastFlightV = 0
+						-- Solo detenerse si de verdad no hay ningun objetivo disponible.
+						-- AdvanceTarget hace una ultima busqueda inmediata antes de declarar el idle.
 						CoinEngine.CurrentTarget = nil
 						CoinEngine.NextTarget = nil
-						nextPrepareAt = pauseUntil
+						AdvanceTarget(root, now)
+						if CoinEngine.CurrentTarget then
+							currentSpeed = math.max(currentSpeed, CoinEngine.FlightMinSpeed)
+							lastFlightV = math.max(lastFlightV, CoinEngine.FlightMinSpeed)
+							nextPrepareAt = now + 0.01
+							LogEvent("coin-chain-recovered immediate=1")
+						else
+						currentSpeed = 0
+						lastFlightV = 0
 						CoinEngine.LastCommandVelocity = Vector3.zero
 						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+						LogEvent("coin-chain-idle no-available-target=1")
 					end
-					velApplied = false
+					end
+					-- Si hay un objetivo siguiente, conserva la ultima orden de vuelo este frame;
+					-- SafeControllerStep solo pone la velocidad a cero cuando no se aplico ninguna.
+					velApplied = CoinEngine.CurrentTarget ~= nil
 					LogEvent(string.format("coin-post-collect-pause enabled=%d hold=%.2f chain=%d", POST_COLLECT_PAUSE_ENABLED and 1 or 0, POST_COLLECT_PAUSE_ENABLED and POST_COLLECT_PAUSE or 0, chainNext and 1 or 0))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
