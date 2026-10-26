@@ -6075,7 +6075,7 @@ local noTargetUntil = 0
 local nextPrepareAt = 0
 local nextHousekeeping = 0
 local nextRescanAt = 0
-local rescanBackoff = 1.0
+local rescanBackoff = 0.25
 local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
@@ -6323,7 +6323,12 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 	-- Vertical steering is limited by the existing safety cap; horizontal motion/animation
 	-- remains under the Humanoid rather than a BodyVelocity mover.
 	local physicalVelocity = root.AssemblyLinearVelocity
-	root.AssemblyLinearVelocity = Vector3.new(physicalVelocity.X, targetVelocity.Y, physicalVelocity.Z)
+	-- El Humanoid:Move por si solo puede ser sobrescrito por los controles del jugador y
+	-- su aceleracion normal no alcanza a seguir objetivos rapidos. Aplicar el componente
+	-- horizontal directamente mantiene el rumbo del AutoFarm; se conserva Y fisica para
+	-- que gravedad y animacion de caida sigan funcionando.
+	local commandedHorizontal = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
+	root.AssemblyLinearVelocity = Vector3.new(commandedHorizontal.X, physicalVelocity.Y, commandedHorizontal.Z)
 	if CoinEngine.NoclipWanted and hum.FloorMaterial == Enum.Material.Air then
 		pcall(function()
 			if hum:GetState() ~= Enum.HumanoidStateType.Freefall then
@@ -6331,7 +6336,7 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 			end
 		end)
 	end
-	CoinEngine.LastCommandVelocity = targetVelocity
+	CoinEngine.LastCommandVelocity = Vector3.new(commandedHorizontal.X, physicalVelocity.Y, commandedHorizontal.Z)
 end
 
 local function CoinNameMatches(obj)
@@ -6437,7 +6442,7 @@ local function RescanCoins()
 		found = ScanContainer(Workspace)
 	end
 	lastContainer = container
-	if found > 0 then rescanBackoff = 1.0 else rescanBackoff = math.min(rescanBackoff * 1.5, 4) end
+	if found > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
 	nextRescanAt = os.clock() + rescanBackoff
 	return found
 end
@@ -6478,7 +6483,7 @@ local function Activate()
 	CoinEngine.AddedConnection = Workspace.DescendantAdded:Connect(OnDescendantAdded)
 	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
 	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
-	rescanBackoff = 1.0
+	rescanBackoff = 0.25
 	ResetPath()
 	RescanCoins()
 end
@@ -8280,7 +8285,7 @@ local function ControllerStep(dt)
 	if now >= nextHousekeeping then
 		nextHousekeeping = now + 0.5
 		if FindCoinContainer() ~= lastContainer then
-			rescanBackoff = 1.0
+			rescanBackoff = 0.25
 			ResetPath()
 			pauseUntil = now + 1.5                          -- cambio de ronda/mapa: esperar a que el juego termine de moverte
 			roundActive = false                             -- la ronda se vuelve a detectar (armas + monedas)
