@@ -6001,26 +6001,26 @@ local CoinEngine = {
 		SelfRoleScanInterval = 0.25,
 	},
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 80,         -- V3.14: conserva el tope original del slider
-	MaxVerticalVelocity = 12, -- limita la orden vertical sin reducir el tope configurado
-	MaxAcceleration = 72,     -- se usa para calcular el frenado de aproximacion a la moneda
+	BaseMaxSpeed = 32,         -- limite de estabilidad para reducir desplazamientos grandes por frame
+	MaxVerticalVelocity = 8,  -- limita ascensos/descensos bruscos
+	MaxAcceleration = 48,     -- frenado mas conservador al aproximarse a una moneda
 	LastCommandVelocity = Vector3.zero,
 	AdaptiveStability = true, -- adapta direccion y cambios de velocidad
-	LastSafetyCap = 80,       -- limite temporal efectivo; el slider visible conserva el maximo 80
+	LastSafetyCap = 32,       -- limite efectivo maximo del Auto-Farm
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
-	SpeedSafetyHoldUntil = 0, -- evita que un unico frame rapido reactive 80 de golpe tras un tiron
-	SpeedSafetyHoldCap = 80,  -- campo de compatibilidad; el FPS ya no reduce este limite
-	CommandAcceleration = 150, -- limita cambios bruscos de la velocidad ordenada; no limita la velocidad final
-	RiskCommandAccelerationFloor = 80, -- aceleracion minima cuando la latencia o la carga de velocidad aumentan
-	NearTargetAccelerationMultiplier = 1.75, -- frena/ajusta con rapidez en el contacto de la moneda
-	RampTime = 0.55,           -- rampa original de aceleracion para el rango 70-80
+	SpeedSafetyHoldUntil = 0,
+	SpeedSafetyHoldCap = 32,
+	CommandAcceleration = 70, -- reduce cambios bruscos entre comandos consecutivos
+	RiskCommandAccelerationFloor = 40,
+	NearTargetAccelerationMultiplier = 1.35,
+	RampTime = 0.85,           -- aceleracion progresiva para reducir desajustes comando/fisica
 	MinCollectInterval = 0.04,
 	MaxDistance = 300,
 	VerticalTravelPenalty = 2.5, -- una moneda en el mismo piso pesa mas que una elevada
 	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
 	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 80,   -- V3.14: Safe Mode conserva el mismo tope de 80
+	SafeMaxSpeed = 32,   -- mismo limite conservador tambien con Safe Mode
 	SafeRampTime = 0.65,       -- rampa extra gradual en Safe Mode
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
@@ -6080,7 +6080,7 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local POST_COLLECT_PAUSE = 0.10 -- espera fija tras cada recogida confirmada por el controlador
+local POST_COLLECT_PAUSE = 0.25 -- espera fija tras cada recogida confirmada por el controlador
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
@@ -6141,8 +6141,8 @@ local function StopFlight()
 	flightOn = false
 	solidOverlapActive = false
 	CoinEngine.SpeedSafetyHoldUntil = 0
-	CoinEngine.SpeedSafetyHoldCap = 80
-	CoinEngine.LastSafetyCap = 80
+	CoinEngine.SpeedSafetyHoldCap = 32
+	CoinEngine.LastSafetyCap = 32
 	CoinEngine.LastSafetyReason = "normal"
 	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
@@ -6170,7 +6170,9 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	CoinEngine.NoclipWanted = true       -- Reactivar NoClip durante el vuelo para atravesar paredes hacia las monedas
+	-- No activar NoClip desde el Auto-Farm: se mantienen colisiones consistentes con la geometria.
+	-- Las rutas obstruidas deben redirigirse, no atravesarse.
+	CoinEngine.NoclipWanted = false
 end
 
 -- Estabilidad adaptativa V3.14, ajustada para ser independiente de los FPS.
@@ -6367,7 +6369,6 @@ local function UnregisterCoin(coin)
 	if CoinEngine.NextTarget == coin then CoinEngine.NextTarget = nil end
 end
 
-
 local function FindCoinContainer()
 	return Workspace:FindFirstChild("CoinContainer")
 end
@@ -6415,7 +6416,7 @@ local function RescanCoins()
 		found = ScanContainer(Workspace)
 	end
 	lastContainer = container
-	if found > 0 or CoinEngine.CoinCount > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
+	if found > 0 then rescanBackoff = 1.0 else rescanBackoff = math.min(rescanBackoff * 1.5, 4) end
 	nextRescanAt = os.clock() + rescanBackoff
 	return found
 end
@@ -6456,7 +6457,7 @@ local function Activate()
 	CoinEngine.AddedConnection = Workspace.DescendantAdded:Connect(OnDescendantAdded)
 	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
 	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
-	rescanBackoff = 0.25
+	rescanBackoff = 1.0
 	ResetPath()
 	RescanCoins()
 end
@@ -6645,7 +6646,7 @@ local function UpdateDiagnosticSegment(root)
 	return diagnosticSegment
 end
 local nextSolidGuardCheck, solidOverlapSince = 0, nil
-local SOLID_OVERLAP_CONFIRM_TIME = 0.45
+local SOLID_OVERLAP_CONFIRM_TIME = 0.25
 -- Ultimo dt real de Heartbeat. Las muestras forzadas (kick / safety-stop / GUI-error) llaman a
 -- LogStep con dt=0, lo que producia "fps=0" falso. Ahora se usa el ultimo dt valido.
 local lastFrameDt = 1 / 60
@@ -8183,7 +8184,7 @@ local function ControllerStep(dt)
 
 	local now = os.clock()
 	local rawDt = dt
-	-- No sobrescribir NoclipWanted aquí: EnsureFlight lo activa y StopFlight lo desactiva.
+	-- NoClip queda apagado durante el Auto-Farm; EnsureFlight conserva las colisiones activas.
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -8258,7 +8259,7 @@ local function ControllerStep(dt)
 	if now >= nextHousekeeping then
 		nextHousekeeping = now + 0.5
 		if FindCoinContainer() ~= lastContainer then
-			rescanBackoff = 0.25
+			rescanBackoff = 1.0
 			ResetPath()
 			pauseUntil = now + 1.5                          -- cambio de ronda/mapa: esperar a que el juego termine de moverte
 			roundActive = false                             -- la ronda se vuelve a detectar (armas + monedas)
@@ -8435,7 +8436,7 @@ local function ControllerStep(dt)
 			local actualSpeed = root.AssemblyLinearVelocity.Magnitude
 			local routeBlocked = target and target.Parent and not HasClearCoinRoute(root.Position, target) or false
 			local overlapAge = now - solidOverlapSince
-			local stalled = (now - lastProgress) >= 0.55
+			local stalled = (now - lastProgress) >= 0.35
 			if overlapAge >= SOLID_OVERLAP_CONFIRM_TIME and routeBlocked and actualSpeed >= 12 and targetDistance > 8 and stalled then
 				LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1 confirm=%.2f routeBlocked=1 stall=%.2f",
 					actualSpeed, targetDistance, overlapAge, now - lastProgress))
@@ -8481,12 +8482,18 @@ local function ControllerStep(dt)
 	end
 	local slowFramesInWindow = #recentSlowFrameTimes
 
-	-- Frame-time/FPS metrics are retained for diagnosis, but must not lower the requested speed.
-	-- Time-based acceleration and the collision/ping guards below remain active; this avoids
-	-- silently slowing the farm solely because the device renders fewer frames per second.
-	local safetyCap = 80
+	-- Frame-time/FPS metrics remain diagnostic; repeated slow frames lower the movement cap temporarily.
+	-- This avoids issuing large movement requests after a delayed Heartbeat.
+	local safetyCap = Param(CoinEngine.SafeMaxSpeed, 32)
+	-- En intervalos lentos, reducir tambien la velocidad objetivo evita grandes desplazamientos por frame.
+	local frameSpeedCap = safetyCap
+	if sampleDt >= 0.060 then
+		frameSpeedCap = math.min(frameSpeedCap, 16)
+	elseif sampleDt >= 0.040 then
+		frameSpeedCap = math.min(frameSpeedCap, 22)
+	end
 	CoinEngine.SpeedSafetyHoldUntil = 0
-	CoinEngine.SpeedSafetyHoldCap = safetyCap
+	CoinEngine.SpeedSafetyHoldCap = frameSpeedCap
 	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
 	-- mantener el farm en 64 aunque el ping medio de las dos capturas ronda 117-133 ms.
 	local pingCap, pingWhy = 80, nil
@@ -8503,12 +8510,11 @@ local function ControllerStep(dt)
 		speed = math.min(speed, pingCap)
 		if safetyReason == "normal" then safetyReason = pingWhy else safetyReason = safetyReason .. "+" .. pingWhy end
 	end
-	-- Con NoClip activo, el mero solapamiento con una pared puede ser transitorio mientras se atraviesa.
-	-- Recortar velocidad solo si el solapamiento persiste y además no hay progreso hacia el objetivo.
+	-- Si hay solapamiento persistente con geometria y falta de progreso, reducir la velocidad y redirigir.
 	local solidStall = solidOverlapActive and solidOverlapSince ~= nil
-		and (now - solidOverlapSince) >= 0.85 and (now - lastProgress) >= 0.85
-	if solidStall and speed > 50 then
-		speed = 50
+		and (now - solidOverlapSince) >= 0.35 and (now - lastProgress) >= 0.35
+	if solidStall and speed > 12 then
+		speed = 12
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 
@@ -8534,6 +8540,11 @@ local function ControllerStep(dt)
 			speed = math.min(speed + additionalSpeed, 124)
 			safetyReason = safetyReason == "normal" and boostReason or (safetyReason .. "+" .. boostReason)
 		end
+	end
+	if speed > frameSpeedCap then
+		speed = frameSpeedCap
+		local capReason = sampleDt >= 0.060 and "slow-frame-critical" or (sampleDt >= 0.040 and "slow-frame" or "stable-cap")
+		safetyReason = safetyReason == "normal" and capReason or (safetyReason .. "+" .. capReason)
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
 		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms slowFrames=%d pingEma=%.0f solid=%d",
