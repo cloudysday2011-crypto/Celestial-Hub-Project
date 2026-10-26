@@ -6029,7 +6029,7 @@ local CoinEngine = {
 	-- ===== LOTES FIJOS (solo con Safe Mode) =====
 	Batches = {13, 13, 13, 11},  -- monedas RECOGIDAS por el script en cada lote; tras cada lote (menos el ultimo) hay pausa
 	BatchPauseTime = 3.0,        -- segundos de pausa entre lotes. Al terminar el ultimo (13+13+13+11 = 50) el farm se detiene
-	-- ===== MOVIMIENTO del Humanoid + descenso final hacia suelo =====
+	-- ===== VUELO (arquitectura de "Fly": BodyVelocity + BodyGyro + PlatformStand) =====
 	StopDistance = 0.0,          -- V3.11: apunta al punto de contacto sobre la moneda, no se queda a 2 studs
 	FlightApproachGain = 30,     -- frenado al acercarse (velocidad maxima = distancia restante * ganancia)
 	SafeFlightApproachGain = 15, -- con Safe Mode el frenado es mas suave
@@ -6075,19 +6075,17 @@ local noTargetUntil = 0
 local nextPrepareAt = 0
 local nextHousekeeping = 0
 local nextRescanAt = 0
-local rescanBackoff = 0.25
+local rescanBackoff = 1.0
 local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local POST_COLLECT_PAUSE = 0.10 -- frenado breve entre monedas tras confirmar la recogida
+local POST_COLLECT_PAUSE = 0.10 -- espera fija tras cada recogida confirmada por el controlador
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
 local coinsSinceRest = 0
 local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
-local touchdownTarget, touchdownStartedAt = nil, 0 -- fase breve de descenso y contacto con el suelo
-local controlledHumanoid, savedWalkSpeed = nil, nil -- restaura WalkSpeed al apagar el AutoFarm
 local noclipOn = false
 local solidOverlapActive = false          -- ultimo resultado del guard de solidos (cada 0.12 s)
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
@@ -6114,7 +6112,7 @@ for _, n in ipairs(CoinEngine.Batches) do batchTotal += n end
 local touchedCoins = setmetatable({}, {__mode = "k"})   -- [coin] = true (monedas distintas recogidas esta ronda)
 local batchPausing, batchPausePending, limitReached = false, false, false
 local curStatus = ""
-local flightGyro, flightVel, flightOn = nil, nil, false  -- compatibilidad/limpieza con versiones que usaban los BodyMovers
+local flightGyro, flightVel, flightOn = nil, nil, false  -- mismos elementos que usa "Fly": BodyGyro + BodyVelocity + PlatformStand
 local velApplied = false               -- el controlador dio orden de velocidad este frame (si no, se flota quieto)
 
 local function SetStatus(s)
@@ -6128,51 +6126,51 @@ local function ResetRoundCounters()
 end
 
 -- ---------------------------------------------------------------
--- MOVIMIENTO DEL AUTO-FARM: usa el controlador normal del Humanoid, sin BodyVelocity,
--- BodyGyro ni PlatformStand. La gravedad/animacion aerea del personaje sigue activa.
--- El NoClip solo se pausa al acercarse a una moneda para permitir el contacto con el suelo.
+-- VUELO (arquitectura de la funcion "Fly" de CH): en vez de teletransportar el CFrame cada frame,
+-- el personaje vuela con fisica real (BodyVelocity), con PlatformStand activo: sin animacion de
+-- caida/caminar en el aire ni posiciones "saltadas" que el anti-cheat pueda marcar como invalidas.
 -- ---------------------------------------------------------------
 
 local function StopFlight()
-	-- Limpiar restos de ejecuciones anteriores que todavia usaran la arquitectura Fly.
 	if flightGyro then pcall(function() flightGyro:Destroy() end); flightGyro = nil end
 	if flightVel then pcall(function() flightVel:Destroy() end); flightVel = nil end
-	local hum = controlledHumanoid or GetHumanoid()
-	if hum then
-		pcall(function()
-			hum.PlatformStand = false
-			hum:Move(Vector3.zero, false)
-			if controlledHumanoid == hum and savedWalkSpeed ~= nil then hum.WalkSpeed = savedWalkSpeed end
-		end)
+	if flightOn then
+		local hum = GetHumanoid()
+		if hum then pcall(function() hum.PlatformStand = false end) end
 	end
-	controlledHumanoid, savedWalkSpeed = nil, nil
 	flightOn = false
-	touchdownTarget, touchdownStartedAt = nil, 0
 	solidOverlapActive = false
 	CoinEngine.SpeedSafetyHoldUntil = 0
 	CoinEngine.SpeedSafetyHoldCap = 80
 	CoinEngine.LastSafetyCap = 80
 	CoinEngine.LastSafetyReason = "normal"
 	CoinEngine.LastCommandVelocity = Vector3.zero
-	_G.Celestial.FarmFlying = false
+	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
 	CoinEngine.NoclipWanted = false
 end
 
 local function EnsureFlight(root, hum)
-	-- Save each Humanoid's existing speed once, then use ordinary animation/physics.
-	if controlledHumanoid ~= hum then
-		if controlledHumanoid and savedWalkSpeed ~= nil then
-			pcall(function() controlledHumanoid.WalkSpeed = savedWalkSpeed end)
-		end
-		controlledHumanoid, savedWalkSpeed = hum, hum.WalkSpeed
+	if not flightGyro or flightGyro.Parent ~= root then
+		if flightGyro then pcall(function() flightGyro:Destroy() end) end
+		flightGyro = Instance.new("BodyGyro")
+		flightGyro.Name = "__CelestialFarmGyro"
+		flightGyro.MaxTorque = Vector3.new(99999, 99999, 99999)
+		flightGyro.P = 9000
+		flightGyro.CFrame = root.CFrame
+		flightGyro.Parent = root
 	end
-	-- Destroy leftover movers from an older run; this version never creates them.
-	if flightGyro then pcall(function() flightGyro:Destroy() end); flightGyro = nil end
-	if flightVel then pcall(function() flightVel:Destroy() end); flightVel = nil end
-	if hum.PlatformStand then hum.PlatformStand = false end
+	if not flightVel or flightVel.Parent ~= root then
+		if flightVel then pcall(function() flightVel:Destroy() end) end
+		flightVel = Instance.new("BodyVelocity")
+		flightVel.Name = "__CelestialFarmVel"
+		flightVel.MaxForce = Vector3.new(99999, 99999, 99999)
+		flightVel.Velocity = Vector3.zero
+		flightVel.Parent = root
+	end
+	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	CoinEngine.NoclipWanted = touchdownTarget == nil
+	CoinEngine.NoclipWanted = true       -- Reactivar NoClip durante el vuelo para atravesar paredes hacia las monedas
 end
 
 -- Estabilidad adaptativa V3.14, ajustada para ser independiente de los FPS.
@@ -6243,7 +6241,7 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 end
 
 local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
-	if not direction then return end
+	if not flightVel or not direction then return end
 	local speed = math.max(0, tonumber(requestedSpeed) or 0)
 	local dirMag = direction.Magnitude
 	if dirMag < 1e-5 then return end
@@ -6309,34 +6307,8 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 			targetVelocity = previous + deltaVelocity.Unit * allowedDelta
 		end
 	end
-	local root = GetRoot()
-	local hum = GetHumanoid()
-	if not root or not hum then return end
-	local horizontalVelocity = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
-	local horizontalSpeed = horizontalVelocity.Magnitude
-	hum.WalkSpeed = horizontalSpeed
-	if horizontalSpeed > 0.05 then
-		hum:Move(horizontalVelocity.Unit, false)
-	else
-		hum:Move(Vector3.zero, false)
-	end
-	-- Vertical steering is limited by the existing safety cap; horizontal motion/animation
-	-- remains under the Humanoid rather than a BodyVelocity mover.
-	local physicalVelocity = root.AssemblyLinearVelocity
-	-- El Humanoid:Move por si solo puede ser sobrescrito por los controles del jugador y
-	-- su aceleracion normal no alcanza a seguir objetivos rapidos. Aplicar el componente
-	-- horizontal directamente mantiene el rumbo del AutoFarm; se conserva Y fisica para
-	-- que gravedad y animacion de caida sigan funcionando.
-	local commandedHorizontal = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
-	root.AssemblyLinearVelocity = Vector3.new(commandedHorizontal.X, physicalVelocity.Y, commandedHorizontal.Z)
-	if CoinEngine.NoclipWanted and hum.FloorMaterial == Enum.Material.Air then
-		pcall(function()
-			if hum:GetState() ~= Enum.HumanoidStateType.Freefall then
-				hum:ChangeState(Enum.HumanoidStateType.Freefall)
-			end
-		end)
-	end
-	CoinEngine.LastCommandVelocity = Vector3.new(commandedHorizontal.X, physicalVelocity.Y, commandedHorizontal.Z)
+	flightVel.Velocity = targetVelocity
+	CoinEngine.LastCommandVelocity = targetVelocity
 end
 
 local function CoinNameMatches(obj)
@@ -6395,13 +6367,123 @@ local function UnregisterCoin(coin)
 	if CoinEngine.NextTarget == coin then CoinEngine.NextTarget = nil end
 end
 
+
+-- Deteccion visual: los nombres solo prefiltran candidatos; para aceptarlos deben girar
+-- mientras permanecen en el mismo lugar. Los objetos que se desplazan se descartan.
+-- La lista contiene solo candidatos coin-like, no cada pieza del mapa por fotograma.
+local coinMotionState = setmetatable({}, {__mode = "k"})
+local coinMotionCandidates = {}
+local coinMotionIndex = {}
+local nextCoinMotionSample = 0
+local COIN_MOTION_SAMPLE_INTERVAL = 0.08
+local COIN_MOTION_POSITION_TOLERANCE = 0.18
+local COIN_MOTION_ANCHOR_TOLERANCE = 0.30
+local COIN_MOTION_MIN_ANGLE = math.rad(0.7)
+local IsInRecognizedCoinSource -- forward declaration for the motion sampler
+
+local function RemoveCoinMotionCandidate(coin, permanentlyReject)
+	local state = coinMotionState[coin]
+	if state and permanentlyReject then state.rejected = true end
+	local index = coinMotionIndex[coin]
+	if index then
+		local last = #coinMotionCandidates
+		local replacement = coinMotionCandidates[last]
+		coinMotionCandidates[index] = replacement
+		coinMotionCandidates[last] = nil
+		coinMotionIndex[coin] = nil
+		if replacement and replacement ~= coin then coinMotionIndex[replacement] = index end
+	end
+end
+
+local function QueueCoinMotionCandidate(coin)
+	if not coin or not coin.Parent or not IsValidCoin(coin) then return false end
+	local existing = coinMotionState[coin]
+	if existing then
+		if not existing.rejected and not coinMotionIndex[coin] then
+			coinMotionCandidates[#coinMotionCandidates + 1] = coin
+			coinMotionIndex[coin] = #coinMotionCandidates
+		end
+		return false
+	end
+	local now = os.clock()
+	coinMotionState[coin] = {
+		anchorPosition = coin.Position,
+		lastPosition = coin.Position,
+		lastCFrame = coin.CFrame,
+		lastSampleAt = now,
+		createdAt = now,
+		stableSamples = 0,
+		rotationSamples = 0,
+		rejected = false,
+	}
+	coinMotionCandidates[#coinMotionCandidates + 1] = coin
+	coinMotionIndex[coin] = #coinMotionCandidates
+	return true
+end
+
+local function UpdateCoinMotionCandidates(now)
+	if now < nextCoinMotionSample then return end
+	nextCoinMotionSample = now + COIN_MOTION_SAMPLE_INTERVAL
+	for i = #coinMotionCandidates, 1, -1 do
+		local coin = coinMotionCandidates[i]
+		local state = coinMotionState[coin]
+		if not state or state.rejected or not coin or not coin.Parent
+			or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+			if coin and CoinEngine.CoinCache[coin] then UnregisterCoin(coin) end
+			if coin then RemoveCoinMotionCandidate(coin, true) else
+				local last = #coinMotionCandidates
+				local replacement = coinMotionCandidates[last]
+				coinMotionCandidates[i] = replacement
+				coinMotionCandidates[last] = nil
+				if replacement then coinMotionIndex[replacement] = i end
+			end
+		else
+			local sampleDt = now - state.lastSampleAt
+			if sampleDt >= 0.065 then
+				local position = coin.Position
+				local currentCFrame = coin.CFrame
+				local stepDisplacement = (position - state.lastPosition).Magnitude
+				local totalDisplacement = (position - state.anchorPosition).Magnitude
+				if stepDisplacement > COIN_MOTION_POSITION_TOLERANCE or totalDisplacement > COIN_MOTION_ANCHOR_TOLERANCE then
+					-- Un objeto que cambia de lugar no se clasifica como moneda, aunque tambien rote.
+					if CoinEngine.CoinCache[coin] then UnregisterCoin(coin) end
+					RemoveCoinMotionCandidate(coin, true)
+				else
+					local oldCF = state.lastCFrame
+					local minDot = math.min(
+						oldCF.RightVector:Dot(currentCFrame.RightVector),
+						oldCF.UpVector:Dot(currentCFrame.UpVector),
+						oldCF.LookVector:Dot(currentCFrame.LookVector))
+					local angularChange = math.acos(math.clamp(minDot, -1, 1))
+					state.stableSamples += 1
+					if angularChange >= COIN_MOTION_MIN_ANGLE then
+						state.rotationSamples += 1
+					else
+						state.rotationSamples = math.max(0, state.rotationSamples - 1)
+					end
+					state.lastPosition = position
+					state.lastCFrame = currentCFrame
+					state.lastSampleAt = now
+					-- Confirm only after repeated rotation and stable position, not from one noisy frame.
+					if state.stableSamples >= 2 and state.rotationSamples >= 2 then
+						RegisterCoin(coin)
+					elseif now - state.createdAt >= 1.25 and state.rotationSamples < 2 then
+						-- Retirar candidatos estaticos evita mantenerlos en la lista de muestreo.
+						RemoveCoinMotionCandidate(coin, true)
+					end
+				end
+			end
+		end
+	end
+end
+
 local function FindCoinContainer()
 	return Workspace:FindFirstChild("CoinContainer")
 end
 
 -- No registrar monedas que aparezcan en objetos ajenos al mapa/ronda activa.
 -- DescendantAdded se escucha en Workspace por eficiencia, pero eso no convierte todo Workspace en una fuente valida.
-local function IsInRecognizedCoinSource(obj)
+IsInRecognizedCoinSource = function(obj)
 	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then return false end
 	if not CoinNameMatches(obj) then return false end
 	local coinContainer = FindCoinContainer()
@@ -6421,8 +6503,7 @@ local function ScanContainer(container)
 	local found = 0
 	for _, obj in ipairs(container:GetDescendants()) do
 		if obj:IsA("BasePart") and IsValidCoin(obj) and not CoinEngine.CoinCache[obj] then
-			RegisterCoin(obj)
-			found += 1
+			if QueueCoinMotionCandidate(obj) then found += 1 end
 		end
 	end
 	return found
@@ -6438,11 +6519,11 @@ local function RescanCoins()
 	end
 	-- Fallback compatible con mapas que guardan monedas directamente en Workspace.
 	-- ScanContainer solo registra BaseParts cuyo nombre coincide con CoinNameMatches y pasa IsValidCoin.
-	if found == 0 and CoinEngine.CoinCount == 0 then
+	if found == 0 and CoinEngine.CoinCount == 0 and #coinMotionCandidates == 0 then
 		found = ScanContainer(Workspace)
 	end
 	lastContainer = container
-	if found > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
+	if found > 0 or CoinEngine.CoinCount > 0 or #coinMotionCandidates > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
 	nextRescanAt = os.clock() + rescanBackoff
 	return found
 end
@@ -6451,7 +6532,7 @@ local function OnDescendantAdded(obj)
 	if obj:IsA("BasePart") and CoinNameMatches(obj) then
 		task.defer(function()
 			if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
-				RegisterCoin(obj)
+				QueueCoinMotionCandidate(obj)
 			end
 		end)
 	end
@@ -6459,6 +6540,8 @@ end
 
 local function OnDescendantRemoving(obj)
 	if CoinEngine.CoinCache[obj] then UnregisterCoin(obj) end
+	RemoveCoinMotionCandidate(obj, true)
+	coinMotionState[obj] = nil
 end
 
 local function ResetPath()
@@ -6484,6 +6567,10 @@ local function Activate()
 	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
 	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
 	rescanBackoff = 0.25
+	table.clear(coinMotionCandidates)
+	table.clear(coinMotionIndex)
+	table.clear(coinMotionState)
+	nextCoinMotionSample = 0
 	ResetPath()
 	RescanCoins()
 end
@@ -6497,6 +6584,10 @@ local function Deactivate()
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
+	table.clear(coinMotionCandidates)
+	table.clear(coinMotionIndex)
+	table.clear(coinMotionState)
+	nextCoinMotionSample = 0
 	coinsSinceRest = 0
 	CoinEngine.CoinCount = 0
 	roundActive = false
@@ -8209,8 +8300,9 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
+	UpdateCoinMotionCandidates(now)
 	local rawDt = dt
-	-- NoclipWanted se activa durante el trayecto y se desactiva para el contacto con el suelo.
+	-- No sobrescribir NoclipWanted aquí: EnsureFlight lo activa y StopFlight lo desactiva.
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -8285,7 +8377,7 @@ local function ControllerStep(dt)
 	if now >= nextHousekeeping then
 		nextHousekeeping = now + 0.5
 		if FindCoinContainer() ~= lastContainer then
-			rescanBackoff = 0.25
+			rescanBackoff = 1.0
 			ResetPath()
 			pauseUntil = now + 1.5                          -- cambio de ronda/mapa: esperar a que el juego termine de moverte
 			roundActive = false                             -- la ronda se vuelve a detectar (armas + monedas)
@@ -8331,7 +8423,7 @@ local function ControllerStep(dt)
 
 	if now < pauseUntil then
 		if batchPausing then SetStatus("batch-pause") end
-		return                            -- SafeControllerStep detiene la entrada horizontal; la gravedad sigue activa
+		return                            -- SafeControllerStep deja la velocidad en 0: flota quieto en el sitio
 	end
 	if batchPausing then
 		batchPausing = false
@@ -8445,7 +8537,7 @@ local function ControllerStep(dt)
 		end
 	end
 
-	-- ===== MOVIMIENTO hacia la moneda =====
+	-- ===== VUELO hacia la moneda =====
 	SetStatus(CoinEngine.ThreatResponse.Active and "threat-routing" or "farming")
 	EnsureFlight(root, hum)
 
@@ -8624,7 +8716,7 @@ local function ControllerStep(dt)
 	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
 	-- Dirigirse al centro geométrico de la moneda hacía que el personaje quedara a varios studs en horizontal
 	-- al dispararse la recogida por distancia 3D.
-	local contactHeight = math.max(0.5, hum.HipHeight + root.Size.Y * 0.5 + target.Size.Y * 0.5 - 0.1)
+	local contactHeight = math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15)
 	local approachPos = target.Position + Vector3.new(0, contactHeight, 0)
 	local delta = approachPos - rootPos
 	local dist = delta.Magnitude
@@ -8647,57 +8739,6 @@ local function ControllerStep(dt)
 	CoinEngine.LastTargetVel = tt.vel.Magnitude
 
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
-	-- Enter the grounded contact phase near the target. Restore collisions and descend gently;
-	-- if landing is unusually delayed, increase downward velocity after 1.5 seconds.
-	if touchdownTarget and touchdownTarget ~= target then
-		touchdownTarget, touchdownStartedAt = nil, 0
-		CoinEngine.NoclipWanted = true
-	end
-	if not touchdownTarget and dist <= 3.0 and math.abs(delta.Y) <= 1.25 then
-		touchdownTarget, touchdownStartedAt = target, now
-		CoinEngine.NoclipWanted = false
-		LogEvent(string.format("coin-touchdown-start dist=%.2f floor=%s", dist, tostring(hum.FloorMaterial)))
-	end
-	if touchdownTarget == target then
-		CoinEngine.NoclipWanted = false
-		if hum.FloorMaterial == Enum.Material.Air then
-			-- Stop horizontal travel while the character settles onto real ground.
-			hum.WalkSpeed = 0
-			hum:Move(Vector3.zero, false)
-			local physicalVelocity = root.AssemblyLinearVelocity
-			local airborneFor = now - touchdownStartedAt
-			local downVelocity
-			if airborneFor >= 1.5 then
-				downVelocity = -8
-			else
-				downVelocity = math.clamp(math.min(physicalVelocity.Y, -3), -6, -3)
-			end
-			local horizontalVelocity = Vector3.new(physicalVelocity.X, 0, physicalVelocity.Z)
-			if horizontalVelocity.Magnitude > 6 then horizontalVelocity = horizontalVelocity.Unit * 6 end
-			root.AssemblyLinearVelocity = Vector3.new(horizontalVelocity.X, downVelocity, horizontalVelocity.Z)
-			CoinEngine.LastCommandVelocity = Vector3.new(horizontalVelocity.X, downVelocity, horizontalVelocity.Z)
-			velApplied = true
-			if airborneFor >= 1.5 then SetStatus("touchdown-recovery") else SetStatus("touchdown") end
-			return
-		end
-		-- Once grounded, walk the final short distance to the coin without re-enabling NoClip.
-		if dist > pickupDistance then
-			local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
-			local walkSpeed = math.min(math.max(currentSpeed, 4), 8)
-			if horizontalDelta.Magnitude > 0.05 then
-				hum.WalkSpeed = walkSpeed
-				hum:Move(horizontalDelta.Unit, false)
-			else
-				hum.WalkSpeed = 0
-				hum:Move(Vector3.zero, false)
-			end
-			local physicalVelocity = root.AssemblyLinearVelocity
-			CoinEngine.LastCommandVelocity = Vector3.new(horizontalDelta.Magnitude > 0.05 and horizontalDelta.Unit.X * walkSpeed or 0,
-				physicalVelocity.Y, horizontalDelta.Magnitude > 0.05 and horizontalDelta.Unit.Z * walkSpeed or 0)
-			velApplied = true
-			return
-		end
-	end
 	if dist <= pickupDistance then
 		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
 		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
@@ -8707,7 +8748,7 @@ local function ControllerStep(dt)
 			if CoinEngine.SoftBrake then
 				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
 				currentSpeed = math.min(currentSpeed, lastFlightV) * CoinEngine.SoftBrakeDecay
-				if currentSpeed > 1 and dist > 0.001 then
+				if currentSpeed > 1 and flightVel and dist > 0.001 then
 					ApplyStableFlightVelocity(delta / dist, currentSpeed, dt)
 					velApplied = true
 				else
@@ -8734,16 +8775,13 @@ local function ControllerStep(dt)
 					-- Parada breve tras cada recogida: elimina el impulso residual y obliga a
 					-- elegir la siguiente moneda desde la posicion actual del personaje.
 					pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
-					touchdownTarget, touchdownStartedAt = nil, 0
-					CoinEngine.NoclipWanted = false
 					currentSpeed = 0
 					lastFlightV = 0
 					CoinEngine.LastCommandVelocity = Vector3.zero
-					hum.WalkSpeed = 0
-					hum:Move(Vector3.zero, false)
 					CoinEngine.NextTarget = nil
 					nextPrepareAt = pauseUntil
 					velApplied = false
+					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 					LogEvent(string.format("coin-post-collect-pause hold=%.2f next=dynamic-reselect", POST_COLLECT_PAUSE))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
@@ -8761,7 +8799,7 @@ local function ControllerStep(dt)
 			lastProgress = now
 		end
 	else
-		-- Desplazamiento hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
+		-- Vuelo: velocidad real hacia la moneda, con frenado suave al acercarse (sin sobrepasarla)
 		local dir = delta / dist
 		local remaining = dist - CoinEngine.StopDistance
 		local gain = Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain)
@@ -8780,9 +8818,13 @@ local function ControllerStep(dt)
 			v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 		end
 		lastFlightV = v
-		if v == v then
+		if v == v and flightVel then
 			ApplyStableFlightVelocity(dir, v, dt)
 			velApplied = true
+		end
+		local horiz = Vector3.new(dir.X, 0, dir.Z)
+		if horiz.Magnitude > 0.05 and flightGyro then
+			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + horiz)   -- de frente hacia donde vuela, siempre derecho
 		end
 	end
 
@@ -8828,15 +8870,8 @@ local function SafeControllerStep(dt)
 			end
 		end
 	end
-	if not velApplied then
-		local hum = GetHumanoid()
-		if hum then
-			pcall(function()
-				hum:Move(Vector3.zero, false)
-				if flightOn then hum.WalkSpeed = 0 end
-			end)
-		end
-		if not touchdownTarget then CoinEngine.NoclipWanted = false end
+	if flightVel and not velApplied then
+		pcall(function() flightVel.Velocity = Vector3.zero end) -- sin orden: flota quieto
 		CoinEngine.LastCommandVelocity = Vector3.zero
 	end
 	if State.FarmEnabled and not logFinalized then pcall(HiResPush, os.clock(), dt, csMs) end
