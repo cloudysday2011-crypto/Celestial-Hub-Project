@@ -6368,122 +6368,13 @@ local function UnregisterCoin(coin)
 end
 
 
--- Deteccion visual: los nombres solo prefiltran candidatos; para aceptarlos deben girar
--- mientras permanecen en el mismo lugar. Los objetos que se desplazan se descartan.
--- La lista contiene solo candidatos coin-like, no cada pieza del mapa por fotograma.
-local coinMotionState = setmetatable({}, {__mode = "k"})
-local coinMotionCandidates = {}
-local coinMotionIndex = {}
-local nextCoinMotionSample = 0
-local COIN_MOTION_SAMPLE_INTERVAL = 0.08
-local COIN_MOTION_POSITION_TOLERANCE = 0.18
-local COIN_MOTION_ANCHOR_TOLERANCE = 0.30
-local COIN_MOTION_MIN_ANGLE = math.rad(0.7)
-local IsInRecognizedCoinSource -- forward declaration for the motion sampler
-
-local function RemoveCoinMotionCandidate(coin, permanentlyReject)
-	local state = coinMotionState[coin]
-	if state and permanentlyReject then state.rejected = true end
-	local index = coinMotionIndex[coin]
-	if index then
-		local last = #coinMotionCandidates
-		local replacement = coinMotionCandidates[last]
-		coinMotionCandidates[index] = replacement
-		coinMotionCandidates[last] = nil
-		coinMotionIndex[coin] = nil
-		if replacement and replacement ~= coin then coinMotionIndex[replacement] = index end
-	end
-end
-
-local function QueueCoinMotionCandidate(coin)
-	if not coin or not coin.Parent or not IsValidCoin(coin) then return false end
-	local existing = coinMotionState[coin]
-	if existing then
-		if not existing.rejected and not coinMotionIndex[coin] then
-			coinMotionCandidates[#coinMotionCandidates + 1] = coin
-			coinMotionIndex[coin] = #coinMotionCandidates
-		end
-		return false
-	end
-	local now = os.clock()
-	coinMotionState[coin] = {
-		anchorPosition = coin.Position,
-		lastPosition = coin.Position,
-		lastCFrame = coin.CFrame,
-		lastSampleAt = now,
-		createdAt = now,
-		stableSamples = 0,
-		rotationSamples = 0,
-		rejected = false,
-	}
-	coinMotionCandidates[#coinMotionCandidates + 1] = coin
-	coinMotionIndex[coin] = #coinMotionCandidates
-	return true
-end
-
-local function UpdateCoinMotionCandidates(now)
-	if now < nextCoinMotionSample then return end
-	nextCoinMotionSample = now + COIN_MOTION_SAMPLE_INTERVAL
-	for i = #coinMotionCandidates, 1, -1 do
-		local coin = coinMotionCandidates[i]
-		local state = coinMotionState[coin]
-		if not state or state.rejected or not coin or not coin.Parent
-			or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
-			if coin and CoinEngine.CoinCache[coin] then UnregisterCoin(coin) end
-			if coin then RemoveCoinMotionCandidate(coin, true) else
-				local last = #coinMotionCandidates
-				local replacement = coinMotionCandidates[last]
-				coinMotionCandidates[i] = replacement
-				coinMotionCandidates[last] = nil
-				if replacement then coinMotionIndex[replacement] = i end
-			end
-		else
-			local sampleDt = now - state.lastSampleAt
-			if sampleDt >= 0.065 then
-				local position = coin.Position
-				local currentCFrame = coin.CFrame
-				local stepDisplacement = (position - state.lastPosition).Magnitude
-				local totalDisplacement = (position - state.anchorPosition).Magnitude
-				if stepDisplacement > COIN_MOTION_POSITION_TOLERANCE or totalDisplacement > COIN_MOTION_ANCHOR_TOLERANCE then
-					-- Un objeto que cambia de lugar no se clasifica como moneda, aunque tambien rote.
-					if CoinEngine.CoinCache[coin] then UnregisterCoin(coin) end
-					RemoveCoinMotionCandidate(coin, true)
-				else
-					local oldCF = state.lastCFrame
-					local minDot = math.min(
-						oldCF.RightVector:Dot(currentCFrame.RightVector),
-						oldCF.UpVector:Dot(currentCFrame.UpVector),
-						oldCF.LookVector:Dot(currentCFrame.LookVector))
-					local angularChange = math.acos(math.clamp(minDot, -1, 1))
-					state.stableSamples += 1
-					if angularChange >= COIN_MOTION_MIN_ANGLE then
-						state.rotationSamples += 1
-					else
-						state.rotationSamples = math.max(0, state.rotationSamples - 1)
-					end
-					state.lastPosition = position
-					state.lastCFrame = currentCFrame
-					state.lastSampleAt = now
-					-- Confirm only after repeated rotation and stable position, not from one noisy frame.
-					if state.stableSamples >= 2 and state.rotationSamples >= 2 then
-						RegisterCoin(coin)
-					elseif now - state.createdAt >= 1.25 and state.rotationSamples < 2 then
-						-- Retirar candidatos estaticos evita mantenerlos en la lista de muestreo.
-						RemoveCoinMotionCandidate(coin, true)
-					end
-				end
-			end
-		end
-	end
-end
-
 local function FindCoinContainer()
 	return Workspace:FindFirstChild("CoinContainer")
 end
 
 -- No registrar monedas que aparezcan en objetos ajenos al mapa/ronda activa.
 -- DescendantAdded se escucha en Workspace por eficiencia, pero eso no convierte todo Workspace en una fuente valida.
-IsInRecognizedCoinSource = function(obj)
+local function IsInRecognizedCoinSource(obj)
 	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then return false end
 	if not CoinNameMatches(obj) then return false end
 	local coinContainer = FindCoinContainer()
@@ -6503,7 +6394,8 @@ local function ScanContainer(container)
 	local found = 0
 	for _, obj in ipairs(container:GetDescendants()) do
 		if obj:IsA("BasePart") and IsValidCoin(obj) and not CoinEngine.CoinCache[obj] then
-			if QueueCoinMotionCandidate(obj) then found += 1 end
+			RegisterCoin(obj)
+			found += 1
 		end
 	end
 	return found
@@ -6519,11 +6411,11 @@ local function RescanCoins()
 	end
 	-- Fallback compatible con mapas que guardan monedas directamente en Workspace.
 	-- ScanContainer solo registra BaseParts cuyo nombre coincide con CoinNameMatches y pasa IsValidCoin.
-	if found == 0 and CoinEngine.CoinCount == 0 and #coinMotionCandidates == 0 then
+	if found == 0 and CoinEngine.CoinCount == 0 then
 		found = ScanContainer(Workspace)
 	end
 	lastContainer = container
-	if found > 0 or CoinEngine.CoinCount > 0 or #coinMotionCandidates > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
+	if found > 0 or CoinEngine.CoinCount > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.0) end
 	nextRescanAt = os.clock() + rescanBackoff
 	return found
 end
@@ -6532,7 +6424,7 @@ local function OnDescendantAdded(obj)
 	if obj:IsA("BasePart") and CoinNameMatches(obj) then
 		task.defer(function()
 			if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
-				QueueCoinMotionCandidate(obj)
+				RegisterCoin(obj)
 			end
 		end)
 	end
@@ -6540,8 +6432,6 @@ end
 
 local function OnDescendantRemoving(obj)
 	if CoinEngine.CoinCache[obj] then UnregisterCoin(obj) end
-	RemoveCoinMotionCandidate(obj, true)
-	coinMotionState[obj] = nil
 end
 
 local function ResetPath()
@@ -6567,10 +6457,6 @@ local function Activate()
 	CoinEngine.RemovingConnection = Workspace.DescendantRemoving:Connect(OnDescendantRemoving)
 	_G.Celestial.CoinDescendantConnection = CoinEngine.AddedConnection
 	rescanBackoff = 0.25
-	table.clear(coinMotionCandidates)
-	table.clear(coinMotionIndex)
-	table.clear(coinMotionState)
-	nextCoinMotionSample = 0
 	ResetPath()
 	RescanCoins()
 end
@@ -6584,10 +6470,6 @@ local function Deactivate()
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
-	table.clear(coinMotionCandidates)
-	table.clear(coinMotionIndex)
-	table.clear(coinMotionState)
-	nextCoinMotionSample = 0
 	coinsSinceRest = 0
 	CoinEngine.CoinCount = 0
 	roundActive = false
@@ -8300,7 +8182,6 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
-	UpdateCoinMotionCandidates(now)
 	local rawDt = dt
 	-- No sobrescribir NoclipWanted aquí: EnsureFlight lo activa y StopFlight lo desactiva.
 
@@ -8377,7 +8258,7 @@ local function ControllerStep(dt)
 	if now >= nextHousekeeping then
 		nextHousekeeping = now + 0.5
 		if FindCoinContainer() ~= lastContainer then
-			rescanBackoff = 1.0
+			rescanBackoff = 0.25
 			ResetPath()
 			pauseUntil = now + 1.5                          -- cambio de ronda/mapa: esperar a que el juego termine de moverte
 			roundActive = false                             -- la ronda se vuelve a detectar (armas + monedas)
