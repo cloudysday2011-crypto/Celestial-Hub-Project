@@ -5980,12 +5980,18 @@ local CoinEngine = {
 	-- V3.22: threat-aware routing shares the existing movement controller; it never writes CFrame.
 	ThreatResponse = {
 		Enabled = true,
-		EnterDistance = 15,       -- same red-zone distance shown by the Dangerometer
-		ReleaseDistance = 22,     -- hysteresis prevents rapid on/off switching around 15 studs
-		LostGrace = 0.60,         -- brief grace for role-detector updates / character replication
+		EnterDistance = 15,       -- zona de amenaza original
+		ReleaseDistance = 35,     -- fuera de 35 studs se considera zona segura
+		SafeDistance = 35,
+		RapidCloseTriggerDistance = 25, -- activa escape si cae desde >35 a <=25 rapidamente
+		RapidCloseWindow = 0.85,
+		LastDistanceAboveSafeAt = 0,
+		EmergencyEscape = false,
+		EmergencyEscapeStartedAt = 0,
+		LostGrace = 0.60,         -- breve margen para actualizaciones de rol / replicacion
 		RoleScanInterval = 0.25,
 		RouteCheckInterval = 0.30,
-		PreferredSeparation = 24, -- prefer coins at least this far from the Murderer
+		PreferredSeparation = 24,
 		Active = false,
 		Murderer = nil,
 		CachedMurderer = nil,
@@ -5993,7 +5999,7 @@ local CoinEngine = {
 		NextRouteCheckAt = 0,
 		LastSeenAt = 0,
 		LastDistance = math.huge,
-		-- V3.22: explicit self-role guard; never route away from the local player.
+		-- Proteccion explicita: nunca huir de un jugador si el cliente se identifica como Murderer.
 		LocalMurderer = false,
 		LocalMurdererSafe = false,
 		LocalMurdererSafeLogged = false,
@@ -6053,7 +6059,13 @@ local CoinEngine = {
 	PingAdaptiveSpeed = false, -- V3.14: compatibilidad heredada; el ping ya no reduce la velocidad objetivo
 	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
 	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
-	NoclipWanted = false,      -- Se activa al iniciar el vuelo del Auto-Farm y se restaura al detenerlo
+	NoclipWanted = false,      -- Solicitud temporal; solo ruta bloqueada o escape urgente
+	AutoNoclipMode = nil,      -- "coin-route", "murder-escape" o "exit-solid"
+	AutoNoclipTarget = nil,
+	AutoNoclipStartedAt = 0,
+	AutoNoclipNextCheckAt = 0,
+	AutoNoclipMaxCrossTime = 2.25,
+	AutoNoclipCheckInterval = 0.12,
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
@@ -6147,6 +6159,8 @@ local function StopFlight()
 	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
 	CoinEngine.NoclipWanted = false
+	CoinEngine.AutoNoclipMode = nil
+	CoinEngine.AutoNoclipTarget = nil
 end
 
 local function EnsureFlight(root, hum)
@@ -6170,9 +6184,8 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	-- No activar NoClip desde el Auto-Farm: se mantienen colisiones consistentes con la geometria.
-	-- Las rutas obstruidas deben redirigirse, no atravesarse.
-	CoinEngine.NoclipWanted = false
+	-- NoclipWanted lo administra UpdateAutoNoclip: solo se activa por una ruta obstruida
+	-- confirmada o una emergencia de escape, y se desactiva tras salir del obstaculo.
 end
 
 -- Estabilidad adaptativa V3.14, ajustada para ser independiente de los FPS.
@@ -7680,8 +7693,8 @@ local function CoinTravelScore(fromPos, coinPos)
 end
 
 -- Selector de ruta: conserva la puntuacion habitual y prefiere una trayectoria despejada
--- entre los cinco candidatos mas cercanos. Si todos estan bloqueados, mantiene el mejor candidato
--- original como fallback; no modifica el limite de velocidad ni el sistema NoClip.
+-- entre los candidatos cercanos. Si todos estan bloqueados, conserva un fallback temporal;
+-- UpdateAutoNoclip decide si hace falta un cruce breve o una nueva ruta.
 local routeRayParams = RaycastParams.new()
 routeRayParams.FilterType = Enum.RaycastFilterType.Exclude
 routeRayParams.RespectCanCollide = true
@@ -7694,7 +7707,9 @@ local function HasClearCoinRoute(fromPos, coin)
 	if container then ignore[#ignore + 1] = container end
 	routeRayParams.FilterDescendantsInstances = ignore
 	local origin = fromPos + Vector3.new(0, 0.75, 0)
-	local destination = coin.Position + Vector3.new(0, 0.5, 0)
+	local root = GetRoot()
+	local contactHeight = root and math.max(0.5, (root.Size.Y + coin.Size.Y) * 0.5 - 0.15) or 2.5
+	local destination = coin.Position + Vector3.new(0, contactHeight, 0)
 	local direction = destination - origin
 	if direction.Magnitude < 0.1 then return true end
 	local ok, hit = pcall(function()
@@ -7727,7 +7742,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	end
 	if #candidates == 0 then return nil end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
-	local checks = math.min(14, #candidates)
+	local checks = math.min(24, #candidates)
 	for i = 1, checks do
 		if HasClearCoinRoute(fromPos, candidates[i].coin) then
 			return candidates[i].coin
@@ -7974,20 +7989,22 @@ local function UpdateThreatResponse(root, now)
 	local threat = CoinEngine.ThreatResponse
 	if not threat.Enabled or not root then return nil, math.huge end
 
-	-- If the local player is confirmed as Murderer, do not classify them as their own danger.
-	-- Clear any stale threat route and return to the normal coin selector.
+	-- Si el jugador local es el Murderer, esta respuesta queda desactivada.
 	if CoinEngine.DetectLocalMurderer(now) then
+		local wasActive = threat.Active
 		threat.Active = false
+		threat.EmergencyEscape = false
 		threat.Murderer = nil
 		threat.CachedMurderer = nil
 		threat.LastDistance = math.huge
 		threat.LastSeenAt = now
+		threat.LastDistanceAboveSafeAt = now
 		threat.LocalMurdererSafe = true
 		if not threat.LocalMurdererSafeLogged then
 			threat.LocalMurdererSafeLogged = true
 			return "self-murderer-safe", math.huge
 		end
-		return nil, math.huge
+		return wasActive and "released" or nil, math.huge
 	end
 	threat.LocalMurdererSafe = false
 	threat.LocalMurdererSafeLogged = false
@@ -7997,7 +8014,53 @@ local function UpdateThreatResponse(root, now)
 	local murderRoot = murderer and GetRoot(murderer)
 	local distance = murderRoot and (root.Position - murderRoot.Position).Magnitude or math.huge
 
-	if not threat.Active then
+	-- >35 studs is the explicit safe zone: release immediately and clear emergency mode.
+	if murderer and murderRoot and distance > threat.SafeDistance then
+		threat.LastDistanceAboveSafeAt = now
+		threat.LastDistance = distance
+		threat.LastSeenAt = now
+		threat.Active = false
+		threat.EmergencyEscape = false
+		threat.Murderer = nil
+		if wasActive then
+			LogEvent(string.format("murder-threat-response safe-zone dist=%.1f limit=%.1f", distance, threat.SafeDistance))
+			return "released", distance
+		end
+		return nil, distance
+	end
+
+	-- Remember the last time the Murderer was beyond 35 studs. If the observed distance
+	-- falls to <=25 within 0.85s, treat it as a fast approach and switch to emergency escape.
+	local rapidClosing = murderer ~= nil and murderRoot ~= nil
+		and distance <= threat.RapidCloseTriggerDistance
+		and threat.LastDistanceAboveSafeAt > 0
+		and (now - threat.LastDistanceAboveSafeAt) <= threat.RapidCloseWindow
+	if distance >= threat.SafeDistance then
+		threat.LastDistanceAboveSafeAt = now
+	end
+	if rapidClosing and not threat.EmergencyEscape then
+		threat.EmergencyEscape = true
+		threat.EmergencyEscapeStartedAt = now
+		threat.Active = true
+		threat.Murderer = murderer
+		threat.LastSeenAt = now
+		threat.LastDistance = distance
+		LogEvent(string.format("murder-rapid-close-escape dist=%.1f safeSeenAgo=%.2f noclip-request=1", distance, now - threat.LastDistanceAboveSafeAt))
+	end
+
+	if threat.EmergencyEscape then
+		if murderer and murderRoot and distance <= threat.SafeDistance then
+			threat.Active = true
+			threat.Murderer = murderer
+			threat.LastSeenAt = now
+			threat.LastDistance = distance
+		elseif now - threat.LastSeenAt >= threat.LostGrace then
+			threat.EmergencyEscape = false
+			threat.Active = false
+			threat.Murderer = nil
+			threat.LastDistance = math.huge
+		end
+	elseif not threat.Active then
 		if murderer and distance <= threat.EnterDistance then
 			threat.Active = true
 			threat.Murderer = murderer
@@ -8005,7 +8068,7 @@ local function UpdateThreatResponse(root, now)
 			threat.LastDistance = distance
 		end
 	else
-		if murderer and murderRoot and distance <= threat.ReleaseDistance then
+		if murderer and murderRoot and distance <= threat.SafeDistance then
 			threat.Murderer = murderer
 			threat.LastSeenAt = now
 			threat.LastDistance = distance
@@ -8016,9 +8079,7 @@ local function UpdateThreatResponse(root, now)
 		end
 	end
 
-	if wasActive ~= threat.Active then
-		return threat.Active and "entered" or "released", distance
-	end
+	if wasActive ~= threat.Active then return threat.Active and "entered" or "released", distance end
 	return nil, distance
 end
 
@@ -8074,6 +8135,100 @@ local function AdvanceTarget(root, now)
 		CoinEngine.NextTarget = nil
 		noTargetUntil = now + 0.15
 	end
+end
+
+-- Coordina NoClip solo mientras se cruza un obstaculo hacia el objetivo o durante
+-- la ventana de escape rapido. Si se detecta que el root sigue dentro de geometria,
+-- mantiene NoClip un poco mas y lo apaga en cuanto ya no haya solapamiento.
+local function UpdateAutoNoclip(root, target, now)
+	local threat = CoinEngine.ThreatResponse
+	if State.NoClipActive then
+		CoinEngine.AutoNoclipMode = nil
+		CoinEngine.AutoNoclipTarget = nil
+		CoinEngine.NoclipWanted = false
+		return target
+	end
+
+	local insideSolid = IsInsideSolid(root.Position)
+	if threat.EmergencyEscape and threat.Active and threat.Murderer and target and target.Parent then
+		if CoinEngine.AutoNoclipMode ~= "murder-escape" then
+			CoinEngine.AutoNoclipMode = "murder-escape"
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.AutoNoclipTarget = nil
+			LogEvent("auto-noclip start reason=murder-rapid-close")
+		end
+		CoinEngine.NoclipWanted = true
+		return target
+	end
+
+	if CoinEngine.AutoNoclipMode == "murder-escape" then
+		if insideSolid then
+			CoinEngine.AutoNoclipMode = "exit-solid"
+			CoinEngine.NoclipWanted = true
+		else
+			CoinEngine.AutoNoclipMode = nil
+			CoinEngine.NoclipWanted = false
+			LogEvent("auto-noclip stop reason=murder-distance-safe")
+		end
+		return target
+	end
+
+	if CoinEngine.AutoNoclipMode == "exit-solid" then
+		if insideSolid then
+			CoinEngine.NoclipWanted = true
+		else
+			CoinEngine.AutoNoclipMode = nil
+			CoinEngine.AutoNoclipTarget = nil
+			CoinEngine.NoclipWanted = false
+			LogEvent("auto-noclip stop reason=clear-of-solid")
+		end
+		return target
+	end
+
+	if CoinEngine.AutoNoclipMode == "coin-route" then
+		if not target or not target.Parent or target ~= CoinEngine.AutoNoclipTarget then
+			CoinEngine.AutoNoclipMode = insideSolid and "exit-solid" or nil
+			CoinEngine.AutoNoclipTarget = nil
+			CoinEngine.NoclipWanted = insideSolid
+			if not insideSolid then LogEvent("auto-noclip stop reason=target-changed") end
+			return target
+		end
+		if now >= CoinEngine.AutoNoclipNextCheckAt then
+			CoinEngine.AutoNoclipNextCheckAt = now + CoinEngine.AutoNoclipCheckInterval
+			local routeClear = HasClearCoinRoute(root.Position, target)
+			if routeClear then
+				CoinEngine.AutoNoclipMode = insideSolid and "exit-solid" or nil
+				CoinEngine.AutoNoclipTarget = nil
+				CoinEngine.NoclipWanted = insideSolid
+				LogEvent(insideSolid and "auto-noclip transition=exit-solid" or "auto-noclip stop reason=route-clear")
+			elseif now - CoinEngine.AutoNoclipStartedAt >= CoinEngine.AutoNoclipMaxCrossTime then
+				CoinEngine.Blacklist[target] = now + 2.0
+				SetCurrent(nil, now)
+				CoinEngine.AutoNoclipMode = insideSolid and "exit-solid" or nil
+				CoinEngine.AutoNoclipTarget = nil
+				CoinEngine.NoclipWanted = insideSolid
+				LogEvent(string.format("auto-noclip abort reason=cross-timeout elapsed=%.2f inside=%d", now - CoinEngine.AutoNoclipStartedAt, insideSolid and 1 or 0))
+				return nil
+			end
+		end
+		CoinEngine.NoclipWanted = CoinEngine.AutoNoclipMode == "coin-route"
+		return target
+	end
+
+	if target and target.Parent and (target.Position - root.Position).Magnitude > 3
+		and now >= CoinEngine.AutoNoclipNextCheckAt then
+		CoinEngine.AutoNoclipNextCheckAt = now + CoinEngine.AutoNoclipCheckInterval
+		if not HasClearCoinRoute(root.Position, target) then
+			CoinEngine.AutoNoclipMode = "coin-route"
+			CoinEngine.AutoNoclipTarget = target
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipWanted = true
+			LogEvent(string.format("auto-noclip start reason=coin-route-blocked dist=%.1f target=%s", (target.Position - root.Position).Magnitude, target.Name))
+			return target
+		end
+	end
+	CoinEngine.NoclipWanted = false
+	return target
 end
 
 local function CollectCoin(root, coin, now)
@@ -8184,7 +8339,7 @@ local function ControllerStep(dt)
 
 	local now = os.clock()
 	local rawDt = dt
-	-- NoClip queda apagado durante el Auto-Farm; EnsureFlight conserva las colisiones activas.
+	-- NoClip se coordina más abajo, tras validar el objetivo y comprobar la ruta.
 
 	-- Detector de inicio/fin de ronda (inventarios + monedas). Corre siempre, tambien durante las pausas.
 	UpdateRound(now)
@@ -8275,6 +8430,7 @@ local function ControllerStep(dt)
 	if not roundActive then
 		if CoinEngine.ThreatResponse.Active or CoinEngine.ThreatResponse.Murderer or CoinEngine.ThreatResponse.CachedMurderer then
 			CoinEngine.ThreatResponse.Active = false
+			CoinEngine.ThreatResponse.EmergencyEscape = false
 			CoinEngine.ThreatResponse.Murderer = nil
 			CoinEngine.ThreatResponse.CachedMurderer = nil
 			CoinEngine.ThreatResponse.NextRoleScanAt = 0
@@ -8355,12 +8511,18 @@ local function ControllerStep(dt)
 		end
 	end
 
-	if CoinEngine.CoinCount == 0 then return end            -- espera (flotando quieto) hasta que un evento registre monedas
-	if not CoinEngine.CurrentTarget and now < noTargetUntil then return end
+	if CoinEngine.CoinCount == 0 then
+		UpdateAutoNoclip(root, nil, now)
+		return -- espera hasta que se registre alguna moneda
+	end
+	if not CoinEngine.CurrentTarget and now < noTargetUntil then
+		UpdateAutoNoclip(root, nil, now)
+		return
+	end
 
 	if not CoinEngine.CurrentTarget or not IsAvailable(CoinEngine.CurrentTarget, now) then
 		AdvanceTarget(root, now)
-		if not CoinEngine.CurrentTarget then return end
+		if not CoinEngine.CurrentTarget then UpdateAutoNoclip(root, nil, now); return end
 	end
 
 	-- Preparar el siguiente objetivo mientras se viaja al actual
@@ -8437,7 +8599,7 @@ local function ControllerStep(dt)
 			local routeBlocked = target and target.Parent and not HasClearCoinRoute(root.Position, target) or false
 			local overlapAge = now - solidOverlapSince
 			local stalled = (now - lastProgress) >= 0.35
-			if overlapAge >= SOLID_OVERLAP_CONFIRM_TIME and routeBlocked and actualSpeed >= 12 and targetDistance > 8 and stalled then
+			if not CoinEngine.NoclipWanted and overlapAge >= SOLID_OVERLAP_CONFIRM_TIME and routeBlocked and actualSpeed >= 12 and targetDistance > 8 and stalled then
 				LogEvent(string.format("solid-overlap-reroute speed=%.1f toCoin=%.1f adaptive=1 confirm=%.2f routeBlocked=1 stall=%.2f",
 					actualSpeed, targetDistance, overlapAge, now - lastProgress))
 				-- Cambiar de objetivo solo si hay solapamiento persistente, ruta obstruida y falta de progreso.
@@ -8513,8 +8675,14 @@ local function ControllerStep(dt)
 	end
 	-- Con NoClip activo, el mero solapamiento con una pared puede ser transitorio mientras se atraviesa.
 	-- Recortar velocidad solo si el solapamiento persiste y además no hay progreso hacia el objetivo.
-	local solidStall = solidOverlapActive and solidOverlapSince ~= nil
+	local solidStall = not CoinEngine.NoclipWanted and solidOverlapActive and solidOverlapSince ~= nil
 		and (now - solidOverlapSince) >= 0.35 and (now - lastProgress) >= 0.35
+	-- Unicamente durante el cierre rapido, permitir una subida moderada del limite en frames estables;
+	-- los guardas de latencia/tirones siguen prevaleciendo para no crear saltos grandes.
+	if CoinEngine.ThreatResponse.EmergencyEscape and sampleDt < 0.040 and pingCap == 80 and not solidStall then
+		frameSpeedCap = math.min(safetyCap * 1.10, 42.2)
+		safetyReason = safetyReason == "normal" and "rapid-close-envelope" or (safetyReason .. "+rapid-close-envelope")
+	end
 	if solidStall and speed > 12 then
 		speed = 12
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
@@ -8532,7 +8700,11 @@ local function ControllerStep(dt)
 			and detector.CurrentPower == "Sprint"
 		local desiredThreatSpeed = sliderSpeed + 25
 		local boostReason = "murder-escape"
-		if isSprintMurderer then
+		if threat.EmergencyEscape then
+			-- La rampa se acorta mas abajo; este impulso sigue limitado por frameSpeedCap.
+			desiredThreatSpeed = sliderSpeed + math.max(8, sliderSpeed * 0.10)
+			boostReason = "rapid-close-escape"
+		elseif isSprintMurderer then
 			desiredThreatSpeed = sliderSpeed + math.max(25, sliderSpeed * 0.55)
 			boostReason = "murder-escape-sprint"
 		end
@@ -8557,6 +8729,9 @@ local function ControllerStep(dt)
 	CoinEngine.LastSafetyCap = speed
 	dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
+	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
+		ramp = math.min(ramp, 0.30) -- acelera la respuesta sin anular la rampa ni el limite de velocidad
+	end
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
@@ -8572,7 +8747,7 @@ local function ControllerStep(dt)
 	if not target or not IsAvailable(target, now) then
 		AdvanceTarget(root, now)
 		target = CoinEngine.CurrentTarget
-		if not target then return end
+		if not target then UpdateAutoNoclip(root, nil, now); return end
 	end
 
 	-- V3.12: validar el objetivo contra la posicion ACTUAL del jugador en cada ciclo.
@@ -8588,7 +8763,7 @@ local function ControllerStep(dt)
 		SetCurrent(nil, now)
 		AdvanceTarget(root, now)
 		target = CoinEngine.CurrentTarget
-		if not target then return end
+		if not target then UpdateAutoNoclip(root, nil, now); return end
 	end
 
 	-- Filtrado mas estricto de monedas recolocadas: como las monedas normales son estaticas,
@@ -8603,9 +8778,12 @@ local function ControllerStep(dt)
 			SetCurrent(nil, now)
 			AdvanceTarget(root, now)
 			target = CoinEngine.CurrentTarget
-			if not target then return end
+			if not target then UpdateAutoNoclip(root, nil, now); return end
 		end
 	end
+	target = UpdateAutoNoclip(root, target, now)
+	if not target or not target.Parent then return end
+
 	local rootPos = root.Position
 	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
 	-- Dirigirse al centro geométrico de la moneda hacía que el personaje quedara a varios studs en horizontal
@@ -8806,6 +8984,9 @@ CoinEngine.Destroy = function()
 	if CoinEngine.NoclipConn then CoinEngine.NoclipConn:Disconnect(); CoinEngine.NoclipConn = nil end
 	if CoinEngine.KickConn then CoinEngine.KickConn:Disconnect(); CoinEngine.KickConn = nil end
 	CoinEngine.NoclipWanted = false
+	CoinEngine.AutoNoclipMode = nil
+	CoinEngine.AutoNoclipTarget = nil
+	CoinEngine.ThreatResponse.EmergencyEscape = false
 	RestoreCollisions()
 	if _G.Celestial.ConnectionFarm == controller then _G.Celestial.ConnectionFarm = nil end
 	Deactivate()
