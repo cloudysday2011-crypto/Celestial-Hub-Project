@@ -1,4 +1,4 @@
--- StabilityLog15 Optimized: immediate coin pickup, five-coin rest, and reduced detector/Dangerometer overhead.
+-- StabilityLog15: FPS-independent AutoFarm movement and targeted runtime performance optimizations.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.22: based on V3.21; preserves the 10-80 slider and local-Murderer-safe routing.
@@ -4508,14 +4508,28 @@ local function UpdatePowerDetectorState()
 		murderPlayer = detector.CurrentPlayer
 	end
 	if not murderPlayer then
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if plr ~= LocalPlayer and plr.Character then
-				local hum = GetHumanoid(plr)
-				if hum and hum.Health > 0 then
-					local isKnife = CheckPlayerInventory(plr)
-					if isKnife then murderPlayer = plr; break end
+		-- Role discovery is shared by repeated detector updates; don't rescan every Heartbeat.
+		local now = tick()
+		if now >= (detector.NextRoleDiscoveryAt or 0) then
+			detector.NextRoleDiscoveryAt = now + 0.25
+			detector.CachedRoleCandidate = nil
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= LocalPlayer and plr.Character then
+					local hum = GetHumanoid(plr)
+					if hum and hum.Health > 0 then
+						local isKnife = CheckPlayerInventory(plr)
+						if isKnife then detector.CachedRoleCandidate = plr; break end
+					end
 				end
 			end
+		end
+		local candidate = detector.CachedRoleCandidate
+		if candidate and candidate.Parent == Players and candidate.Character then
+			local hum = GetHumanoid(candidate)
+			if hum and hum.Health > 0 then murderPlayer = candidate
+			else detector.CachedRoleCandidate = nil end
+		else
+			detector.CachedRoleCandidate = nil
 		end
 	end
 	if not murderPlayer then
@@ -6080,14 +6094,12 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local COINS_PER_REST = 5       -- pausa corta solo despues de cinco recogidas consecutivas
-local REST_PAUSE_TIME = 0.25    -- descanso entre grupos de cinco monedas
+local POST_COLLECT_PAUSE = 0.25 -- descanso solo despues de cinco monedas realmente recogidas
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
 local coinsSinceRest = 0
-local coinsSinceRest = 0
-local arriveTarget, arriveAt = nil, 0     -- seguimiento de llegada; no se espera antes del toque
+local arriveTarget, arriveAt = nil, 0     -- espera de "asentamiento" al llegar a una moneda
 local noclipOn = false
 local solidOverlapActive = false          -- ultimo resultado del guard de solidos (cada 0.12 s)
 local origCollide = {}                    -- [part] = CanCollide original (se restaura al terminar)
@@ -6123,7 +6135,6 @@ end
 
 local function ResetRoundCounters()
 	roundCollected, batchCollected, batchIndex = 0, 0, 1
-	coinsSinceRest = 0
 	table.clear(touchedCoins)
 	batchPausing, batchPausePending, limitReached = false, false, false
 end
@@ -6602,7 +6613,25 @@ local function IsInsideSolid(pos)
 	return false
 end
 
--- La recogida ya no utiliza una espera de asentamiento basada en ping.
+-- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera ese tiempo al llegar
+-- a la moneda y ANTES de recogerla: asi la recogida no se valida desde una posicion "vieja/lejana".
+local function GetSettleTime(now)
+	if now >= nextPingAt then
+		nextPingAt = now + 1
+		pcall(function()
+			cachedPingMs = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+	end
+	return math.clamp(cachedPingMs / 2000 + 0.02, CoinEngine.SettleMin, CoinEngine.SettleMax)
+end
+
+-- Con PingSettle: espera al menos un ping completo + margen para que el servidor te vea ya parado
+-- junto a la moneda antes del toque. Sin el interruptor devuelve el valor original.
+local function GetCollectSettle(now, safe)
+	-- V3.23: no imponer una espera de asentamiento antes de tocar la moneda.
+	-- Se conserva la funcion para mantener intactas sus referencias y el diagnostico.
+	return 0
+end
 
 -- ---------------------------------------------------------------
 -- REGISTRO DE DIAGNOSTICO + RECUPERACION ADAPTATIVA
@@ -8603,12 +8632,13 @@ local function ControllerStep(dt)
 
 	local pickupDistance = firetouchinterest and CoinEngine.PickupDistance or 0.25
 	if dist <= pickupDistance then
-		-- Intentar el toque inmediatamente al entrar en el radio de recogida; sin espera de asentamiento.
+		-- Con firetouchinterest se conserva el rango original. Sin el, acercarse hasta contacto fisico
+		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
 		if firetouchinterest then
 			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
 			lastProgress = now
 			if CoinEngine.SoftBrake then
-				-- Frenado conservado, pero no bloquea el intento de recogida.
+				-- Frenada progresiva: la velocidad decae por frame en vez de cortarse a 0 de golpe.
 				currentSpeed = math.min(currentSpeed, lastFlightV) * CoinEngine.SoftBrakeDecay
 				if currentSpeed > 1 and flightVel and dist > 0.001 then
 					ApplyStableFlightVelocity(delta / dist, currentSpeed, dt)
@@ -8618,8 +8648,8 @@ local function ControllerStep(dt)
 				end
 			elseif safe then currentSpeed = currentSpeed * 0.5 end
 			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
-			local settle = 0 -- solo para diagnosticos; no introduce una espera.
-			if now - lastCollectAt >= minGap then
+			local settle = GetCollectSettle(now, safe)
+			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
@@ -8631,26 +8661,25 @@ local function ControllerStep(dt)
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
 					coinsCollectedTotal += 1
+					coinsSinceRest += 1
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
-					-- Mantener el movimiento entre monedas; descansar solo cada cinco recogidas confirmadas.
-					coinsSinceRest += 1
-					if coinsSinceRest >= COINS_PER_REST then
+					-- No detenerse tras cada moneda; descansar 0.25 s cada cinco recogidas confirmadas.
+					if coinsSinceRest >= 5 then
 						coinsSinceRest = 0
-						batchPausing = true
-						pauseUntil = math.max(pauseUntil, now + REST_PAUSE_TIME)
-						currentSpeed = 0
-						lastFlightV = 0
-						CoinEngine.LastCommandVelocity = Vector3.zero
-						CoinEngine.NextTarget = nil
-						nextPrepareAt = pauseUntil
-						velApplied = false
-						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
-						LogEvent(string.format("coin-five-rest hold=%.2f count=%d", REST_PAUSE_TIME, COINS_PER_REST))
+						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
+						LogEvent(string.format("coin-batch-rest hold=%.2f collected=5", POST_COLLECT_PAUSE))
 					end
+					currentSpeed = 0
+					lastFlightV = 0
+					CoinEngine.LastCommandVelocity = Vector3.zero
+					CoinEngine.NextTarget = nil
+					nextPrepareAt = pauseUntil
+					velApplied = false
+					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 
-					-- Conteo de monedas unicas por ronda; se mantiene igual que antes.
+					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 					if not touchedCoins[target] then
 						touchedCoins[target] = true
 						roundCollected += 1
@@ -8660,7 +8689,8 @@ local function ControllerStep(dt)
 				end
 			end
 		else
-			-- Sin la API de toque, dejar que el contacto fisico normal recoja la moneda.
+			-- A distancia de contacto no hay que declarar recogida ni limpiar el objetivo manualmente.
+			-- La moneda desaparecera por el contacto del juego o seguira siendo el objetivo.
 			lastProgress = now
 		end
 	else
@@ -10569,8 +10599,12 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		local lastPowerDetection = 0
 		_G.Celestial.ConnectionPowerDetector = RunService.Heartbeat:Connect(function()
 			local now = tick()
-			-- Intervalo uniforme: evita aumentar a 25 Hz los escaneos costosos de Ghost/Sprint.
 			local detectorInterval = 0.08
+			if _G.Celestial.PowerDetector
+				and (_G.Celestial.PowerDetector.CurrentPower == "Ghost"
+					or _G.Celestial.PowerDetector.CurrentPower == "Sprint") then
+				detectorInterval = 0.04
+			end
 			if now - lastPowerDetection < detectorInterval then return end
 			lastPowerDetection = now
 			pcall(function()
@@ -10581,93 +10615,71 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end)
 		end)
 
-		local lastDangerSquareColors = {}
-		local dangerFallbackPlayer, dangerNextFallbackScanAt = nil, 0
-		local function SetDangerSquares(activeCount, activeColor, idleColor)
-			for i = 1, 5 do
-				local wanted = i <= activeCount and activeColor or idleColor
-				if lastDangerSquareColors[i] ~= wanted then
-					dangerSquareBoxes[i].BackgroundColor3 = wanted
-					lastDangerSquareColors[i] = wanted
-				end
-			end
-		end
-		local function SetVisibleIfChanged(object, visible)
-			if object.Visible ~= visible then object.Visible = visible end
-		end
-		local lastDangerDistanceText = nil
-		local function SetDangerDistanceText(value)
-			if value ~= lastDangerDistanceText then
-				DangerDistanceLabel.Text = value
-				lastDangerDistanceText = value
-			end
-		end
-
 		task.spawn(function()
 			while task.wait(0.15) do
 				pcall(function()
-					-- While hidden, do not resolve players or inspect inventories on every polling pass.
-					if not State.DangerometerActive then
-						SetVisibleIfChanged(DangerometerFrame, false)
-						SetVisibleIfChanged(PowerIndicatorFrame, false)
-						return
-					end
-					SetVisibleIfChanged(DangerometerFrame, true)
+					DangerometerFrame.Visible = State.DangerometerActive
 					local myRoot = GetRoot()
-					local detector = _G.Celestial.PowerDetector
-					local isMeMurderer = State.MurdererName == LocalPlayer.Name
-						or (detector and detector.CurrentPlayer == LocalPlayer and detector.CurrentState == "You are the Murderer")
+					local isMeMurderer = (State.MurdererName == LocalPlayer.Name)
+					local targetChar = nil
 					if isMeMurderer then
-						SetVisibleIfChanged(DangerMurderLabel, true)
-						SetVisibleIfChanged(DangerDistanceLabel, false)
-						SetDangerSquares(5, Color3.fromRGB(120, 0, 180), Color3.fromRGB(120, 0, 180))
-						return
-					end
-					SetVisibleIfChanged(DangerMurderLabel, false)
-					SetVisibleIfChanged(DangerDistanceLabel, true)
-					local mPlr = nil
-					if State.MurdererName ~= "" then mPlr = Players:FindFirstChild(State.MurdererName) end
-					if not mPlr and detector then
-						local candidate = detector.CurrentPlayer
-						if candidate and candidate ~= LocalPlayer and candidate.Parent == Players then mPlr = candidate end
-					end
-					-- The detector is normally the shared source. If it is disabled or has no candidate,
-					-- retain the original inventory-based fallback but scan at most every 0.60 seconds.
-					if not mPlr and tick() >= dangerNextFallbackScanAt then
-						dangerNextFallbackScanAt = tick() + 0.60
-						dangerFallbackPlayer = nil
-						for _, candidate in ipairs(Players:GetPlayers()) do
-							if candidate ~= LocalPlayer then
-								local candidateHumanoid = GetHumanoid(candidate)
-								if candidate.Character and candidateHumanoid and candidateHumanoid.Health > 0 then
-									local hasKnife = CheckPlayerInventory(candidate)
-									if hasKnife then dangerFallbackPlayer = candidate; break end
+						DangerMurderLabel.Visible = true
+						DangerDistanceLabel.Visible = false
+						for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(120, 0, 180) end
+					else
+						DangerMurderLabel.Visible = false
+						DangerDistanceLabel.Visible = true
+						DangerDistanceLabel.Position = UDim2.new(0, 6, 0.55, 0)
+						if State.MurdererName ~= "" then
+							local mPlr = Players:FindFirstChild(State.MurdererName)
+							if mPlr and mPlr.Character and GetHumanoid(mPlr) and GetHumanoid(mPlr).Health > 0 then
+								targetChar = mPlr.Character
+							end
+						end
+						if not targetChar then
+							-- Primero reutilizar al jugador que el detector de poderes ya identifico.
+							-- Evita volver a recorrer herramientas/inventarios cada ciclo del Dangerometer.
+							local detector = _G.Celestial.PowerDetector
+							local cachedPlayer = detector and detector.CurrentPlayer
+							if cachedPlayer and cachedPlayer ~= LocalPlayer and cachedPlayer.Parent == Players
+								and cachedPlayer.Character then
+								local cachedHum = GetHumanoid(cachedPlayer)
+								if cachedHum and cachedHum.Health > 0 then targetChar = cachedPlayer.Character end
+							end
+							if not targetChar then
+								for _, plr in ipairs(Players:GetPlayers()) do
+									if plr ~= LocalPlayer then
+										local hum = GetHumanoid(plr)
+										if plr.Character and hum and hum.Health > 0 then
+											local isKnife, _ = CheckPlayerInventory(plr)
+											if isKnife then targetChar = plr.Character; break end
+										end
+									end
 								end
 							end
 						end
-					end
-					if not mPlr and dangerFallbackPlayer and dangerFallbackPlayer.Parent == Players then
-						mPlr = dangerFallbackPlayer
-					end
-					local targetChar = nil
-					if mPlr and mPlr.Character then
-						local hum = GetHumanoid(mPlr)
-						if hum and hum.Health > 0 then targetChar = mPlr.Character end
-					end
-					local mRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart") or nil
-					if mRoot and myRoot then
-						local dist = math.floor((myRoot.Position - mRoot.Position).Magnitude)
-						local activeCount, activeColor = 0, Color3.fromRGB(40, 40, 45)
-						if dist <= 15 then activeCount, activeColor = 5, Color3.fromRGB(255, 50, 50)
-						elseif dist <= 30 then activeCount, activeColor = 4, Color3.fromRGB(255, 140, 0)
-						elseif dist <= 50 then activeCount, activeColor = 3, Color3.fromRGB(255, 220, 0)
-						elseif dist <= 80 then activeCount, activeColor = 2, Color3.fromRGB(50, 220, 100)
-						elseif dist <= 110 then activeCount, activeColor = 1, Color3.fromRGB(50, 150, 255) end
-						SetDangerSquares(activeCount, activeColor, Color3.fromRGB(40, 40, 45))
-						SetDangerDistanceText(string.format("%d studs", dist))
-					else
-						SetDangerSquares(0, Color3.fromRGB(220, 220, 220), Color3.fromRGB(220, 220, 220))
-						SetDangerDistanceText("No murder")
+						if targetChar and myRoot then
+							local mRoot = targetChar:FindFirstChild("HumanoidRootPart")
+							if mRoot then
+								local dist = math.floor((myRoot.Position - mRoot.Position).Magnitude)
+								local activeCount, activeColor = 0, Color3.fromRGB(40, 40, 45)
+								if dist <= 15 then activeCount, activeColor = 5, Color3.fromRGB(255, 50, 50)
+								elseif dist <= 30 then activeCount, activeColor = 4, Color3.fromRGB(255, 140, 0)
+								elseif dist <= 50 then activeCount, activeColor = 3, Color3.fromRGB(255, 220, 0)
+								elseif dist <= 80 then activeCount, activeColor = 2, Color3.fromRGB(50, 220, 100)
+								elseif dist <= 110 then activeCount, activeColor = 1, Color3.fromRGB(50, 150, 255) end
+								for i = 1, 5 do
+									dangerSquareBoxes[i].BackgroundColor3 = i <= activeCount and activeColor or Color3.fromRGB(40, 40, 45)
+								end
+								DangerDistanceLabel.Text = string.format("%d studs", dist)
+							else
+								for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(220, 220, 220) end
+								DangerDistanceLabel.Text = "No murder"
+							end
+						else
+							for i = 1, 5 do dangerSquareBoxes[i].BackgroundColor3 = Color3.fromRGB(220, 220, 220) end
+							DangerDistanceLabel.Text = "No murder"
+						end
 					end
 				end)
 			end
