@@ -6074,7 +6074,7 @@ local CoinEngine = {
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
-	AutoNoclipCheckInterval = 0.12,
+	AutoNoclipCheckInterval = 0.045,
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
@@ -6407,9 +6407,10 @@ local function IsInRecognizedCoinSource(obj)
 		local mapRoot = Workspace:FindFirstChild(name)
 		if mapRoot and obj:IsDescendantOf(mapRoot) then return true end
 	end
-	-- Algunos mapas/rondas colocan las monedas directamente en Workspace o fuera de CoinContainer.
-	-- IsValidCoin y el chequeo de suelo siguen filtrando piezas que no sean monedas utilizables.
-	return true
+	-- Compatibilidad con mapas que guardan monedas directamente en Workspace: solo se acepta
+	-- una moneda cuyo padre inmediato sea Workspace; no cualquier objeto con nombre parecido
+	-- escondido en carpetas ajenas al mapa.
+	return obj.Parent == Workspace
 end
 
 -- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
@@ -7732,7 +7733,7 @@ local function HasClearCoinRoute(fromPos, coin)
 	return ok and hit == nil
 end
 
--- Una sola pasada O(N) para puntuar; solo hace hasta cinco raycasts al comparar rutas candidatas.
+-- Una sola pasada O(N) para puntuar; solo hace hasta cinco raycasts sobre los candidatos mejor puntuados.
 local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
@@ -7756,7 +7757,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	end
 	if #candidates == 0 then return nil end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
-	local checks = math.min(24, #candidates)
+	local checks = math.min(5, #candidates)
 	for i = 1, checks do
 		if HasClearCoinRoute(fromPos, candidates[i].coin) then
 			return candidates[i].coin
@@ -8728,7 +8729,7 @@ local function ControllerStep(dt)
 
 	-- Mejora de objetivo con histéresis (evita oscilar por pequeñas diferencias)
 	if now >= nextImproveCheck then
-		nextImproveCheck = now + 0.18
+		nextImproveCheck = now + 0.075
 		local cur = CoinEngine.CurrentTarget
 		local cand
 		if CoinEngine.ThreatResponse.Active then
@@ -8787,7 +8788,7 @@ local function ControllerStep(dt)
 	-- Se mantienen las colisiones; un bloqueo persistente provoca una redireccion de ruta, no NoClip.
 	-- La velocidad efectiva tambien considera los picos de ping medidos.
 	if now >= nextSolidGuardCheck then
-		nextSolidGuardCheck = now + 0.12
+		nextSolidGuardCheck = now + 0.06
 		if IsInsideSolid(root.Position) then
 			solidOverlapActive = true
 			solidOverlapSince = solidOverlapSince or now
