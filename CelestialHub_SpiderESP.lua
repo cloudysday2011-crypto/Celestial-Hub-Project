@@ -5985,9 +5985,18 @@ local CoinEngine = {
 		SafeDistance = 35,
 		RapidCloseTriggerDistance = 25, -- activa escape si cae desde >35 a <=25 rapidamente
 		RapidCloseWindow = 0.85,
+		EscapeTriggerDistance = 30, -- dispara escape si hay linea de vision despejada
 		LastDistanceAboveSafeAt = 0,
 		EmergencyEscape = false,
 		EmergencyEscapeStartedAt = 0,
+		LastLineOfSightClear = false,
+		LineOfSightPlayer = nil,
+		NextLineOfSightCheckAt = 0,
+		LineOfSightCheckInterval = 0.10,
+		EscapeDestination = nil,
+		NextEscapeDestinationAt = 0,
+		EscapeDestinationInterval = 0.28,
+		NextEscapeLogAt = 0,
 		LostGrace = 0.60,         -- breve margen para actualizaciones de rol / replicacion
 		RoleScanInterval = 0.25,
 		RouteCheckInterval = 0.30,
@@ -6092,7 +6101,8 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local POST_COLLECT_PAUSE = 0.10 -- pausa breve para encadenar monedas cercanas
+local POST_COLLECT_PAUSE_ENABLED = false -- queda dormido para futuras actualizaciones
+local POST_COLLECT_PAUSE = 0.10 -- cooldown conservado, no aplicado mientras el flag sea false
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
@@ -6494,6 +6504,10 @@ local function Deactivate()
 	CoinEngine.ThreatResponse.NextRouteCheckAt = 0
 	CoinEngine.ThreatResponse.LastSeenAt = 0
 	CoinEngine.ThreatResponse.LastDistance = math.huge
+	CoinEngine.ThreatResponse.LastLineOfSightClear = false
+	CoinEngine.ThreatResponse.LineOfSightPlayer = nil
+	CoinEngine.ThreatResponse.EscapeDestination = nil
+	CoinEngine.ThreatResponse.NextEscapeDestinationAt = 0
 	CoinEngine.ThreatResponse.LocalMurderer = false
 	CoinEngine.ThreatResponse.LocalMurdererSafe = false
 	CoinEngine.ThreatResponse.LocalMurdererSafeLogged = false
@@ -7870,6 +7884,98 @@ local function ResolveFarmMurderer(now)
 	return nil
 end
 
+-- Line-of-sight test for a possible knife throw. The ray ignores both characters and
+-- coin visuals, but respects collidable map geometry; it is cached to avoid raycasting every frame.
+local murderSightParams = RaycastParams.new()
+murderSightParams.FilterType = Enum.RaycastFilterType.Exclude
+murderSightParams.RespectCanCollide = true
+local function HasClearMurderLineOfSight(murderer, localRoot)
+	local murderRoot = murderer and GetRoot(murderer)
+	if not murderRoot or not localRoot then return false end
+	local ignore = {}
+	if murderer.Character then ignore[#ignore + 1] = murderer.Character end
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	murderSightParams.FilterDescendantsInstances = ignore
+	local origin = murderRoot.Position + Vector3.new(0, 1.25, 0)
+	local destination = localRoot.Position + Vector3.new(0, 1.25, 0)
+	local ray = destination - origin
+	if ray.Magnitude <= 0.1 then return true end
+	local ok, hit = pcall(function() return Workspace:Raycast(origin, ray, murderSightParams) end)
+	return ok and hit == nil
+end
+
+-- Find a long, collision-free horizontal escape lane. It evaluates several directions,
+-- then chooses the reachable endpoint that maximizes separation from the Murderer.
+-- Destination is a real position only; movement still goes through the existing stable Fly controller.
+local escapeRayParams = RaycastParams.new()
+escapeRayParams.FilterType = Enum.RaycastFilterType.Exclude
+escapeRayParams.RespectCanCollide = true
+local escapeAngles = {0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150}
+local function GetMurderEscapeDestination(root, murderer, now)
+	local threat = CoinEngine.ThreatResponse
+	if not root or not murderer or not GetRoot(murderer) then return nil end
+	if threat.EscapeDestination and now < (threat.NextEscapeDestinationAt or 0) then
+		return threat.EscapeDestination
+	end
+
+	local murderRoot = GetRoot(murderer)
+	local fromPos = root.Position
+	local away = Vector3.new(fromPos.X - murderRoot.Position.X, 0, fromPos.Z - murderRoot.Position.Z)
+	if away.Magnitude < 0.05 then
+		local look = root.CFrame.LookVector
+		away = Vector3.new(-look.X, 0, -look.Z)
+	end
+	if away.Magnitude < 0.05 then away = Vector3.new(1, 0, 0) end
+	away = away.Unit
+
+	local ignore = {}
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	if murderer.Character then ignore[#ignore + 1] = murderer.Character end
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	escapeRayParams.FilterDescendantsInstances = ignore
+
+	local origin = fromPos + Vector3.new(0, 1.25, 0)
+	local bestDestination, bestSeparation, bestTravel = nil, -math.huge, -math.huge
+	for _, degrees in ipairs(escapeAngles) do
+		local angle = math.rad(degrees)
+		local c, sn = math.cos(angle), math.sin(angle)
+		local direction = Vector3.new(away.X * c - away.Z * sn, 0, away.X * sn + away.Z * c).Unit
+		local rayVector = direction * 80
+		local ok, hit = pcall(function() return Workspace:Raycast(origin, rayVector, escapeRayParams) end)
+		if ok then
+			local clearDistance = 80
+			if hit then clearDistance = math.max(0, (hit.Position - origin).Magnitude - 5) end
+			-- Prefer actual reachable distance from the threat; at a tie, keep the longer lane.
+			if clearDistance >= 8 then
+				local travel = math.max(0, clearDistance - 2)
+				local candidate = fromPos + direction * travel
+				candidate = Vector3.new(candidate.X, fromPos.Y, candidate.Z)
+				if IsSafeCoinPosition(candidate) then
+					local separation = (candidate - murderRoot.Position).Magnitude
+					if separation > bestSeparation or (math.abs(separation - bestSeparation) < 0.1 and travel > bestTravel) then
+						bestDestination, bestSeparation, bestTravel = candidate, separation, travel
+					end
+				end
+			end
+		end
+	end
+
+	-- If all sampled lanes are blocked, use a short fallback away from the threat;
+	-- temporary NoClip is coordinated by UpdateAutoNoclip, while velocity remains capped.
+	if not bestDestination then
+		local fallback = fromPos + away * 14
+		bestDestination = Vector3.new(fallback.X, fromPos.Y, fallback.Z)
+	end
+	threat.EscapeDestination = bestDestination
+	threat.NextEscapeDestinationAt = now + (threat.EscapeDestinationInterval or 0.28)
+	LogEvent(string.format("murder-escape-destination travel=%.1f separation=%.1f", (bestDestination - fromPos).Magnitude,
+		(bestDestination - murderRoot.Position).Magnitude))
+	return bestDestination
+end
+
 local function IsThreatSafeCoin(coin)
 	local threat = CoinEngine.ThreatResponse
 	if not threat.Active or not coin or not coin.Parent then return true end
@@ -7994,6 +8100,8 @@ local function UpdateThreatResponse(root, now)
 		local wasActive = threat.Active
 		threat.Active = false
 		threat.EmergencyEscape = false
+		threat.EscapeDestination = nil
+		threat.NextEscapeDestinationAt = 0
 		threat.Murderer = nil
 		threat.CachedMurderer = nil
 		threat.LastDistance = math.huge
@@ -8029,15 +8137,43 @@ local function UpdateThreatResponse(root, now)
 		return nil, distance
 	end
 
-	-- Remember the last time the Murderer was beyond 35 studs. If the observed distance
-	-- falls to <=25 within 0.85s, treat it as a fast approach and switch to emergency escape.
+	-- A clear throw lane inside 30 studs is enough to trigger the emergency escape;
+	-- no animation-id assumption is needed. LOS is checked at most ten times per second.
+	local clearShotLane = false
+	if murderer and murderRoot then
+		if now >= (threat.NextLineOfSightCheckAt or 0) or threat.LineOfSightPlayer ~= murderer then
+			threat.NextLineOfSightCheckAt = now + (threat.LineOfSightCheckInterval or 0.10)
+			threat.LineOfSightPlayer = murderer
+			threat.LastLineOfSightClear = HasClearMurderLineOfSight(murderer, root)
+		end
+		clearShotLane = threat.LastLineOfSightClear == true
+	else
+		threat.LastLineOfSightClear = false
+		threat.LineOfSightPlayer = nil
+	end
+	if distance >= threat.SafeDistance then
+		threat.LastDistanceAboveSafeAt = now
+	end
+	local directThrowThreat = murderer ~= nil and murderRoot ~= nil
+		and distance < (threat.EscapeTriggerDistance or 30) and clearShotLane
+	if directThrowThreat and not threat.EmergencyEscape then
+		threat.EmergencyEscape = true
+		threat.EmergencyEscapeStartedAt = now
+		threat.Active = true
+		threat.Murderer = murderer
+		threat.LastSeenAt = now
+		threat.LastDistance = distance
+		threat.EscapeDestination = nil
+		threat.NextEscapeDestinationAt = 0
+		LogEvent(string.format("murder-direct-line-escape dist=%.1f los=1 trigger=%.1f", distance, threat.EscapeTriggerDistance or 30))
+		return "escape-entered", distance
+	end
+
+	-- Keep the older rapid-approach trigger as a secondary fallback if LOS sampling misses the approach.
 	local rapidClosing = murderer ~= nil and murderRoot ~= nil
 		and distance <= threat.RapidCloseTriggerDistance
 		and threat.LastDistanceAboveSafeAt > 0
 		and (now - threat.LastDistanceAboveSafeAt) <= threat.RapidCloseWindow
-	if distance >= threat.SafeDistance then
-		threat.LastDistanceAboveSafeAt = now
-	end
 	if rapidClosing and not threat.EmergencyEscape then
 		threat.EmergencyEscape = true
 		threat.EmergencyEscapeStartedAt = now
@@ -8150,12 +8286,12 @@ local function UpdateAutoNoclip(root, target, now)
 	end
 
 	local insideSolid = IsInsideSolid(root.Position)
-	if threat.EmergencyEscape and threat.Active and threat.Murderer and target and target.Parent then
+	if threat.EmergencyEscape and threat.Active and threat.Murderer then
 		if CoinEngine.AutoNoclipMode ~= "murder-escape" then
 			CoinEngine.AutoNoclipMode = "murder-escape"
 			CoinEngine.AutoNoclipStartedAt = now
 			CoinEngine.AutoNoclipTarget = nil
-			LogEvent("auto-noclip start reason=murder-rapid-close")
+			LogEvent("auto-noclip start reason=murder-escape")
 		end
 		CoinEngine.NoclipWanted = true
 		return target
@@ -8496,6 +8632,68 @@ local function ControllerStep(dt)
 		end
 	end
 	local threat = CoinEngine.ThreatResponse
+	-- Escape overrides coin routing entirely: it continues even if the map has zero coins.
+	-- Uses the same BodyVelocity/BodyGyro + adaptive acceleration controller as the farm.
+	if threat.EmergencyEscape and threat.Active and threat.Murderer then
+		if CoinEngine.CurrentTarget or CoinEngine.NextTarget then
+			CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
+			CoinEngine.TargetTrack = nil
+			arriveTarget, arriveAt = nil, 0
+			bestDist = math.huge
+			lastProgress = now
+		end
+		SetStatus("murder-escape")
+		EnsureFlight(root, hum)
+		UpdateAutoNoclip(root, nil, now)
+		local destination = GetMurderEscapeDestination(root, threat.Murderer, now)
+		local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
+		local safetyCap = Param(CoinEngine.SafeMaxSpeed, 38.4)
+		local escapeCap = safetyCap
+		if sampleDt >= 0.060 then
+			escapeCap = math.min(escapeCap, 16)
+		elseif sampleDt >= 0.040 then
+			escapeCap = math.min(escapeCap, 22)
+		else
+			local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
+			local solidUnsettled = solidOverlapActive and solidOverlapSince ~= nil and (now - solidOverlapSince) >= 0.20
+			if pingForSafety < 160 and not solidUnsettled and (adaptiveCommandRiskScore or 0) < 0.65 then
+				escapeCap = math.min(safetyCap * 1.10, 42.2)
+			end
+		end
+		local commandDt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
+		local escapeRamp = math.min(Param(CoinEngine.RampTime, CoinEngine.SafeRampTime), 0.30)
+		currentSpeed = math.min(escapeCap, currentSpeed + escapeCap * commandDt / math.max(escapeRamp, 0.10))
+		CoinEngine.LastSafetyCap = escapeCap
+		CoinEngine.LastSafetyReason = string.format("murder-escape-los-dist%.0f", threat.LastDistance or 0)
+		if destination then
+			local delta = Vector3.new(destination.X - root.Position.X, 0, destination.Z - root.Position.Z)
+			if delta.Magnitude > 2 then
+				ApplyStableFlightVelocity(delta.Unit, currentSpeed, dt)
+				velApplied = true
+				lastFlightV = currentSpeed
+				local horiz = delta.Unit
+				if flightGyro then pcall(function() flightGyro.CFrame = CFrame.lookAt(root.Position, root.Position + horiz) end) end
+			else
+				currentSpeed = 0
+				CoinEngine.LastCommandVelocity = Vector3.zero
+				if flightVel then flightVel.Velocity = Vector3.zero end
+				velApplied = true
+			end
+		else
+			currentSpeed = 0
+			CoinEngine.LastCommandVelocity = Vector3.zero
+			if flightVel then flightVel.Velocity = Vector3.zero end
+			velApplied = true
+		end
+		if now >= (threat.NextEscapeLogAt or 0) then
+			threat.NextEscapeLogAt = now + 0.50
+			LogEvent(string.format("murder-escape-active dist=%.1f cap=%.1f los=%d noclip=%d dest=%d",
+				threat.LastDistance or -1, escapeCap, threat.LastLineOfSightClear and 1 or 0,
+				CoinEngine.NoclipWanted and 1 or 0, destination and 1 or 0))
+		end
+		return
+	end
+
 	if threat.Active and now >= threat.NextRouteCheckAt then
 		threat.NextRouteCheckAt = now + threat.RouteCheckInterval
 		local cur = CoinEngine.CurrentTarget
@@ -8852,7 +9050,9 @@ local function ControllerStep(dt)
 						and (preparedNextCoin.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 						and math.abs(preparedNextCoin.Position.Y - root.Position.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 						and HasClearCoinRoute(root.Position, preparedNextCoin)
-					pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
+					if POST_COLLECT_PAUSE_ENABLED then
+						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
+					end
 					if chainNext then
 						SetCurrent(preparedNextCoin, now)
 						currentSpeed = math.min(currentSpeed, CoinEngine.FlightMinSpeed)
@@ -8869,7 +9069,7 @@ local function ControllerStep(dt)
 						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 					end
 					velApplied = false
-					LogEvent(string.format("coin-post-collect-pause hold=%.2f chain=%d", POST_COLLECT_PAUSE, chainNext and 1 or 0))
+					LogEvent(string.format("coin-post-collect-pause enabled=%d hold=%.2f chain=%d", POST_COLLECT_PAUSE_ENABLED and 1 or 0, POST_COLLECT_PAUSE_ENABLED and POST_COLLECT_PAUSE or 0, chainNext and 1 or 0))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 					if not touchedCoins[target] then
