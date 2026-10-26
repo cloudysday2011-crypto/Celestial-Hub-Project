@@ -4508,28 +4508,14 @@ local function UpdatePowerDetectorState()
 		murderPlayer = detector.CurrentPlayer
 	end
 	if not murderPlayer then
-		-- Role discovery is shared by repeated detector updates; don't rescan every Heartbeat.
-		local now = tick()
-		if now >= (detector.NextRoleDiscoveryAt or 0) then
-			detector.NextRoleDiscoveryAt = now + 0.25
-			detector.CachedRoleCandidate = nil
-			for _, plr in ipairs(Players:GetPlayers()) do
-				if plr ~= LocalPlayer and plr.Character then
-					local hum = GetHumanoid(plr)
-					if hum and hum.Health > 0 then
-						local isKnife = CheckPlayerInventory(plr)
-						if isKnife then detector.CachedRoleCandidate = plr; break end
-					end
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LocalPlayer and plr.Character then
+				local hum = GetHumanoid(plr)
+				if hum and hum.Health > 0 then
+					local isKnife = CheckPlayerInventory(plr)
+					if isKnife then murderPlayer = plr; break end
 				end
 			end
-		end
-		local candidate = detector.CachedRoleCandidate
-		if candidate and candidate.Parent == Players and candidate.Character then
-			local hum = GetHumanoid(candidate)
-			if hum and hum.Health > 0 then murderPlayer = candidate
-			else detector.CachedRoleCandidate = nil end
-		else
-			detector.CachedRoleCandidate = nil
 		end
 	end
 	if not murderPlayer then
@@ -6094,7 +6080,7 @@ local nextImproveCheck = 0
 local errorStreak = 0
 local lastSetPos = nil      -- ultima posicion que escribimos nosotros (detecta teletransportes del servidor)
 local pauseUntil = 0
-local POST_COLLECT_PAUSE = 0.25 -- descanso solo despues de cinco monedas realmente recogidas
+local POST_COLLECT_PAUSE = 0.25 -- espera fija tras cada recogida confirmada por el controlador
 local currentSpeed = 0
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
@@ -6628,9 +6614,11 @@ end
 -- Con PingSettle: espera al menos un ping completo + margen para que el servidor te vea ya parado
 -- junto a la moneda antes del toque. Sin el interruptor devuelve el valor original.
 local function GetCollectSettle(now, safe)
-	-- V3.23: no imponer una espera de asentamiento antes de tocar la moneda.
-	-- Se conserva la funcion para mantener intactas sus referencias y el diagnostico.
-	return 0
+	local base = GetSettleTime(now)   -- V3.3: la espera sigue al ping tambien sin Safe Mode (log: settle=0.03 fijo con ping 175-273 antes del kick)
+	if not CoinEngine.PingSettle then return base end
+	if not safe then GetSettleTime(now) end   -- refresca cachedPingMs tambien fuera de Safe Mode
+	local want = cachedPingMs / 1000 + CoinEngine.PingSettleMargin
+	return math.min(math.max(base, want), CoinEngine.PingSettleMax)
 end
 
 -- ---------------------------------------------------------------
@@ -8661,16 +8649,12 @@ local function ControllerStep(dt)
 				arriveTarget = nil
 				if CollectCoin(root, target, now) then
 					coinsCollectedTotal += 1
-					coinsSinceRest += 1
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
-					-- No detenerse tras cada moneda; descansar 0.25 s cada cinco recogidas confirmadas.
-					if coinsSinceRest >= 5 then
-						coinsSinceRest = 0
-						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
-						LogEvent(string.format("coin-batch-rest hold=%.2f collected=5", POST_COLLECT_PAUSE))
-					end
+					-- Parada breve tras cada recogida: elimina el impulso residual y obliga a
+					-- elegir la siguiente moneda desde la posicion actual del personaje.
+					pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
 					currentSpeed = 0
 					lastFlightV = 0
 					CoinEngine.LastCommandVelocity = Vector3.zero
@@ -8678,6 +8662,7 @@ local function ControllerStep(dt)
 					nextPrepareAt = pauseUntil
 					velApplied = false
 					if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+					LogEvent(string.format("coin-post-collect-pause hold=%.2f next=dynamic-reselect", POST_COLLECT_PAUSE))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
 					if not touchedCoins[target] then
@@ -10637,23 +10622,12 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 							end
 						end
 						if not targetChar then
-							-- Primero reutilizar al jugador que el detector de poderes ya identifico.
-							-- Evita volver a recorrer herramientas/inventarios cada ciclo del Dangerometer.
-							local detector = _G.Celestial.PowerDetector
-							local cachedPlayer = detector and detector.CurrentPlayer
-							if cachedPlayer and cachedPlayer ~= LocalPlayer and cachedPlayer.Parent == Players
-								and cachedPlayer.Character then
-								local cachedHum = GetHumanoid(cachedPlayer)
-								if cachedHum and cachedHum.Health > 0 then targetChar = cachedPlayer.Character end
-							end
-							if not targetChar then
-								for _, plr in ipairs(Players:GetPlayers()) do
-									if plr ~= LocalPlayer then
-										local hum = GetHumanoid(plr)
-										if plr.Character and hum and hum.Health > 0 then
-											local isKnife, _ = CheckPlayerInventory(plr)
-											if isKnife then targetChar = plr.Character; break end
-										end
+							for _, plr in ipairs(Players:GetPlayers()) do
+								if plr ~= LocalPlayer then
+									local hum = GetHumanoid(plr)
+									if plr.Character and hum and hum.Health > 0 then
+										local isKnife, _ = CheckPlayerInventory(plr)
+										if isKnife then targetChar = plr.Character; break end
 									end
 								end
 							end
