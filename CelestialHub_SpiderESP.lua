@@ -6407,10 +6407,9 @@ local function IsInRecognizedCoinSource(obj)
 		local mapRoot = Workspace:FindFirstChild(name)
 		if mapRoot and obj:IsDescendantOf(mapRoot) then return true end
 	end
-	-- Compatibilidad con mapas que guardan monedas directamente en Workspace: solo se acepta
-	-- una moneda cuyo padre inmediato sea Workspace; no cualquier objeto con nombre parecido
-	-- escondido en carpetas ajenas al mapa.
-	return obj.Parent == Workspace
+	-- Algunos mapas/rondas colocan las monedas directamente en Workspace o fuera de CoinContainer.
+	-- IsValidCoin y el chequeo de suelo siguen filtrando piezas que no sean monedas utilizables.
+	return true
 end
 
 -- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
@@ -7757,7 +7756,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	end
 	if #candidates == 0 then return nil end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
-	local checks = math.min(5, #candidates)
+	local checks = math.min(24, #candidates)
 	for i = 1, checks do
 		if HasClearCoinRoute(fromPos, candidates[i].coin) then
 			return candidates[i].coin
