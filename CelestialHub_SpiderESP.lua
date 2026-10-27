@@ -6084,8 +6084,8 @@ local CoinEngine = {
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
-	AutoNoclipCheckInterval = 0.09, -- evita raycasts redundantes en cada pocos Heartbeats
-	NoclipStuckConfirmTime = 0.22, -- activa recuperacion solo tras falta de progreso real
+	AutoNoclipCheckInterval = 0.04, -- muestreo rápido: limita la latencia de recuperación a ~0.25 s
+	NoclipStuckConfirmTime = 0.14, -- confirmación corta, corroborada por ruta bloqueada y comando activo
 	NoclipExitSolidMaxTime = 1.10, -- nunca mantener la recuperación sin límite
 	NoclipRetryCooldown = 0.35,
 	NoclipConn = nil,
@@ -7878,8 +7878,8 @@ local function HasClearCoinRoute(fromPos, coin)
 	local coinPosition = coin.Position
 	local cached = CoinEngine.RouteCheckCache[coin]
 	-- Cache corta: reusa el barrido solo si raiz y moneda apenas se han movido.
-	if cached and now - cached.at <= 0.075
-		and (fromPos - cached.fromPos).Magnitude <= 1.25
+	if cached and now - cached.at <= 0.04
+		and (fromPos - cached.fromPos).Magnitude <= 1.0
 		and (coinPosition - cached.targetPos).Magnitude <= 0.15 then
 		return cached.clear, cached.hit
 	end
@@ -8448,6 +8448,7 @@ local routeNavigation = {
 	target = nil, points = {}, index = 1, nextPlanAt = 0, failedUntil = 0,
 	bestAimDistance = math.huge, lastAimProgressAt = 0, lastRootPosition = nil,
 	directPathBlocked = false, lastDetourPart = nil, lastDetourAt = 0, lastDetourStartPosition = nil, detourAttempts = 0,
+	noDetourPending = false, blockedHit = nil,
 }
 
 local function ResetRouteNavigation(target, now)
@@ -8464,6 +8465,8 @@ local function ResetRouteNavigation(target, now)
 	routeNavigation.lastDetourAt = 0
 	routeNavigation.lastDetourStartPosition = nil
 	routeNavigation.detourAttempts = 0
+	routeNavigation.noDetourPending = false
+	routeNavigation.blockedHit = nil
 end
 
 local function PrepareNext(now)
@@ -8540,7 +8543,7 @@ local function HasConfirmedRouteStall(root, target, now)
 		return false
 	end
 	local elapsed = now - (noclipStallTrack.at or now)
-	if elapsed < 0.075 then return false end
+	if elapsed < 0.04 then return false end
 	local towardProgress = (noclipStallTrack.distance or distance) - distance
 	local commandedSpeed = (CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude
 	-- Movement sideways or in a loop is not target progress. Only meaningful distance
@@ -8683,13 +8686,21 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	if now < (routeNavigation.nextPlanAt or 0) or now < (routeNavigation.failedUntil or 0) then
 		return destination, false
 	end
-	routeNavigation.nextPlanAt = now + 0.16
+	routeNavigation.nextPlanAt = now + 0.08
 	local clear, hit = HasClearCoinRoute(root.Position, target)
 	routeNavigation.directPathBlocked = not clear
+	if clear then
+		routeNavigation.noDetourPending = false
+		routeNavigation.blockedHit = nil
+	else
+		routeNavigation.blockedHit = hit
+	end
 	if clear then
 		routeNavigation.points = {}
 		routeNavigation.index = 1
 		routeNavigation.failedUntil = 0
+		routeNavigation.noDetourPending = false
+		routeNavigation.blockedHit = nil
 		routeNavigation.lastDetourPart = nil
 		routeNavigation.lastDetourAt = 0
 		routeNavigation.lastDetourStartPosition = nil
@@ -8704,11 +8715,18 @@ local function GetFarmNavigationAim(root, target, destination, now)
 		local movedSinceAttempt = routeNavigation.lastDetourStartPosition
 			and (root.Position - routeNavigation.lastDetourStartPosition).Magnitude or 0
 		if sinceAttempt < 0.55 then
+			-- A recently attempted detour around the same hit already failed; do not wait out
+			-- the old suppression window before the adaptive crossing can take ownership.
 			routeNavigation.failedUntil = math.max(routeNavigation.failedUntil or 0, (routeNavigation.lastDetourAt or now) + 0.55)
+			routeNavigation.noDetourPending = true
+			routeNavigation.blockedHit = hit
 			return destination, false
 		elseif movedSinceAttempt < 1.5 then
-			-- Keep the original suppression deadline; never push it forward on every poll.
+			-- Keep the original suppression deadline, but hand a repeated no-progress attempt
+			-- directly to recovery instead of waiting for another full route-planning cycle.
 			routeNavigation.failedUntil = math.max(routeNavigation.failedUntil or 0, (routeNavigation.lastDetourAt or now) + 0.55)
+			routeNavigation.noDetourPending = true
+			routeNavigation.blockedHit = hit
 			return destination, false
 		end
 		-- Same obstacle, but a meaningful position change allows a new geometric assessment.
@@ -8724,14 +8742,20 @@ local function GetFarmNavigationAim(root, target, destination, now)
 		routeNavigation.lastDetourAt = now
 		routeNavigation.lastDetourStartPosition = root.Position
 		routeNavigation.detourAttempts = (routeNavigation.detourAttempts or 0) + 1
+		routeNavigation.noDetourPending = false
+		routeNavigation.blockedHit = hit
 		LogEvent(string.format("route-detour-planned parts=1 points=%d attempt=%d target=%s", #detour, routeNavigation.detourAttempts, target.Name))
 		return detour[1], true
 	end
 	routeNavigation.failedUntil = now + 0.35
+	routeNavigation.noDetourPending = true
+	routeNavigation.blockedHit = hit
 	return destination, false
 end
 
--- Temporary crossing is allowed only after an actual movement stall has been confirmed.
+-- Temporary crossing may begin immediately after preflight proves that direct travel is
+-- blocked and no short, geometrically validated detour is available. Unexpected stalls use
+-- the independent short progress-confirmation path below.
 local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	local threat = CoinEngine.ThreatResponse
 	if State.NoClipActive then
@@ -8764,7 +8788,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				local clear = HasClearCharacterPath(root.Position, escapeDestination, ignore, root, routeRayParams)
 				threat.EscapeRouteBlockedNow = not clear
 				threat.CheckedEscapeDestination = escapeDestination
-				threat.NextEscapeRouteCheckAt = now + math.max(0.075, tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.09)
+				threat.NextEscapeRouteCheckAt = now + math.max(0.04, tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
 			end
 			escapeRouteBlocked = threat.EscapeRouteBlockedNow == true
 		end
@@ -8885,7 +8909,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 		end
 
 		if now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
-			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.09)
+			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
 			local routeClear = HasClearCoinRoute(root.Position, target)
 			local inside = IsInsideSolidForNoclip(root.Position, now)
 			if routeClear and not inside then
@@ -8919,14 +8943,39 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 		return target
 	end
 
-	-- A blocked ray is only evidence that the straight line is obstructed, not proof that
-	-- NoClip is needed. Keep the normal collision path while it is making real progress.
-	-- Evaluate a route ray only after the progress monitor confirms a stall, cutting routine
-	-- raycasts while the character is already moving successfully toward the coin.
+	-- If preflight found a blocked direct path and could not validate either local detour,
+	-- start the bounded adaptive crossing now. This avoids the old sequence of detour cooldown
+	-- + global stall timeout + another route sample (which could approach two seconds).
+	if routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
+		and IsValidCoin(target) and routeNavigation.directPathBlocked then
+		local routeClearNow = HasClearCoinRoute(root.Position, target)
+		if routeClearNow then
+			routeNavigation.noDetourPending = false
+			routeNavigation.directPathBlocked = false
+			routeNavigation.blockedHit = nil
+			routeNavigation.failedUntil = 0
+		else
+			routeNavigation.noDetourPending = false
+			routeNavigation.points = {}
+			routeNavigation.index = 1
+			CoinEngine.AutoNoclipMode = IsInsideSolidForNoclip(root.Position, now) and "exit-solid" or "coin-route"
+			CoinEngine.AutoNoclipTarget = target
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipWanted = true
+			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
+			LogEvent(string.format("auto-noclip start reason=preflight-blocked-no-valid-detour dist=%.1f target=%s",
+				(target.Position - root.Position).Magnitude, target.Name))
+			return target
+		end
+	end
+
+	-- Unexpected obstruction fallback: once the active command and progress samples confirm
+	-- a stall, the 0.14 s timer plus 40 ms sampling keeps typical detection around 0.2-0.25 s.
+	-- A single blocked ray does not trigger this fallback while the character is progressing.
 	if target and target.Parent and IsValidCoin(target)
 		and (target.Position - root.Position).Magnitude > 0.1
 		and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
-		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.09)
+		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
 		local progressAge = math.max(0, now - (lastProgress or now))
 		-- Keep the short stall sampler warm even before the global progress timer expires;
 		-- otherwise the confirmation window would start late and delay recovery twice.
