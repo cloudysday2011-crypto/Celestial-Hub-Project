@@ -1,4 +1,4 @@
--- StabilityLog17: priority Murder escape, confirmed-stall adaptive NoClip, and lower-latency coin chaining.
+-- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.23: based on V3.22; keeps position-stability limits while making emergency routing frame-budget adaptive.
@@ -6009,7 +6009,16 @@ local CoinEngine = {
 		LostGrace = 0.60,         -- breve margen para actualizaciones de rol / replicacion
 		RoleScanInterval = 0.25,
 		RouteCheckInterval = 0.30,
-		PreferredSeparation = 24,
+		PreferredSeparation = 30,
+		-- A coin beside the Murderer is temporarily ineligible even when the local player
+		-- is outside the 30-stud emergency radius. Hysteresis prevents threshold flicker.
+		CoinDangerDistance = 30,
+		CoinDangerReleaseDistance = 36,
+		CoinDangerReleaseHold = 0.35,
+		CoinDangerState = setmetatable({}, {__mode = "k"}),
+		CoinThreatSnapshot = nil,
+		SafeReleaseSince = nil,
+		SafeReleaseHold = 0.45,
 		Active = false,
 		Murderer = nil,
 		CachedMurderer = nil,
@@ -7755,6 +7764,97 @@ end
 -- SELECTOR DE OBJETIVOS
 -- ---------------------------------------------------------------
 
+-- Coin danger is evaluated against the Murderer's current and short predicted position,
+-- independently from whether the local character has entered emergency-escape range.
+-- Coins are temporarily excluded on entry <30 studs and restored only after clearing 36
+-- studs continuously for a short hold, preventing re-selection flicker around the boundary.
+local function GetCoinThreatSnapshot(now)
+	local threat = CoinEngine.ThreatResponse
+	if not threat or threat.LocalMurderer then
+		if threat then threat.CoinThreatSnapshot = nil end
+		return nil
+	end
+	local cached = threat.CoinThreatSnapshot
+	if cached and cached.murderer and cached.murderer.Parent == Players
+		and now >= cached.at and now - cached.at <= 0.04 then
+		return cached
+	end
+	local murderer = threat.Murderer
+	if not murderer or murderer == LocalPlayer or murderer.Parent ~= Players then
+		murderer = threat.CachedMurderer
+	end
+	if not murderer or murderer == LocalPlayer or murderer.Parent ~= Players then
+		threat.CoinThreatSnapshot = nil
+		return nil
+	end
+	local murderRoot = GetRoot(murderer)
+	local murderHumanoid = GetHumanoid(murderer)
+	if not murderRoot or (murderHumanoid and murderHumanoid.Health <= 0) then
+		threat.CoinThreatSnapshot = nil
+		return nil
+	end
+	local murderPos = murderRoot.Position
+	local predictedPos = murderPos
+	pcall(function()
+		local velocity = murderRoot.AssemblyLinearVelocity
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+		if horizontal.Magnitude > 30 then horizontal = horizontal.Unit * 30 end
+		predictedPos = murderPos + horizontal * 0.35
+	end)
+	local snapshot = {
+		at = now, murderer = murderer, root = murderRoot,
+		murderPos = murderPos, predictedPos = predictedPos,
+	}
+	threat.CoinThreatSnapshot = snapshot
+	return snapshot
+end
+
+local function IsCoinTemporarilyExcluded(coin, now)
+	if not coin or not coin.Parent then return false end
+	local threat = CoinEngine.ThreatResponse
+	local snapshot = GetCoinThreatSnapshot(now)
+	local stateMap = threat and threat.CoinDangerState
+	if not snapshot then
+		if stateMap then stateMap[coin] = nil end
+		return false
+	end
+	if not stateMap then
+		stateMap = setmetatable({}, {__mode = "k"})
+		threat.CoinDangerState = stateMap
+	end
+	local separation = math.min(
+		(coin.Position - snapshot.murderPos).Magnitude,
+		(coin.Position - snapshot.predictedPos).Magnitude
+	)
+	local state = stateMap[coin]
+	if not state or state.murderer ~= snapshot.murderer then
+		state = {murderer = snapshot.murderer, dangerous = false, safeSince = nil}
+		stateMap[coin] = state
+	end
+	local enterDistance = tonumber(threat.CoinDangerDistance) or 30
+	local releaseDistance = math.max(enterDistance, tonumber(threat.CoinDangerReleaseDistance) or (enterDistance + 6))
+	local releaseHold = math.max(0, tonumber(threat.CoinDangerReleaseHold) or 0.35)
+	if state.dangerous then
+		if separation <= releaseDistance then
+			state.safeSince = nil
+			return true
+		end
+		state.safeSince = state.safeSince or now
+		if now - state.safeSince < releaseHold then return true end
+		state.dangerous = false
+		state.safeSince = nil
+		LogEvent(string.format("coin-danger-released sep=%.1f coin=%s", separation, coin.Name))
+		return false
+	end
+	if separation < enterDistance then
+		state.dangerous = true
+		state.safeSince = nil
+		LogEvent(string.format("coin-danger-excluded sep=%.1f radius=%.1f coin=%s", separation, enterDistance, coin.Name))
+		return true
+	end
+	return false
+end
+
 local function IsAvailable(coin, now)
 	if not coin or not CoinEngine.CoinCache[coin] or not coin.Parent then return false end
 	if not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
@@ -7762,6 +7862,7 @@ local function IsAvailable(coin, now)
 		return false
 	end
 	if not IsSafeCoinPosition(coin.Position) then return false end
+	if IsCoinTemporarilyExcluded(coin, now) then return false end
 	local bl = CoinEngine.Blacklist[coin]
 	if bl then
 		if bl > now then return false end
@@ -7803,6 +7904,34 @@ local function CoinTravelScore(fromPos, coinPos)
 	local delta = coinPos - fromPos
 	local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
 	return horizontal + math.abs(delta.Y) * CoinEngine.VerticalTravelPenalty
+end
+
+-- When a Murderer is known, rank otherwise-safe coins by travel cost plus the closest
+-- approach of the planned straight segment to the threat. This is a soft routing preference,
+-- not a blanket speed cap; dangerous endpoints remain strictly excluded above.
+local function ThreatAwareCoinScore(fromPos, coinPos, now)
+	local score = CoinTravelScore(fromPos, coinPos)
+	local snapshot = GetCoinThreatSnapshot(now)
+	if not snapshot then return score end
+	local segment = coinPos - fromPos
+	local lengthSquared = segment:Dot(segment)
+	local routeGap = math.huge
+	if lengthSquared > 0.001 then
+		local function GapToSegment(threatPos)
+			local t = math.clamp((threatPos - fromPos):Dot(segment) / lengthSquared, 0, 1)
+			return (fromPos + segment * t - threatPos).Magnitude
+		end
+		routeGap = math.min(GapToSegment(snapshot.murderPos), GapToSegment(snapshot.predictedPos))
+	end
+	local away = fromPos - snapshot.murderPos
+	local towardDot = 0
+	if segment.Magnitude > 0.01 and away.Magnitude > 0.01 then
+		towardDot = segment.Unit:Dot(away.Unit)
+	end
+	local closeRoutePenalty = math.max(0, (tonumber(CoinEngine.ThreatResponse.CoinDangerReleaseDistance) or 36) - routeGap) * 1.15
+	local directionPenalty = (1 - towardDot) * 5.0
+	local separationReward = math.min((coinPos - snapshot.predictedPos).Magnitude, 120) * 0.12
+	return score + closeRoutePenalty + directionPenalty - separationReward
 end
 
 -- El chequeo espacial usa piezas fisicas y su CanCollide, no nombres de objetos.
@@ -7907,8 +8036,9 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 				local delta = coin.Position - fromPos
 				local verticalGap = math.abs(delta.Y)
 				local distance = delta.Magnitude
-				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
-					candidates[#candidates + 1] = {coin = coin, score = CoinTravelScore(fromPos, coin.Position)}
+				if not bl and IsSafeCoinPosition(coin.Position) and not IsCoinTemporarilyExcluded(coin, now)
+					and verticalGap <= maxGap and distance <= maxDistance then
+					candidates[#candidates + 1] = {coin = coin, score = ThreatAwareCoinScore(fromPos, coin.Position, now)}
 				end
 			end
 		end
@@ -8136,16 +8266,13 @@ local function GetMurderEscapeDestination(root, murderer, now)
 end
 
 local function IsThreatSafeCoin(coin)
-	local threat = CoinEngine.ThreatResponse
-	if not threat.Active or not coin or not coin.Parent then return true end
-	local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
-	if not murderRoot then return true end
-	return (coin.Position - murderRoot.Position).Magnitude >= threat.PreferredSeparation
+	if not coin or not coin.Parent then return false end
+	return not IsCoinTemporarilyExcluded(coin, os.clock())
 end
 
 local function PickThreatCoin(fromPos, exclude, now)
 	local threat = CoinEngine.ThreatResponse
-	local murderer = threat.Murderer
+	local murderer = threat.Murderer or threat.CachedMurderer
 	local murderRoot = murderer and GetRoot(murderer)
 	if not threat.Active or not murderRoot then
 		return PickNearest(fromPos, exclude, now)
@@ -8156,8 +8283,6 @@ local function PickThreatCoin(fromPos, exclude, now)
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 
-	-- Predict a short, bounded horizontal movement of the Murderer. The cap prevents a
-	-- single physics spike from sending the coin selector toward an unrealistic prediction.
 	local predictedMurderPos = murderPos
 	pcall(function()
 		local velocity = murderRoot.AssemblyLinearVelocity
@@ -8176,19 +8301,24 @@ local function PickThreatCoin(fromPos, exclude, now)
 		if routeVector.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
 			awayDot = routeVector.Unit:Dot(awayVector.Unit)
 		end
-
-		-- Short routes still matter, but a clearly safer/farther coin now wins more often.
-		-- The directional term penalizes routes toward the Murderer; the separation reward
-		-- favors coins farther from both the current and short-term predicted threat position.
 		local directionPenalty = (1 - awayDot) * 16
-		local riskPenalty = math.max(0, threat.PreferredSeparation - safetyGap) * 10
+		local segment = coinPos - fromPos
+		local lengthSquared = segment:Dot(segment)
+		local routeGap = math.huge
+		if lengthSquared > 0.001 then
+			local function GapToSegment(threatPos)
+				local t = math.clamp((threatPos - fromPos):Dot(segment) / lengthSquared, 0, 1)
+				return (fromPos + segment * t - threatPos).Magnitude
+			end
+			routeGap = math.min(GapToSegment(murderPos), GapToSegment(predictedMurderPos))
+		end
+		local routeRiskPenalty = math.max(0, (tonumber(threat.CoinDangerReleaseDistance) or 36) - routeGap) * 1.15
 		local separationReward = math.min(safetyGap, 120) * 0.55
-		local score = CoinTravelScore(fromPos, coinPos) + directionPenalty + riskPenalty - separationReward
-		return score, safetyGap, currentGap, predictedGap
+		return CoinTravelScore(fromPos, coinPos) + directionPenalty + routeRiskPenalty - separationReward, safetyGap
 	end
 
-	local function FindCandidate(verticalLimit, requireSeparation)
-		local best, bestScore = nil, math.huge
+	local function FindCandidate(verticalLimit)
+		local candidates = {}
 		for coin in pairs(CoinEngine.CoinCache) do
 			if coin ~= exclude then
 				if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
@@ -8202,52 +8332,37 @@ local function PickThreatCoin(fromPos, exclude, now)
 					local delta = coin.Position - fromPos
 					local verticalGap = math.abs(delta.Y)
 					local distance = delta.Magnitude
-					local score, safetyGap = ScoreThreatCandidate(coin.Position)
 					if not blacklistedUntil and IsSafeCoinPosition(coin.Position)
-						and verticalGap <= verticalLimit and distance <= maxDistance
-						and (not requireSeparation or safetyGap >= threat.PreferredSeparation) then
-						if IsGrounded(coin) and score < bestScore then
-							best, bestScore = coin, score
-						elseif not IsGrounded(coin) then
+						and not IsCoinTemporarilyExcluded(coin, now)
+						and verticalGap <= verticalLimit and distance <= maxDistance then
+						if IsGrounded(coin) then
+							local score, safetyGap = ScoreThreatCandidate(coin.Position)
+							candidates[#candidates + 1] = {coin = coin, score = score, safetyGap = safetyGap}
+						else
 							CoinEngine.Blacklist[coin] = now + 2.5
 						end
 					end
 				end
 			end
 		end
-		return best
-	end
+		if #candidates == 0 then return nil end
+		table.sort(candidates, function(a, b) return a.score < b.score end)
 
-	-- Prefer a reachable coin that is safe relative to both the current and predicted path.
-	local candidate = FindCandidate(preferredGap, true)
-	if candidate then return candidate end
-	candidate = FindCandidate(maxGap, true)
-	if candidate then return candidate end
-
-	-- If every candidate is close to the threat, keep collection running but rank the options
-	-- by predicted separation and escape direction instead of stopping the farm.
-	local fallback, fallbackScore = nil, math.huge
-	for coin in pairs(CoinEngine.CoinCache) do
-		if coin ~= exclude then
-			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
-				UnregisterCoin(coin)
-			else
-				local bl = CoinEngine.Blacklist[coin]
-				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-				local delta = coin.Position - fromPos
-				if not bl and IsSafeCoinPosition(coin.Position)
-					and math.abs(delta.Y) <= maxGap and delta.Magnitude <= maxDistance then
-					if IsGrounded(coin) then
-						local score = ScoreThreatCandidate(coin.Position)
-						if score < fallbackScore then fallback, fallbackScore = coin, score end
-					else
-						CoinEngine.Blacklist[coin] = now + 2.5
-					end
-				end
-			end
+		-- Prefer a geometrically clear alternative. Check only the best-ranked few to keep
+		-- threat-aware selection responsive; if all are blocked, retain the best safe candidate
+		-- so the existing route planner/temporary recovery can handle the obstruction.
+		for i = 1, math.min(8, #candidates) do
+			local candidate = candidates[i].coin
+			if HasClearCoinRoute(fromPos, candidate) then return candidate end
 		end
+		return candidates[1].coin
 	end
-	return fallback
+
+	-- Never fall back to coins inside the Murderer's temporary danger zone. If every candidate
+	-- is dangerous, return nil: the caller keeps the escape/hold priority instead of oscillating.
+	local candidate = FindCandidate(preferredGap)
+	if candidate then return candidate end
+	return FindCandidate(maxGap)
 end
 
 local function UpdateThreatResponse(root, now)
@@ -8259,6 +8374,7 @@ local function UpdateThreatResponse(root, now)
 		local wasActive = threat.Active
 		threat.Active = false
 		threat.EmergencyEscape = false
+		threat.SafeReleaseSince = nil
 		threat.EscapeDestination = nil
 		threat.EscapePathBlocked = false
 		threat.CheckedEscapeDestination = nil
@@ -8267,6 +8383,8 @@ local function UpdateThreatResponse(root, now)
 		threat.NextEscapeDestinationAt = 0
 		threat.Murderer = nil
 		threat.CachedMurderer = nil
+		threat.CoinThreatSnapshot = nil
+		if threat.CoinDangerState then table.clear(threat.CoinDangerState) end
 		threat.LastDistance = math.huge
 		threat.LastMeasuredDistance = math.huge
 		threat.LastMeasuredAt = now
@@ -8308,11 +8426,20 @@ local function UpdateThreatResponse(root, now)
 		threat.LastClosingSpeed = 0
 	end
 
-	-- >35 studs is the explicit safe zone: release immediately and clear emergency mode.
+	-- Hysteresis: do not toggle farming/escape on tiny distance fluctuations around 35 studs.
+	-- Release only after the Murderer stays beyond the safe boundary for a short continuous hold.
 	if murderer and murderRoot and distance > threat.SafeDistance then
 		threat.LastDistanceAboveSafeAt = now
 		threat.LastDistance = distance
 		threat.LastSeenAt = now
+		if wasActive then
+			threat.SafeReleaseSince = threat.SafeReleaseSince or now
+			if now - threat.SafeReleaseSince < (threat.SafeReleaseHold or 0.45) then
+				threat.Murderer = murderer
+				return nil, distance
+			end
+		end
+		threat.SafeReleaseSince = nil
 		threat.Active = false
 		threat.EmergencyEscape = false
 		threat.EscapeDestination = nil
@@ -8323,11 +8450,12 @@ local function UpdateThreatResponse(root, now)
 		threat.NextEscapeDestinationAt = 0
 		threat.Murderer = nil
 		if wasActive then
-			LogEvent(string.format("murder-threat-response safe-zone dist=%.1f limit=%.1f", distance, threat.SafeDistance))
+			LogEvent(string.format("murder-threat-response safe-zone dist=%.1f limit=%.1f hold=%.2f", distance, threat.SafeDistance, threat.SafeReleaseHold or 0.45))
 			return "released", distance
 		end
 		return nil, distance
 	end
+	threat.SafeReleaseSince = nil
 
 	-- Critical proximity wins over ordinary routing and does not depend on a line-of-sight ray.
 	-- This path is deliberately evaluated before inventory/LOS heuristics can defer the response.
@@ -9064,6 +9192,11 @@ function CoinEngine.CleanupRoundCaches()
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
+	if CoinEngine.ThreatResponse then
+		if CoinEngine.ThreatResponse.CoinDangerState then table.clear(CoinEngine.ThreatResponse.CoinDangerState) end
+		CoinEngine.ThreatResponse.CoinThreatSnapshot = nil
+		CoinEngine.ThreatResponse.SafeReleaseSince = nil
+	end
 	CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
 	LogEvent(string.format("round-cleanup bl=%d att=%d gnd=%d cache=%d", nb, na, ng, CoinEngine.CoinCount))
 end
@@ -9227,8 +9360,11 @@ local function ControllerStep(dt)
 		if CoinEngine.ThreatResponse.Active or CoinEngine.ThreatResponse.Murderer or CoinEngine.ThreatResponse.CachedMurderer then
 			CoinEngine.ThreatResponse.Active = false
 			CoinEngine.ThreatResponse.EmergencyEscape = false
+			CoinEngine.ThreatResponse.SafeReleaseSince = nil
 			CoinEngine.ThreatResponse.Murderer = nil
 			CoinEngine.ThreatResponse.CachedMurderer = nil
+			CoinEngine.ThreatResponse.CoinThreatSnapshot = nil
+			if CoinEngine.ThreatResponse.CoinDangerState then table.clear(CoinEngine.ThreatResponse.CoinDangerState) end
 			CoinEngine.ThreatResponse.NextRoleScanAt = 0
 			CoinEngine.ThreatResponse.NextRouteCheckAt = 0
 			CoinEngine.ThreatResponse.LastSeenAt = 0
@@ -9389,7 +9525,21 @@ local function ControllerStep(dt)
 
 	if not CoinEngine.CurrentTarget or not IsAvailable(CoinEngine.CurrentTarget, now) then
 		AdvanceTarget(root, now)
-		if not CoinEngine.CurrentTarget then UpdateAutoNoclip(root, nil, now); return end
+		if not CoinEngine.CurrentTarget then
+			-- If coins exist but every candidate sits inside the Murderer's danger zone, do not
+			-- fall back to the nearest unsafe coin. Keep the movement controller idle and stable.
+			local knownMurderer = threat.Murderer or threat.CachedMurderer
+			local murderRoot = knownMurderer and GetRoot(knownMurderer)
+			if murderRoot and not threat.EmergencyEscape then
+				SetStatus("waiting-safe-coin")
+				currentSpeed = 0
+				lastFlightV = 0
+				CoinEngine.LastCommandVelocity = Vector3.zero
+				if flightVel then flightVel.Velocity = Vector3.zero end
+			end
+			UpdateAutoNoclip(root, nil, now)
+			return
+		end
 	end
 
 	-- Preparar el siguiente objetivo mientras se viaja al actual
@@ -9412,8 +9562,8 @@ local function ControllerStep(dt)
 			cand = PickNearest(root.Position, nil, now)
 		end
 		if cand and cand ~= cur and cur and cur.Parent then
-			local dc = CoinTravelScore(root.Position, cur.Position)
-			local dn = CoinTravelScore(root.Position, cand.Position)
+			local dc = ThreatAwareCoinScore(root.Position, cur.Position, now)
+			local dn = ThreatAwareCoinScore(root.Position, cand.Position, now)
 			local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
 			-- Do not switch on a single blocked-ray sample while the current target is still
 			-- getting closer. Clearance-based reroutes are evaluated when real progress stalls.
