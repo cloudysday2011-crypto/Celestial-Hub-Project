@@ -2022,24 +2022,6 @@ local function AbsoluteClearESP()
 	end
 end
 
--- Independent active-map evidence used to prevent a stale Ghost role cache from
--- resurrecting the previous round's Murderer after the map has been removed.
--- RoundTimerState alone is not authoritative here: the timer's phase is inferred from role names.
-local function HasActiveMM2RoundWorld()
-	local coinContainer = Workspace:FindFirstChild("CoinContainer")
-	if coinContainer and coinContainer.Parent == Workspace then return true end
-	for _, rootName in ipairs({"Map", "Normal", "Round"}) do
-		local mapRoot = Workspace:FindFirstChild(rootName)
-		if mapRoot and mapRoot.Parent == Workspace then
-			local lowerName = string.lower(mapRoot.Name)
-			if not lowerName:find("lobby", 1, true) and not lowerName:find("waiting", 1, true) then
-				return true
-			end
-		end
-	end
-	return false
-end
-
 local function GetPlayerTeam(plr)
 	if _G.Celestial.GameMode == "MM2" then
 		if plr.Name == State.MurdererName then return "MURDERER" end
@@ -4432,23 +4414,21 @@ local function IsPowerCurrentlyActive(plr, powerName)
 			_G.Celestial.PowerDetector.GhostLastSeenAt = tick()
 			if root then _G.Celestial.PowerDetector.GhostLastKnownCFrame = root.CFrame end
 		end
-		local roundWorldActive = HasActiveMM2RoundWorld()
 		local roundState = _G.Celestial.RoundTimerState
 		local roundActive
 		if roundState then
-			roundActive = roundWorldActive and roundState.phase == "Round" and not roundState.ended
+			roundActive = roundState.phase == "Round" and not roundState.ended
 				and (roundState.remaining == nil or roundState.remaining > 0)
-		else roundActive = roundWorldActive and State.MurdererName == plr.Name end
+		else roundActive = State.MurdererName == plr.Name end
 		local stillAlive = (humanoid and humanoid.Health > 0) or (not humanoid and _G.Celestial.PowerDetector.GhostLastKnownHealth > 0)
 		local missingFromMap = roundActive and stillAlive
 			and _G.Celestial.PowerDetector.GhostLastSeenAt > 0
 			and (not characterInWorkspace or not root)
 			and plr.Parent == Players
 		detector.GhostLastTransparency = transparency
-		detector.GhostVisualActive = roundWorldActive and fullyTransparent
+		detector.GhostVisualActive = fullyTransparent
 		detector.GhostMissingActive = missingFromMap
-		-- A cached Ghost transparency is not proof of an active role once the round map is gone.
-		detector.GhostActive = roundWorldActive and (fullyTransparent or missingFromMap)
+		detector.GhostActive = fullyTransparent or missingFromMap
 		if detector.GhostActive then
 			detector.GhostESPPlayer = plr
 			detector.GhostActivationAt = detector.GhostActivationAt > 0 and detector.GhostActivationAt or tick()
@@ -5735,29 +5715,23 @@ _G.Celestial.ConnectionRoleScanner =
 			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive then
 				local foundMurder = ""
 				local currentGunHolder = nil
-				local mm2RoundWorldActive = HasActiveMM2RoundWorld()
-				-- Inventory evidence is meaningful only while a live map exists. Otherwise a tool
-				-- lingering across the Lobby transition must not revive the previous round's role.
-				if mm2RoundWorldActive then
-					for _, plr in ipairs(activePlayers) do
-						local hum = GetHumanoid(plr)
-						if plr.Character and hum and hum.Health > 0 then
-							local isKnife, isGun = CheckPlayerInventory(plr)
-							if isKnife then foundMurder = plr.Name end
-							if isGun then currentGunHolder = plr.Name end
-						end
+				for _, plr in ipairs(activePlayers) do
+					local hum = GetHumanoid(plr)
+					if plr.Character and hum and hum.Health > 0 then
+						local isKnife, isGun = CheckPlayerInventory(plr)
+						if isKnife then foundMurder = plr.Name end
+						if isGun then currentGunHolder = plr.Name end
 					end
 				end
 				local detector = _G.Celestial.PowerDetector
-				local ghostLockedMurderer = mm2RoundWorldActive and detector
+				local ghostLockedMurderer = detector
 					and detector.GhostActive == true
-					and detector.CurrentPower == "Ghost"
 					and detector.GhostESPPlayer
 					and detector.GhostESPPlayer.Parent == Players
 					and detector.GhostESPPlayer
 				State.MurdererName = foundMurder ~= "" and foundMurder
 					or (ghostLockedMurderer and ghostLockedMurderer.Name or "")
-				local droppedGun = mm2RoundWorldActive and FindDroppedGun() or nil
+				local droppedGun = FindDroppedGun()
 				if droppedGun then State.HasGunBeenDropped = true end
 				if foundMurder == "" and currentGunHolder == nil and not droppedGun then
 					State.OriginalSheriff = nil
@@ -5954,21 +5928,13 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
-	local roundWorldActive = HasActiveMM2RoundWorld()
 	local murderer = nil
-	if roundWorldActive and State.MurdererName ~= "" then
-		murderer = Players:FindFirstChild(State.MurdererName)
-	end
-	-- Cached detector references are only valid as a fallback for an active Ghost power on
-	-- a live map; a stale reference from the previous round must never repaint the Lobby ESP.
-	local ghostCandidateActive = roundWorldActive and detector
-		and detector.CurrentPower == "Ghost" and detector.GhostActive == true
-	if not murderer and ghostCandidateActive
+	if State.MurdererName ~= "" then murderer = Players:FindFirstChild(State.MurdererName) end
+	if not murderer and detector and detector.CurrentPower == "Ghost"
 		and detector.CurrentPlayer and detector.CurrentPlayer.Parent == Players then
 		murderer = detector.CurrentPlayer
 	end
-	if not murderer and ghostCandidateActive
-		and detector.GhostESPPlayer and detector.GhostESPPlayer.Parent == Players then
+	if not murderer and detector and detector.GhostESPPlayer and detector.GhostESPPlayer.Parent == Players then
 		murderer = detector.GhostESPPlayer
 	end
 	if not murderer then
@@ -5991,7 +5957,8 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		return
 	end
 	local char = murderer.Character
-	local ghostActiveLatched = ghostCandidateActive and detector.CurrentPlayer == murderer
+	local ghostActiveLatched = detector and detector.CurrentPower == "Ghost"
+		and detector.CurrentPlayer == murderer and detector.GhostActive == true
 	if not char then
 		if not ghostActiveLatched and _G.Celestial.GhostESPProxy then
 			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
@@ -6012,13 +5979,12 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 			detector.GhostESPPlayer = murderer
 			if detector.GhostActivationAt == 0 then detector.GhostActivationAt = now end
 			State.MurdererName = murderer.Name
-		else
-			detector.GhostVisualActive = false
-		end
+		else detector.GhostVisualActive = false end
 	end
-	local ghostActive = ghostVisual or ghostActiveLatched
-	-- The normal role scanner is the sole writer for ordinary role colors. This loop only
-	-- updates the Highlight when Ghost is actually active, eliminating red/green last-writer races.
+	local ghostActive = ghostVisual
+		or (detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer and detector.GhostActive == true)
+	-- The role scanner owns ordinary Murder/Sheriff/Hero colors. This controller must not
+	-- repaint a stale Murder highlight while Ghost is inactive.
 	if not ghostActive then
 		if _G.Celestial.GhostESPProxy then
 			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
@@ -6034,23 +6000,34 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		_G.Celestial.Highlights[murderer] = hl
 	end
 	local ghostAdornee = char
-	local proxyModel = AntiFlingQuantum.EnsureGhostESPProxy()
-	local proxyPart = proxyModel and proxyModel.PrimaryPart
-	local root = char:FindFirstChild("HumanoidRootPart")
-	local knownCFrame = detector and detector.GhostLastKnownCFrame
-	if proxyPart then
-		if root and root.Parent == Workspace then proxyPart.CFrame = root.CFrame
-		elseif knownCFrame then proxyPart.CFrame = knownCFrame end
-		if proxyPart.Parent then ghostAdornee = proxyModel end
+	if ghostActive then
+		local proxyModel = AntiFlingQuantum.EnsureGhostESPProxy()
+		local proxyPart = proxyModel and proxyModel.PrimaryPart
+		local root = char:FindFirstChild("HumanoidRootPart")
+		local knownCFrame = detector and detector.GhostLastKnownCFrame
+		if proxyPart then
+			if root and root.Parent == Workspace then proxyPart.CFrame = root.CFrame
+			elseif knownCFrame then proxyPart.CFrame = knownCFrame end
+			if proxyPart.Parent then ghostAdornee = proxyModel end
+		end
+	elseif _G.Celestial.GhostESPProxy then
+		pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
+		_G.Celestial.GhostESPProxy = nil
 	end
 	hl.Enabled = true
 	hl.Adornee = ghostAdornee
 	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	hl.FillColor = COLOR_GHOST
-	hl.OutlineColor = COLOR_GHOST
-	hl.FillTransparency = 0.05
-	hl.OutlineTransparency = 0
-
+	if ghostActive then
+		hl.FillColor = COLOR_GHOST
+		hl.OutlineColor = COLOR_GHOST
+		hl.FillTransparency = 0.05
+		hl.OutlineTransparency = 0
+	else
+		hl.FillColor = COLOR_MURDERER
+		hl.OutlineColor = COLOR_MURDERER
+		hl.FillTransparency = 0.5
+		hl.OutlineTransparency = 0.15
+	end
 end)
 
 -- ====================================================================
@@ -6084,8 +6061,6 @@ end
 local CoinEngine = {
 	Active = false,            -- conexiones de eventos abiertas
 	CoinCache = {},            -- [coin] = true (monedas validas conocidas)
-	FreshCoinQueue = {},       -- monedas recien detectadas por evento, priorizadas por el selector rapido
-	FreshCoinSet = setmetatable({}, {__mode = "k"}), -- evita duplicar entradas pendientes
 	CoinCount = 0,
 	Blacklist = {},            -- [coin] = os.clock() hasta el que se ignora
 	Attempts = {},             -- [coin] = intentos de recogida
@@ -6612,7 +6587,6 @@ local function UnregisterCoin(coin)
 		CoinEngine.CoinCount -= 1
 	end
 	CoinEngine.Blacklist[coin] = nil
-	CoinEngine.FreshCoinSet[coin] = nil
 	CoinEngine.Attempts[coin] = nil
 	CoinEngine.GroundOk[coin] = nil
 	CoinEngine.RouteCheckCache[coin] = nil
@@ -6702,13 +6676,7 @@ local function OnDescendantAdded(obj)
 	if obj:IsA("BasePart") and CoinNameMatches(obj) then
 		task.defer(function()
 			if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
-				local wasKnown = CoinEngine.CoinCache[obj] == true
 				RegisterCoin(obj)
-				if roundActive and not wasKnown and CoinEngine.CoinCache[obj] and not CoinEngine.FreshCoinSet[obj] then
-					CoinEngine.FreshCoinSet[obj] = true
-					local queue = CoinEngine.FreshCoinQueue
-					queue[#queue + 1] = obj
-				end
 			end
 		end)
 	end
@@ -6752,8 +6720,6 @@ local function Deactivate()
 	if CoinEngine.RemovingConnection then CoinEngine.RemovingConnection:Disconnect(); CoinEngine.RemovingConnection = nil end
 	_G.Celestial.CoinDescendantConnection = nil
 	table.clear(CoinEngine.CoinCache)
-	table.clear(CoinEngine.FreshCoinQueue)
-	table.clear(CoinEngine.FreshCoinSet)
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
@@ -8066,7 +8032,7 @@ end
 
 local function IsAvailable(coin, now)
 	if not coin or not CoinEngine.CoinCache[coin] or not coin.Parent then return false end
-	if not IsValidCoin(coin) then
+	if not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
 		UnregisterCoin(coin)
 		return false
 	end
@@ -8360,7 +8326,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	local immediateRadius = math.min(maxDistance, 18.0)
 	local immediateVerticalGap = math.min(maxGap, Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap))
 	local immediateForward = Vector3.zero
-	do
+	if maxRouteChecks > 0 then
 		local root = GetRoot()
 		local commanded = CoinEngine.LastCommandVelocity or Vector3.zero
 		local planar = Vector3.new(commanded.X, 0, commanded.Z)
@@ -8372,53 +8338,9 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 			if lookPlanar.Magnitude > 0.05 then immediateForward = lookPlanar.Unit end
 		end
 	end
-	-- Fresh event candidates are LIFO so the latest spawn is considered before a full O(N)
-	-- cache walk. Limit each pass to avoid a burst of coin events monopolizing the Heartbeat.
-	local freshQueue = CoinEngine.FreshCoinQueue
-	local freshProcessed = 0
-	local freshBest, freshBestScore = nil, math.huge
-	while #freshQueue > 0 and freshProcessed < 64 do
-		local coin = freshQueue[#freshQueue]
-		freshQueue[#freshQueue] = nil
-		if coin and CoinEngine.FreshCoinSet[coin] then
-			CoinEngine.FreshCoinSet[coin] = nil
-			freshProcessed += 1
-			if coin ~= exclude and CoinEngine.CoinCache[coin] and coin.Parent and IsValidCoin(coin) then
-				local bl = CoinEngine.Blacklist[coin]
-				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-				local delta = coin.Position - fromPos
-				local verticalGap = math.abs(delta.Y)
-				local distance = delta.Magnitude
-				if not bl and IsSafeCoinPosition(coin.Position) and not IsCoinTemporarilyExcluded(coin, now)
-					and verticalGap <= immediateVerticalGap and distance <= immediateRadius and distance <= maxDistance then
-					local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
-					local forwardDot = 0
-					if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
-						forwardDot = immediateForward:Dot(horizontalDelta.Unit)
-					end
-					if forwardDot >= 0.15 or distance <= 8.0 or horizontalDelta.Magnitude <= 4.5 then
-						local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
-						if quickScore < freshBestScore then
-							freshBestScore = quickScore
-							freshBest = coin
-						end
-					end
-				end
-			end
-		end
-	end
-	if freshBest then
-		immediateCheckedCoin = freshBest
-		immediateGrounded = IsGrounded(freshBest)
-		if immediateGrounded then
-			if maxRouteChecks == 0 or HasClearCoinRoute(fromPos, freshBest) then return freshBest end
-		else
-			CoinEngine.Blacklist[freshBest] = now + 2.5
-		end
-	end
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
-			if not coin.Parent or not IsValidCoin(coin) then
+			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
 				UnregisterCoin(coin)
 			else
 				local bl = CoinEngine.Blacklist[coin]
@@ -8761,7 +8683,7 @@ local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit)
 		local candidates = {}
 		for coin in pairs(CoinEngine.CoinCache) do
 			if coin ~= exclude then
-				if not coin.Parent or not IsValidCoin(coin) then
+				if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
 					UnregisterCoin(coin)
 				else
 					local blacklistedUntil = CoinEngine.Blacklist[coin]
