@@ -6043,20 +6043,20 @@ local CoinEngine = {
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
 	SpeedSafetyHoldUntil = 0,
 	SpeedSafetyHoldCap = 80,
-	CommandAcceleration = 150, -- rampa de comando mas responsiva con limite de cambio por segundo
-	RiskCommandAccelerationFloor = 80,
+	CommandAcceleration = 150, -- aceleracion normal; el +25% se aplica solo durante el encadenamiento
+	RiskCommandAccelerationFloor = 80, -- suelo normal adaptativo; el +25% se aplica solo durante el encadenamiento
 	MaxCommandStepPerFrame = 1.5, -- limite de recorrido por actualizacion; el techo se calcula desde dt real
 	NearTargetAccelerationMultiplier = 1.35,
-	RampTime = 0.55,           -- rampa mas responsiva; la aceleracion sigue integrada por tiempo real
-	MinCollectInterval = 0.04,
+	RampTime = 0.55,           -- rampa normal; el ajuste de encadenamiento se aplica localmente
+	MinCollectInterval = 0.04, -- debounce normal; no sustituye el tiempo fisico de recoleccion
 	MaxDistance = 300,
 	VerticalTravelPenalty = 2.5, -- una moneda en el mismo piso pesa mas que una elevada
 	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
 	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
 	SafeMaxSpeed = 80, -- coincide con el maximo del slider; guardas dinamicos protegen los frames lentos
-	SafeRampTime = 0.48,      -- conserva rampa de Safe Mode, reduciendo la pausa al arrancar
-	SafeMinCollectInterval = 0.05,
+	SafeRampTime = 0.48,      -- rampa normal de Safe Mode; el ajuste de encadenamiento se aplica localmente
+	SafeMinCollectInterval = 0.05, -- debounce normal de Safe Mode
 	SafeMaxDistance = 300,
 	SafePreferredVerticalGap = 22,
 	SafeMaxVerticalGap = 60,      -- respaldo para otros pisos si el nivel actual esta vacio
@@ -6127,6 +6127,7 @@ local pauseUntil = 0
 local POST_COLLECT_PAUSE_ENABLED = false -- queda dormido para futuras actualizaciones
 local POST_COLLECT_PAUSE = 0.10 -- cooldown conservado, no aplicado mientras el flag sea false
 local currentSpeed = 0
+local chainAccelerationActive = false -- boost temporal solo para el tramo posterior a una moneda recogida
 local lastFlightV = 0                -- ultima velocidad ordenada por el tramo de aproximacion (evita el rebote al llegar)
 local lastCollectAt = 0
 local coinsSinceRest = 0
@@ -6349,6 +6350,13 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 				commandAccel *= tonumber(CoinEngine.NearTargetAccelerationMultiplier) or 1.75
 			end
 		end
+		-- El factor se calcula siempre desde la aceleracion normal efectiva; nunca se acumula
+		-- entre monedas. Una amenaza cancela el boost y conserva prioridad absoluta de huida.
+		if CoinEngine.ThreatResponse.Active then
+			chainAccelerationActive = false
+		elseif chainAccelerationActive then
+			commandAccel *= 1.25
+		end
 		local deltaVelocity = targetVelocity - previous
 		local allowedDelta = commandAccel * frameDt
 		if deltaVelocity.Magnitude > allowedDelta and allowedDelta > 0 then
@@ -6537,6 +6545,7 @@ local function OnDescendantRemoving(obj)
 end
 
 local function ResetPath()
+	chainAccelerationActive = false
 	CoinEngine.CurrentTarget = nil
 	CoinEngine.NextTarget = nil
 	bestDist = math.huge
@@ -6736,8 +6745,9 @@ local function IsInsideSolidForNoclip(pos, now)
 	return inside
 end
 
--- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera ese tiempo al llegar
--- a la moneda y ANTES de recogerla: asi la recogida no se valida desde una posicion "vieja/lejana".
+-- Tiempo que el servidor tarda en ver tu posicion real (~ping/2). Se espera antes de llamar
+-- firetouchinterest para conservar la correccion de Invalid Position. Esto NO es una pausa posterior
+-- a la recogida: el encadenamiento del siguiente objetivo se procesa de inmediato en el mismo Heartbeat.
 local function GetSettleTime(now)
 	if now >= nextPingAt then
 		nextPingAt = now + 1
@@ -8619,9 +8629,9 @@ local function SetCurrent(coin, now)
 	bestDist = math.huge
 	lastProgress = now
 	if coin then
-		-- No escanear todas las monedas por segunda vez en el mismo frame de cambio de objetivo.
-		-- La preparación sigue ocurriendo durante el vuelo, con un pequeño margen para repartir el trabajo.
-		nextPrepareAt = now + 0.03
+		-- El objetivo actual se activa de inmediato; retrasa solo 10 ms la preparacion del
+		-- siguiente-siguiente candidato para no duplicar PickNearest en la misma fase del Heartbeat.
+		nextPrepareAt = now + 0.01
 	else
 		nextPrepareAt = now
 	end
@@ -8648,7 +8658,9 @@ local function AdvanceTarget(root, now)
 	else
 		CoinEngine.CurrentTarget = nil
 		CoinEngine.NextTarget = nil
-		noTargetUntil = now + 0.06
+		-- No introducir un cooldown artificial: si aparece/se valida una moneda, se reintenta
+		-- desde la cache en el siguiente Heartbeat; CoinCount==0 ya evita escaneos vacios.
+		noTargetUntil = now
 	end
 end
 
@@ -9385,6 +9397,7 @@ local function ControllerStep(dt)
 		threatTransition, threatDistance = UpdateThreatResponse(root, now)
 	end
 	if threatTransition == "entered" then
+		chainAccelerationActive = false
 		local saferCoin = PickThreatCoin(root.Position, nil, now)
 		if saferCoin then SetCurrent(saferCoin, now) end
 		local murderRoot = CoinEngine.ThreatResponse.Murderer and GetRoot(CoinEngine.ThreatResponse.Murderer)
@@ -9414,7 +9427,9 @@ local function ControllerStep(dt)
 		if jump > expectedStep and not (CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active) then
 			LogEvent(string.format("server-moved-us jump=%.2f threshold=%.2f speed=%.1f dt=%.3f pos=(%.1f,%.1f,%.1f)", jump, expectedStep, currentSpeed, rawDt, root.Position.X, root.Position.Y, root.Position.Z))
 			ResetPath()
-			pauseUntil = now + 1.5
+			-- ResetPath invalida el objetivo anterior; no hace falta congelar 1.5 s el AutoFarm.
+			-- Se vuelve a elegir desde la posicion ya observada en el siguiente Heartbeat.
+			pauseUntil = now
 			return
 		end
 	end
@@ -9466,7 +9481,7 @@ local function ControllerStep(dt)
 		elseif pingForSafety >= 205 then escapeCap = math.min(escapeCap, 68)
 		elseif pingForSafety >= 160 then escapeCap = math.min(escapeCap, 74) end
 		local commandDt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
-		local escapeRamp = math.min(Param(CoinEngine.RampTime, CoinEngine.SafeRampTime), 0.30)
+		local escapeRamp = math.min(Param(CoinEngine.RampTime, CoinEngine.SafeRampTime), 0.30) -- rampa de respuesta de huida; sin boost de encadenamiento
 		currentSpeed = math.min(escapeCap, currentSpeed + escapeCap * commandDt / math.max(escapeRamp, 0.10))
 		CoinEngine.LastSafetyCap = escapeCap
 		CoinEngine.LastSafetyReason = string.format("murder-escape-frame-budget-dist%.0f", threat.LastDistance or 0)
@@ -9752,10 +9767,14 @@ local function ControllerStep(dt)
 	CoinEngine.LastSafetyCap = speed
 	dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
-	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
-		ramp = math.min(ramp, 0.30) -- acelera la respuesta sin anular la rampa ni el limite de velocidad
+	if CoinEngine.ThreatResponse.Active then chainAccelerationActive = false end
+	if chainAccelerationActive and not CoinEngine.ThreatResponse.Active then
+		ramp = ramp / 1.25 -- +25% de aceleracion de rampa solo para el tramo encadenado
 	end
-	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
+	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
+		ramp = math.min(ramp, 0.30) -- respuesta de huida independiente; nunca depende del boost de monedas
+	end
+	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual; el limite efectivo no cambia
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
 	if now >= nextAdaptiveProfileLogAt then
@@ -9929,9 +9948,10 @@ local function ControllerStep(dt)
 					end
 					if chainNext then
 						SetCurrent(chainCoin, now)
+						chainAccelerationActive = not CoinEngine.ThreatResponse.Active
 						-- No reducir la velocidad de crucero a FlightMinSpeed; esa limitacion reiniciaba cada tramo.
 						currentSpeed = math.max(currentSpeed, math.min(speed, CoinEngine.FlightMinSpeed))
-						nextPrepareAt = now + 0.02
+						nextPrepareAt = now -- no esperar 20 ms para preparar el siguiente objetivo
 						local nextContactHeight = math.max(0.5, (root.Size.Y + chainCoin.Size.Y) * 0.5 - 0.15)
 						local nextDelta = chainCoin.Position + Vector3.new(0, nextContactHeight, 0) - root.Position
 						local nextDist = nextDelta.Magnitude
@@ -9959,12 +9979,13 @@ local function ControllerStep(dt)
 						end
 						LogEvent("coin-chain-next immediate-steer=1 route-adaptive=1")
 					else
+						chainAccelerationActive = false
 						currentSpeed = 0
 						lastFlightV = 0
 						CoinEngine.CurrentTarget = nil
 						CoinEngine.NextTarget = nil
-						noTargetUntil = now + 0.02
-						nextPrepareAt = noTargetUntil
+						noTargetUntil = now -- reintentar en el siguiente Heartbeat, sin cooldown artificial tras la recogida
+						nextPrepareAt = now
 						CoinEngine.LastCommandVelocity = Vector3.zero
 						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 						velApplied = false
