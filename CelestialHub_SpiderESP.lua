@@ -6080,8 +6080,8 @@ local CoinEngine = {
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
-	AutoNoclipCheckInterval = 0.09,
-	NoclipStuckConfirmTime = 0.32, -- requiere falta de progreso, no solo una pared delante
+	AutoNoclipCheckInterval = 0.03, -- revisa obstaculos con latencia baja sin raycastear varias veces por frame
+	NoclipStuckConfirmTime = 0.18, -- respaldo para atascos que no pudieron predecirse
 	NoclipExitSolidMaxTime = 1.10, -- nunca mantener la recuperación sin límite
 	NoclipRetryCooldown = 0.35,
 	NoclipConn = nil,
@@ -7803,8 +7803,8 @@ local function HasClearCoinRoute(fromPos, coin)
 	local coinPosition = coin.Position
 	local cached = CoinEngine.RouteCheckCache[coin]
 	-- Reusa un raycast muy reciente solo si el personaje y la moneda apenas cambiaron de posicion.
-	if cached and now - cached.at <= 0.075
-		and (fromPos - cached.fromPos).Magnitude <= 1.25
+	if cached and now - cached.at <= 0.025
+		and (fromPos - cached.fromPos).Magnitude <= 0.65
 		and (coinPosition - cached.targetPos).Magnitude <= 0.15 then
 		return cached.clear
 	end
@@ -8557,20 +8557,35 @@ local function UpdateAutoNoclip(root, target, now)
 		return target
 	end
 
-	-- A blocked ray is only a route warning. Start NoClip only after the controller has
-	-- confirmed that the target has stopped getting closer for a meaningful interval.
-	if target and target.Parent and (target.Position - root.Position).Magnitude > 3
-		and now >= CoinEngine.AutoNoclipNextCheckAt then
-		CoinEngine.AutoNoclipNextCheckAt = now + CoinEngine.AutoNoclipCheckInterval
-		local routeBlocked = not HasClearCoinRoute(root.Position, target)
-		local progressAge = math.max(0, now - (lastProgress or now))
-		local confirmedMotionStall = HasConfirmedRouteStall(root, target, now)
-		if routeBlocked and progressAge >= stuckConfirm and confirmedMotionStall then
+	-- Prediccion anticipada: si el trayecto directo de vuelo esta bloqueado, prepara el cruce
+	-- antes de que el personaje choque. El raycast excluye personaje, moneda y contenedor; el
+	-- modo sigue siendo temporal y termina al despejarse la ruta, al cambiar el objetivo o por timeout.
+	if target and target.Parent and IsValidCoin(target)
+		and (target.Position - root.Position).Magnitude > 3
+		and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
+		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.03)
+		local routeClear = HasClearCoinRoute(root.Position, target)
+		if not routeClear then
+			-- Un solo resultado de trayectoria bloqueada basta para preparar la activacion:
+			-- esperar al stall confirmaba el problema demasiado tarde y dejaba al personaje parado.
 			CoinEngine.AutoNoclipMode = "coin-route"
 			CoinEngine.AutoNoclipTarget = target
 			CoinEngine.AutoNoclipStartedAt = now
 			CoinEngine.NoclipWanted = true
-			LogEvent(string.format("auto-noclip start reason=confirmed-stall-route-blocked stalled=%.2f dist=%.1f target=%s",
+			LogEvent(string.format("auto-noclip start reason=preemptive-route-blocked dist=%.1f target=%s",
+				(target.Position - root.Position).Magnitude, target.Name))
+			return target
+		end
+
+		-- Respaldo para atascos parciales que el raycast central no predijo (p. ej. otra
+		-- pieza del rig queda enganchada). Solo se activa tras confirmar falta de progreso.
+		local progressAge = math.max(0, now - (lastProgress or now))
+		if progressAge >= stuckConfirm and HasConfirmedRouteStall(root, target, now) then
+			CoinEngine.AutoNoclipMode = insideSolid and "exit-solid" or "coin-route"
+			CoinEngine.AutoNoclipTarget = target
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipWanted = true
+			LogEvent(string.format("auto-noclip start reason=confirmed-stall-fallback stalled=%.2f dist=%.1f target=%s",
 				progressAge, (target.Position - root.Position).Magnitude, target.Name))
 			return target
 		end
