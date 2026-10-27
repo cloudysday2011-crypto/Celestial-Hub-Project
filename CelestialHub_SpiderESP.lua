@@ -12737,20 +12737,69 @@ local scanStartTime = tick()
 local minScanTime = 5.0
 local maxScanTime = 7.0
 
+-- Cheap fallback used only when deep mode detection exceeds its startup deadline.
+-- The full detector remains the preferred path; this avoids letting a yielding Workspace
+-- traversal hold the boot loader indefinitely.
+local function DetectFastStartupModeFallback()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if game.PlaceId == 5118969548 and tonumber(Players.MaxPlayers) == 6 then
+		return "SPIDER"
+	end
+	if pg and pg:FindFirstChild("MainGUI") then return "MM2" end
+	if pg and (pg:FindFirstChild("DuelGUI") or pg:FindFirstChild("DuelHUD")) then return "DUELS" end
+	if Workspace:FindFirstChild("CoinContainer") or Workspace:FindFirstChild("Normal") then return "MM2" end
+	if Workspace:FindFirstChild("DuelPads") or Workspace:FindFirstChild("QueuePad")
+		or Workspace:FindFirstChild("DuelArena") or Workspace:FindFirstChild("DuelsMap") then
+		return "DUELS"
+	end
+	return "DUELS"
+end
+
+local function CleanupPartialStartupSpiderIndex()
+	local shared = _G.Celestial.SpiderShared
+	if shared and shared.Index and shared.Index.Building == true
+		and type(shared.DisconnectIndex) == "function" then
+		pcall(shared.DisconnectIndex)
+	end
+end
+
 _G.Celestial.GameDetectionThread = task.spawn(function()
 	local detectedMode = nil
-	while true do
-		local elapsed = tick() - scanStartTime
-		if elapsed >= minScanTime then
-			detectedMode = ScanGameMode()
-			if detectedMode then break end
-		end
-		if elapsed >= maxScanTime then
-			detectedMode = detectedMode or "DUELS"
-			break
-		end
-		task.wait(0.25)
+	local detectionDone = false
+	local detectionOk = false
+	local detectionError = nil
+	local detectionDeadline = scanStartTime + maxScanTime
+
+	-- Preserve the original minimum loader duration. Run the yielding full scan separately so
+	-- the deadline can still be checked while ScanSpiderEvidence yields through large maps.
+	local waitForMinimum = minScanTime - (tick() - scanStartTime)
+	if waitForMinimum > 0 then task.wait(waitForMinimum) end
+
+	local scannerThread = task.spawn(function()
+		local ok, result = pcall(ScanGameMode)
+		detectionOk = ok
+		if ok then detectedMode = result else detectionError = result end
+		detectionDone = true
+	end)
+
+	while not detectionDone and tick() < detectionDeadline do
+		task.wait(0.05)
 	end
+
+	if not detectionDone then
+		pcall(function() task.cancel(scannerThread) end)
+		CleanupPartialStartupSpiderIndex()
+		detectedMode = DetectFastStartupModeFallback()
+		warn("[Celestial] Full game detection exceeded the startup deadline; using fast fallback mode.")
+	elseif not detectionOk then
+		CleanupPartialStartupSpiderIndex()
+		warn("[Celestial] Full game detection failed; using fast fallback mode: " .. tostring(detectionError))
+		detectedMode = DetectFastStartupModeFallback()
+	elseif not detectedMode then
+		detectedMode = DetectFastStartupModeFallback()
+	end
+	if not detectedMode then detectedMode = "DUELS" end
+
 	_G.Celestial.GameMode = detectedMode
 	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
 	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
@@ -12760,8 +12809,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				if _G.Celestial.SpiderESPCleanup then pcall(_G.Celestial.SpiderESPCleanup) end
 			end
 			task.wait(1)
-			local newMode = ScanGameMode()
-			if newMode then
+			local okMode, newMode = pcall(ScanGameMode)
+			if okMode and newMode then
 				_G.Celestial.GameMode = newMode
 				print("✨ CELESTIAL FRAMEWORK: Re-detected game mode after teleport -> " .. tostring(newMode))
 			end
