@@ -1,7 +1,7 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
--- V3.27: bounded decision cost, fast target prefetch, two-tier local detours, and time-bounded selective coin-route NoClip.
+-- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
 -- V3.25: confirms an actually clear exit position before restoring collisions and centralizes the chain-acceleration factor.
 -- V3.24: bounded multi-offset obstacle routing, route hysteresis, and directed exit-solid recovery aim.
 -- Chain acceleration uses one shared 1.25 multiplier for both controller limits; the speed cap remains unchanged.
@@ -6185,6 +6185,24 @@ local CoinEngine = {
 	NoclipExitLastStartPosition = nil,
 	NoclipExitLastTryAt = 0,
 	NoclipExitAttempts = 0,
+	-- Supervisión coordinada de vuelo/NoClip: solo pertenece al controlador de navegación existente.
+	AirborneRecoveryLimit = 2.0,
+	AirborneSupportDistance = 3.20,
+	AirborneProbeInterval = 0.08,
+	AirborneLookDownDistance = 100,
+	AirborneSince = nil,
+	AirRecoveryActive = false,
+	AirRecoveryDestination = nil,
+	AirRecoveryDestinationAt = 0,
+	AirRecoveryDestinationTarget = nil,
+	AirRecoveryDestinationStart = nil,
+	AirRecoveryReason = nil,
+	AirRecoveryNextProbeAt = 0,
+	AirRecoveryLastSupported = false,
+	NoclipPhysicalStartedAt = nil,
+	AutoNoclipHardLimit = 3.0,
+	AutoNoclipExitLeadTime = 0.70,
+	NoclipHardLimitLogged = false,
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
@@ -6294,6 +6312,14 @@ local function StopFlight()
 	CoinEngine.AutoNoclipMode = nil
 	CoinEngine.AutoNoclipTarget = nil
 	CoinEngine.AutoNoclipStartPosition = nil
+	CoinEngine.AirborneSince = nil
+	CoinEngine.AirRecoveryActive = false
+	CoinEngine.AirRecoveryDestination = nil
+	CoinEngine.AirRecoveryDestinationAt = 0
+	CoinEngine.AirRecoveryDestinationTarget = nil
+	CoinEngine.AirRecoveryDestinationStart = nil
+	CoinEngine.AirRecoveryReason = nil
+	CoinEngine.AirRecoveryNextProbeAt = 0
 end
 
 local function EnsureFlight(root, hum)
@@ -6781,6 +6807,8 @@ local function RestoreCollisions()
 	end
 	table.clear(origCollide)
 	noclipOn = false
+	CoinEngine.NoclipPhysicalStartedAt = nil
+	CoinEngine.NoclipHardLimitLogged = false
 	ClearNoclipPartCache()
 	-- Never let a temporary exit waypoint survive a collision-state restoration.
 	CoinEngine.NoclipExitDestination = nil
@@ -6802,6 +6830,12 @@ local function NoclipStep()
 		if not char then
 			if noclipOn then RestoreCollisions() end
 			return
+		end
+		if not noclipOn then
+			-- Start once per continuous physical NoClip session; changing coin-route/exit-solid modes
+			-- must not restart the 3-second safety clock.
+			CoinEngine.NoclipPhysicalStartedAt = os.clock()
+			CoinEngine.NoclipHardLimitLogged = false
 		end
 		EnsureNoclipPartCache(char)
 		for i = 1, #noclipParts do
@@ -7169,7 +7203,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.27 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.28 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7356,7 +7390,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.27 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.28 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -8139,7 +8173,7 @@ local function HasClearCoinRoute(fromPos, coin)
 	local coinPosition = coin.Position
 	local cached = CoinEngine.RouteCheckCache[coin]
 	-- Cache corta: reusa el barrido solo si raiz y moneda apenas se han movido.
-	if cached and now - cached.at <= 0.04
+	if cached and now - cached.at <= 0.12
 		and (fromPos - cached.fromPos).Magnitude <= 1.0
 		and (coinPosition - cached.targetPos).Magnitude <= 0.15 then
 		return cached.clear, cached.hit
@@ -9031,6 +9065,7 @@ local obstacleClusterParams = OverlapParams.new()
 obstacleClusterParams.FilterType = Enum.RaycastFilterType.Exclude
 obstacleClusterParams.RespectCanCollide = true
 obstacleClusterParams.MaxParts = 48
+local obstacleClusterCache = {part = nil, center = nil, at = 0, parts = nil}
 
 local function ProjectedHalfExtent(part, axis)
 	local cf, size = part.CFrame, part.Size
@@ -9047,10 +9082,27 @@ local function GetObstacleClusterEnvelope(root, coin, hit, fromPos, direction, s
 	local maxSide = mainSide + ProjectedHalfExtent(mainPart, side)
 	local clusterCenter = hit.Position or mainPart.Position
 	local ignore = BuildCoinRouteIgnore(coin)
-	obstacleClusterParams.FilterDescendantsInstances = ignore
-	local ok, nearbyParts = pcall(function()
-		return Workspace:GetPartBoundsInBox(CFrame.new(clusterCenter), Vector3.new(16, 8, 16), obstacleClusterParams)
-	end)
+	local clusterNow = os.clock()
+	local cache = obstacleClusterCache
+	local ok, nearbyParts
+	if cache.part == mainPart and cache.center and cache.parts
+		and clusterNow - (cache.at or 0) <= 0.20
+		and (clusterCenter - cache.center).Magnitude <= 1.75 then
+		-- Reuse only the part list; projected bounds are recalculated from current CFrames below.
+		-- The short TTL and center check avoid a global/static-map assumption.
+		ok, nearbyParts = true, cache.parts
+	else
+		obstacleClusterParams.FilterDescendantsInstances = ignore
+		ok, nearbyParts = pcall(function()
+			return Workspace:GetPartBoundsInBox(CFrame.new(clusterCenter), Vector3.new(16, 8, 16), obstacleClusterParams)
+		end)
+		if ok and nearbyParts then
+			obstacleClusterCache.part = mainPart
+			obstacleClusterCache.center = clusterCenter
+			obstacleClusterCache.at = clusterNow
+			obstacleClusterCache.parts = nearbyParts
+		end
+	end
 	if ok and nearbyParts then
 		local processed = 0
 		for _, obstacle in ipairs(nearbyParts) do
@@ -9095,9 +9147,42 @@ local function FindLocalRouteDetour(root, destination, coin, hit)
 	local side = Vector3.new(-direction.Z, 0, direction.X)
 	local bodyRadius = math.max(root.Size.X, root.Size.Z) * 0.62 + 0.65
 	local hitAlong = math.max(0, tonumber(hit.Distance) or math.min(horizontal.Magnitude * 0.30, 6))
+	local clearance = bodyRadius + 1.35
+	local directCost = delta.Magnitude
+	local targetGap = (destination - fromPos).Magnitude
+	local verticalCoinApproach = delta.Y < -2.0 and horizontal.Magnitude <= 4.5
+	if CoinEngine.AutoNoclipCoinRouteEnabled ~= false and not verticalCoinApproach
+		and targetGap <= (tonumber(CoinEngine.AutoNoclipCoinMaxDistance) or 48) then
+		-- Cheapest plausible bypass using the first hit only. If even this lower-cost estimate is
+		-- clearly excessive, skip the costly cluster query and hand off to the existing NoClip decision.
+		local partAlong = ProjectedHalfExtent(part, direction)
+		local partSide = ProjectedHalfExtent(part, side)
+		local quickApproach = math.max(0, hitAlong - partAlong - clearance)
+		local quickBypass = math.min(horizontal.Magnitude - 0.75, hitAlong + partAlong + clearance)
+		if quickBypass <= quickApproach + 0.75 then
+			quickApproach = math.max(0, math.min(hitAlong - clearance, horizontal.Magnitude * 0.22))
+			quickBypass = math.min(horizontal.Magnitude - 0.55, math.max(hitAlong + clearance, hitAlong + partAlong + clearance))
+		end
+		local quickOffset = math.clamp(partSide + bodyRadius + 1.25, 3.0, 22.0)
+		if quickBypass > quickApproach + 0.55 then
+			local aT = math.clamp(quickApproach / math.max(horizontal.Magnitude, 0.1), 0, 1)
+			local bT = math.clamp(quickBypass / math.max(horizontal.Magnitude, 0.1), 0, 1)
+			local quickA = fromPos + direction * quickApproach - side * quickOffset
+			local quickB = fromPos + direction * quickBypass - side * quickOffset
+			quickA = Vector3.new(quickA.X, fromPos.Y + delta.Y * aT, quickA.Z)
+			quickB = Vector3.new(quickB.X, fromPos.Y + delta.Y * bT, quickB.Z)
+			local estimatedMinimum = (quickA - fromPos).Magnitude + (quickB - quickA).Magnitude + (destination - quickB).Magnitude
+			local excessMinimum = estimatedMinimum - directCost
+			if estimatedMinimum >= directCost * 1.42 and excessMinimum >= math.max(6.0, directCost * 0.38) then
+				routeNavigation.noDetourPreferNoclip = true
+				LogEvent(string.format("route-detour-fast-cost-prefer-noclip direct=%.1f estimate=%.1f excess=%.1f target=%s",
+					directCost, estimatedMinimum, excessMinimum, coin and tostring(coin.Name) or "none"))
+				return nil
+			end
+		end
+	end
 	local clusterMinAlong, clusterMaxAlong, clusterMinSide, clusterMaxSide = GetObstacleClusterEnvelope(
 		root, coin, hit, fromPos, direction, side, part)
-	local clearance = bodyRadius + 1.35
 	local approachAlong = math.max(0, clusterMinAlong - clearance)
 	local bypassAlong = math.min(horizontal.Magnitude - 0.75, clusterMaxAlong + clearance)
 	if bypassAlong <= approachAlong + 0.75 then
@@ -9108,13 +9193,8 @@ local function FindLocalRouteDetour(root, destination, coin, hit)
 
 	local sideExtent = math.max(math.abs(clusterMinSide), math.abs(clusterMaxSide))
 	local baseOffset = math.clamp(sideExtent + bodyRadius + 1.25, 3.0, 22.0)
-	-- Decision quirurgica por coste: antes de ejecutar hasta ocho variantes con tres barridos
-	-- cada una, estima el rodeo corto. Solo prefiere el NoClip ya existente cuando la desviacion
-	-- estimada es claramente desproporcionada, la moneda esta dentro del radio permitido y no se
-	-- trata del descenso vertical dedicado (que conserva sus reglas de seguridad).
-	local directCost = delta.Magnitude
-	local targetGap = (destination - fromPos).Magnitude
-	local verticalCoinApproach = delta.Y < -2.0 and horizontal.Magnitude <= 4.5
+	-- Refinar la decisión con la envolvente del conjunto de piezas solo si la estimación rápida
+	-- no justificó NoClip; se conservan los mismos umbrales y la misma validación de rutas.
 	if CoinEngine.AutoNoclipCoinRouteEnabled ~= false and not verticalCoinApproach
 		and targetGap <= (tonumber(CoinEngine.AutoNoclipCoinMaxDistance) or 48) then
 		local sign = -1
@@ -9387,6 +9467,148 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	return destination, false
 end
 
+-- Recuperación aérea integrada en el mismo Heartbeat del AutoFarm (no crea otro controlador).
+-- Un rayo de soporte corto evita clasificar como "en el aire" el vuelo horizontal a altura normal
+-- sobre un piso. Al superar 2 s sin superficie cercana se elige primero una moneda debajo y después
+-- la superficie colisionable más cercana; no se fuerza un CFrame ni se desciende a ciegas.
+local airSupportParams = RaycastParams.new()
+airSupportParams.FilterType = Enum.RaycastFilterType.Exclude
+airSupportParams.RespectCanCollide = true
+local airLandingParams = RaycastParams.new()
+airLandingParams.FilterType = Enum.RaycastFilterType.Exclude
+airLandingParams.RespectCanCollide = true
+local function AirRecoveryIgnore(coin)
+	local ignore = {}
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	local container = FindCoinContainer()
+	if container then ignore[#ignore + 1] = container end
+	if coin then ignore[#ignore + 1] = coin end
+	return ignore
+end
+
+local function UpdateAirborneRecoveryState(root, now)
+	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive then
+		CoinEngine.AirborneSince = nil
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		return false
+	end
+	if now < (CoinEngine.AirRecoveryNextProbeAt or 0) then
+		return CoinEngine.AirRecoveryActive == true
+	end
+	CoinEngine.AirRecoveryNextProbeAt = now + (tonumber(CoinEngine.AirborneProbeInterval) or 0.08)
+	airSupportParams.FilterDescendantsInstances = AirRecoveryIgnore(nil)
+	local supportHit
+	local supportDistance = math.clamp(tonumber(CoinEngine.AirborneSupportDistance) or 3.20, 2.2, 3.6)
+	local ok = pcall(function()
+		supportHit = Workspace:Raycast(root.Position, Vector3.new(0, -supportDistance, 0), airSupportParams)
+	end)
+	-- A broad 4.75-stud probe falsely called low hovering "landed". Keep the support test close
+	-- to the avatar's standing envelope so a character several studs above the floor keeps its timer.
+	local supported = ok and supportHit ~= nil and supportHit.Normal.Y >= 0.55
+	CoinEngine.AirRecoveryLastSupported = supported == true
+	if supported then
+		if CoinEngine.AirRecoveryActive then
+			LogEvent(string.format("air-recovery-landed elapsed=%.2f reason=%s",
+				math.max(0, now - (CoinEngine.AirborneSince or now)), tostring(CoinEngine.AirRecoveryReason or "surface")))
+		end
+		CoinEngine.AirborneSince = nil
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		return false
+	end
+	CoinEngine.AirborneSince = CoinEngine.AirborneSince or now
+	local airborneFor = now - CoinEngine.AirborneSince
+	if airborneFor >= (tonumber(CoinEngine.AirborneRecoveryLimit) or 2.0) and not CoinEngine.AirRecoveryActive then
+		CoinEngine.AirRecoveryActive = true
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = root.Position
+		CoinEngine.AirRecoveryReason = "airborne-limit"
+		LogEvent(string.format("air-recovery-start airborne=%.2f target=%s", airborneFor,
+			CoinEngine.CurrentTarget and tostring(CoinEngine.CurrentTarget.Name) or "none"))
+	end
+	return CoinEngine.AirRecoveryActive == true
+end
+
+local function GetAirRecoveryDestination(root, target, now)
+	if not root then return nil, "no-root" end
+	local cached = CoinEngine.AirRecoveryDestination
+	local cachedAge = now - (CoinEngine.AirRecoveryDestinationAt or 0)
+	local cachedStart = CoinEngine.AirRecoveryDestinationStart
+	local cachedStartMoved = cachedStart and (root.Position - cachedStart).Magnitude or 0
+	local cacheTargetMatches = CoinEngine.AirRecoveryDestinationTarget == target
+	if cached and cachedAge <= 0.35 and cachedStartMoved <= 8.0
+		and (cacheTargetMatches or CoinEngine.AirRecoveryDestinationTarget == nil)
+		and (cached - root.Position).Magnitude > 1.25 then
+		return cached, CoinEngine.AirRecoveryReason or "cached-surface"
+	end
+
+	-- Caso prioritario: moneda por debajo y sin bloqueo real del volumen del personaje.
+	if target and target.Parent and IsAvailable(target, now) then
+		local contactHeight = math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15)
+		local coinAim = target.Position + Vector3.new(0, contactHeight, 0)
+		local delta = coinAim - root.Position
+		local horizontalGap = Vector3.new(delta.X, 0, delta.Z).Magnitude
+		if delta.Y < -1.0 and horizontalGap <= 4.5 then
+			local clear = HasClearCharacterPath(root.Position, coinAim, BuildCoinRouteIgnore(target), root, routeRayParams)
+			if clear and IsSafeCoinPosition(coinAim) then
+				CoinEngine.AirRecoveryDestination = coinAim
+				CoinEngine.AirRecoveryDestinationAt = now
+				CoinEngine.AirRecoveryDestinationTarget = target
+				CoinEngine.AirRecoveryDestinationStart = root.Position
+				CoinEngine.AirRecoveryReason = "coin-below-clear"
+				LogEvent(string.format("air-recovery-aim reason=coin-below gap=%.1f", delta.Magnitude))
+				return coinAim, "coin-below-clear"
+			end
+		end
+	end
+
+	-- Un único rayo descendente encuentra la superficie colisionable más próxima; el punto de
+	-- llegada queda por encima del volumen aproximado del avatar y se valida con el sweep normal.
+	airLandingParams.FilterDescendantsInstances = AirRecoveryIgnore(target)
+	local groundHit
+	local castOk = pcall(function()
+		groundHit = Workspace:Raycast(root.Position, Vector3.new(0, -(tonumber(CoinEngine.AirborneLookDownDistance) or 100), 0), airLandingParams)
+	end)
+	if castOk and groundHit and groundHit.Normal.Y >= 0.55 then
+		local sweepSize = GetCharacterSweepSize(root)
+		local landing = groundHit.Position + Vector3.new(0, sweepSize.Y * 0.5 + 0.35, 0)
+		local ignore = AirRecoveryIgnore(target)
+		local clear = IsSafeCoinPosition(landing) and not IsInsideSolid(landing)
+		if clear then clear = HasClearCharacterPath(root.Position, landing, ignore, root, routeRayParams) end
+		if clear then
+			CoinEngine.AirRecoveryDestination = landing
+			CoinEngine.AirRecoveryDestinationAt = now
+			CoinEngine.AirRecoveryDestinationTarget = nil
+			CoinEngine.AirRecoveryDestinationStart = root.Position
+			CoinEngine.AirRecoveryReason = "nearest-walkable-surface"
+			LogEvent(string.format("air-recovery-aim reason=nearest-surface drop=%.1f", root.Position.Y - landing.Y))
+			return landing, "nearest-walkable-surface"
+		end
+	end
+	-- Si no hay superficie demostrablemente viable, no inventar una posición ni atravesar suelo a ciegas.
+	CoinEngine.AirRecoveryDestination = nil
+	CoinEngine.AirRecoveryDestinationAt = now
+	CoinEngine.AirRecoveryDestinationTarget = nil
+	CoinEngine.AirRecoveryDestinationStart = root.Position
+	CoinEngine.AirRecoveryReason = "no-safe-landing-found"
+	if now >= (CoinEngine.AirRecoveryNextNoSurfaceLogAt or 0) then
+		CoinEngine.AirRecoveryNextNoSurfaceLogAt = now + 0.50
+		LogEvent("air-recovery-no-safe-landing;hold-position-and-reprobe")
+	end
+	return nil, "no-safe-landing-found"
+end
+
 -- Temporary crossing may begin immediately after preflight proves that direct travel is
 -- blocked and no short, geometrically validated detour is available. If its time/progress budget
 -- expires while overlapping a solid, exit safely first, then blacklist/reroute the same coin rather
@@ -9412,6 +9634,10 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	-- during an active recovery, emergency escape, or a stall that has already been confirmed.
 	local stalledFor = math.max(0, now - (lastProgress or now))
 	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22
+	local noclipSessionAge = noclipOn and CoinEngine.NoclipPhysicalStartedAt
+		and math.max(0, now - CoinEngine.NoclipPhysicalStartedAt) or 0
+	local noclipHardLimit = tonumber(CoinEngine.AutoNoclipHardLimit) or 3.0
+	local exitLeadTime = math.clamp(tonumber(CoinEngine.AutoNoclipExitLeadTime) or 0.70, 0.25, 1.0)
 
 	local function RerouteBlockedCoin(blockedTarget, reason)
 		CoinEngine.NoclipRerouteAfterExit = false
@@ -9446,6 +9672,58 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			blockedTarget and tostring(blockedTarget.Name) or "none",
 			replacement and tostring(replacement.Name) or "none"))
 		return CoinEngine.CurrentTarget
+	end
+
+	-- Si ya pasó el margen de cruce, tomar la decisión de salida antes de alcanzar los 3 s.
+	-- El reloj pertenece a la sesión física y no se reinicia al cambiar de coin-route a exit-solid.
+	if noclipOn and not State.NoClipActive and noclipSessionAge >= (noclipHardLimit - exitLeadTime)
+		and CoinEngine.AutoNoclipMode ~= "exit-solid"
+		and not (threat.Active and threat.EmergencyEscape) then
+		local insideNow = IsInsideSolid(root.Position)
+		if insideNow then
+			local oldMode = CoinEngine.AutoNoclipMode
+			local oldTarget = target or CoinEngine.AutoNoclipTarget or CoinEngine.CurrentTarget
+			CoinEngine.NoclipRerouteAfterExit = oldMode == "coin-route" and oldTarget ~= nil
+			CoinEngine.NoclipRerouteReason = CoinEngine.NoclipRerouteAfterExit and "noclip-three-second-exit" or nil
+			CoinEngine.NoclipRerouteTarget = CoinEngine.NoclipRerouteAfterExit and oldTarget or nil
+			CoinEngine.AutoNoclipMode = "exit-solid"
+			CoinEngine.AutoNoclipTarget = oldTarget
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipExitDestination = nil
+			CoinEngine.NoclipWanted = true
+			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
+			LogEvent(string.format("auto-noclip hard-limit-exit elapsed=%.2f limit=%.2f prior=%s",
+				noclipSessionAge, noclipHardLimit, tostring(oldMode or "none")))
+		else
+			CoinEngine.AutoNoclipMode = nil
+			CoinEngine.AutoNoclipTarget = nil
+			CoinEngine.AutoNoclipStartPosition = nil
+			CoinEngine.NoclipWanted = false
+			LogEvent(string.format("auto-noclip hard-limit-stop elapsed=%.2f reason=outside-solid", noclipSessionAge))
+		end
+	end
+
+	-- Un aterrizaje forzado no puede quedar en conflicto con coin-route: si está dentro de un
+	-- sólido, solo el mismo controlador continúa la salida local; si ya está fuera, detiene NoClip.
+	if CoinEngine.AirRecoveryActive and CoinEngine.AutoNoclipMode == "coin-route"
+		and not (threat.Active and threat.EmergencyEscape) then
+		local insideNow = IsInsideSolid(root.Position)
+		if insideNow then
+			CoinEngine.NoclipRerouteAfterExit = false
+			CoinEngine.NoclipRerouteReason = nil
+			CoinEngine.NoclipRerouteTarget = nil
+			CoinEngine.AutoNoclipMode = "exit-solid"
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipExitDestination = nil
+			CoinEngine.NoclipWanted = true
+			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
+			LogEvent("air-recovery-priority-after-noclip-exit")
+		else
+			CoinEngine.AutoNoclipMode = nil
+			CoinEngine.AutoNoclipTarget = nil
+			CoinEngine.AutoNoclipStartPosition = nil
+			CoinEngine.NoclipWanted = false
+		end
 	end
 
 	-- Escape has movement priority. The escape planner tests the complete character
@@ -9536,11 +9814,18 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			end
 			local recoveryAge = now - (CoinEngine.AutoNoclipStartedAt or now)
 			if recoveryAge >= (tonumber(CoinEngine.NoclipExitSolidMaxTime) or 1.10) then
-				CoinEngine.AutoNoclipMode = nil
-				CoinEngine.AutoNoclipTarget = nil
-				CoinEngine.NoclipWanted = false
-				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-				LogEvent(string.format("auto-noclip abort reason=escape-exit-timeout elapsed=%.2f", recoveryAge))
+				-- Durante escape tambien se conserva la prioridad de salir del sólido; la colisión
+				-- solo se restaura cuando una comprobación confirma que el volumen ya está libre.
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.NoclipExitDestination = nil
+				CoinEngine.NoclipExitDestinationAt = 0
+				CoinEngine.NoclipWanted = true
+				if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
+					CoinEngine.NoclipHardLimitLogged = true
+					LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
+				else
+					LogEvent(string.format("auto-noclip escape-exit-replan elapsed=%.2f session=%.2f", recoveryAge, noclipSessionAge))
+				end
 			else
 				CoinEngine.NoclipWanted = true
 			end
@@ -9612,26 +9897,44 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			CoinEngine.NoclipExitStartPosition = nil
 			LogEvent("auto-noclip exit-aim-rejected reason=still-overlapping;replan=1")
 			if elapsed >= (tonumber(CoinEngine.NoclipExitSolidMaxTime) or 1.10) then
-				CoinEngine.AutoNoclipMode = nil
-				CoinEngine.AutoNoclipTarget = nil
-				CoinEngine.NoclipWanted = false
-				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-				ResetRouteNavigation(CoinEngine.CurrentTarget, now)
-				LogEvent(string.format("auto-noclip abort reason=exit-solid-timeout elapsed=%.2f", elapsed))
+				-- El punto no consiguió liberar todo el volumen; mantener el NoClip solo para volver
+				-- a buscar una salida local. No restaurar colisión mientras el cuerpo sigue solapado.
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.NoclipWanted = true
+				if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
+					CoinEngine.NoclipHardLimitLogged = true
+					LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
+				else
+					LogEvent(string.format("auto-noclip exit-solid-replan-near-waypoint elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
+				end
 			else
 				CoinEngine.NoclipWanted = true
 			end
 			return target
 		elseif elapsed >= (tonumber(CoinEngine.NoclipExitSolidMaxTime) or 1.10) then
-			CoinEngine.AutoNoclipMode = nil
-			CoinEngine.AutoNoclipTarget = nil
-			CoinEngine.NoclipWanted = false
-			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
-			LogEvent(string.format("auto-noclip abort reason=exit-solid-timeout elapsed=%.2f", elapsed))
+			-- No restaurar colisiones mientras el volumen del personaje siga dentro de la pared.
+			-- Se invalida el punto fallido y se vuelve a elegir una salida local; el reloj físico global
+			-- no se reinicia, y no se permite volver a coin-route hasta confirmar espacio libre.
+			CoinEngine.NoclipExitDestination = nil
+			CoinEngine.NoclipExitDestinationAt = 0
+			CoinEngine.NoclipExitStartPosition = nil
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipWanted = true
+			if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
+				CoinEngine.NoclipHardLimitLogged = true
+				LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
+			else
+				LogEvent(string.format("auto-noclip exit-solid-replan elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
+			end
 		else
 			CoinEngine.NoclipWanted = true
 		end
+		return target
+	end
+
+	if CoinEngine.AirRecoveryActive then
+		-- Tras salir de un sólido, el movimiento pertenece al descenso y no al objetivo horizontal.
+		CoinEngine.NoclipWanted = false
 		return target
 	end
 
@@ -9687,7 +9990,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	-- Cuando un bloqueo no admite un desvio local validado, se permite un cruce NoClip
 	-- corto SOLO para una moneda cercana. La duracion y distancia estan acotadas; si no progresa,
 	-- se restaura colision en espacio libre o se pasa al recuperador de salida-solido.
-	if routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
+	if not CoinEngine.AirRecoveryActive and routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
 		and IsValidCoin(target) and routeNavigation.directPathBlocked then
 		local preferNoClipForCost = routeNavigation.noDetourPreferNoclip == true
 		routeNavigation.noDetourPreferNoclip = false
@@ -9748,7 +10051,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	-- Unexpected obstruction fallback: once the active command and progress samples confirm
 	-- a stall, the 0.14 s timer plus 40 ms sampling keeps typical detection around 0.2-0.25 s.
 	-- A single blocked ray does not trigger this fallback while the character is progressing.
-	if target and target.Parent and IsValidCoin(target)
+	if not CoinEngine.AirRecoveryActive and target and target.Parent and IsValidCoin(target)
 		and (target.Position - root.Position).Magnitude > 0.1
 		and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
 		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
@@ -9883,6 +10186,54 @@ local function UpdateRound(now)
 			CoinEngine.CleanupRoundCaches()
 		end
 	end
+end
+
+-- When no coin target exists, the same Heartbeat controller still completes a local exit
+-- or an airborne recovery. It never creates a second mover and never teleports the character.
+local function DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
+	if State.NoClipActive or State.FlyActive or State.FlingActive then return false end
+	local exitRecovery = CoinEngine.NoclipWanted and CoinEngine.AutoNoclipMode == "exit-solid"
+	local restoreHold = noclipOn and not CoinEngine.NoclipWanted and CoinEngine.AutoNoclipMode == nil
+	local airRecovery = CoinEngine.AirRecoveryActive and not exitRecovery
+		and not CoinEngine.NoclipWanted and not noclipOn
+	if not exitRecovery and not restoreHold and not airRecovery then return false end
+
+	EnsureFlight(root, hum)
+	local aim
+	if exitRecovery then
+		aim = EnsureNoclipExitDestination(root, nil, now)
+	elseif airRecovery then
+		aim = GetAirRecoveryDestination(root, nil, now)
+	else
+		aim = root.Position -- one collision-restoration frame; the physical NoClip step restores saved flags
+	end
+
+	local delta = aim and (aim - root.Position) or Vector3.zero
+	local gap = delta.Magnitude
+	if not aim or gap <= 0.85 then
+		CoinEngine.LastCommandVelocity = Vector3.zero
+		if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+		lastFlightV = 0
+		velApplied = true
+		return true
+	end
+
+	-- Brake against the local landing/exit point, not the distance to a potentially distant coin.
+	local acceleration = math.max(1, tonumber(CoinEngine.MaxAcceleration) or 40)
+	-- An empty/no-safe-coin branch can have reset currentSpeed to zero. Recovery gets a temporary
+	-- local cap (not a change to the cruise slider) so it can still reach a verified landing/exit.
+	local configuredSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80)
+	local recoveryCap = currentSpeed > 1 and currentSpeed or math.min(configuredSpeed, 24)
+	local speed = math.min(recoveryCap, math.sqrt(2 * acceleration * math.max(0, gap - 0.75)))
+	if gap > 2.5 then speed = math.max(speed, math.min(recoveryCap, tonumber(CoinEngine.FlightMinSpeed) or 6)) end
+	ApplyStableFlightVelocity(delta.Unit, speed, dt)
+	lastFlightV = speed
+	velApplied = true
+	local horizontal = Vector3.new(delta.X, 0, delta.Z)
+	if horizontal.Magnitude > 0.05 and flightGyro then
+		pcall(function() flightGyro.CFrame = CFrame.lookAt(root.Position, root.Position + horizontal.Unit) end)
+	end
+	return true
 end
 
 -- ---------------------------------------------------------------
@@ -10053,6 +10404,10 @@ local function ControllerStep(dt)
 			LogEvent("murder-threat-response released normal-routing=1")
 		end
 	end
+
+	-- Track air time before pause/position-reconciliation early returns. Emergency escape still owns
+	-- the movement branch below, but landing recovery is already armed for when escape ends.
+	UpdateAirborneRecoveryState(root, now)
 	-- Emergency escape invalidates any earlier round/hitch hold: threat priority must not
 	-- wait for a stale farm pause to expire before issuing the evasive route.
 	if CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active then
@@ -10075,9 +10430,10 @@ local function ControllerStep(dt)
 	end
 	lastSetPos = root.Position            -- ultima posicion observada (ya no se escribe el CFrame)
 
-	if now < pauseUntil and not (CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active) then
+	if now < pauseUntil and not (CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active)
+		and not CoinEngine.AirRecoveryActive then
 		if batchPausing then SetStatus("batch-pause") end
-		return                            -- SafeControllerStep deja la velocidad en 0: flota quieto en el sitio
+		return                            -- las pausas normales no bloquean una recuperación aérea ya activada
 	end
 	if batchPausing then
 		batchPausing = false
@@ -10177,12 +10533,17 @@ local function ControllerStep(dt)
 		end
 	end
 
+	-- Supervisar el tiempo en el aire incluso si no hay monedas seleccionables. La huida de
+	-- emergencia ya tuvo prioridad y retorno arriba; no se crea un controlador adicional.
+
 	if CoinEngine.CoinCount == 0 then
 		UpdateAutoNoclip(root, nil, now)
-		return -- espera hasta que se registre alguna moneda
+		DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
+		return -- espera hasta que se registre alguna moneda, sin abandonar una recuperación local
 	end
 	if not CoinEngine.CurrentTarget and now < noTargetUntil then
 		UpdateAutoNoclip(root, nil, now)
+		DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
 		return
 	end
 
@@ -10201,6 +10562,7 @@ local function ControllerStep(dt)
 				if flightVel then flightVel.Velocity = Vector3.zero end
 			end
 			UpdateAutoNoclip(root, nil, now)
+			DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
 			return
 		end
 	end
@@ -10216,7 +10578,7 @@ local function ControllerStep(dt)
 
 	-- Mejora de objetivo con histéresis. Se evalua con menor frecuencia y no vuelve a escanear
 	-- todo el cache mientras una ruta bloqueada/desvio sigue siendo valida.
-	if now >= nextImproveCheck then
+	if not CoinEngine.AirRecoveryActive and now >= nextImproveCheck then
 		local cur = CoinEngine.CurrentTarget
 		local activeDetour = cur and routeNavigation.target == cur
 			and (routeNavigation.index or 1) <= #(routeNavigation.points or {})
@@ -10438,7 +10800,7 @@ local function ControllerStep(dt)
 	if not target or not IsAvailable(target, now) then
 		AdvanceTarget(root, now)
 		target = CoinEngine.CurrentTarget
-		if not target then UpdateAutoNoclip(root, nil, now); return end
+		if not target then UpdateAutoNoclip(root, nil, now); DriveLocalRecoveryWithoutTarget(root, hum, now, dt); return end
 	end
 
 	-- V3.12: validar el objetivo contra la posicion ACTUAL del jugador en cada ciclo.
@@ -10454,7 +10816,7 @@ local function ControllerStep(dt)
 		SetCurrent(nil, now)
 		AdvanceTarget(root, now)
 		target = CoinEngine.CurrentTarget
-		if not target then UpdateAutoNoclip(root, nil, now); return end
+		if not target then UpdateAutoNoclip(root, nil, now); DriveLocalRecoveryWithoutTarget(root, hum, now, dt); return end
 	end
 
 	-- Filtrado mas estricto de monedas recolocadas: como las monedas normales son estaticas,
@@ -10469,11 +10831,14 @@ local function ControllerStep(dt)
 			SetCurrent(nil, now)
 			AdvanceTarget(root, now)
 			target = CoinEngine.CurrentTarget
-			if not target then UpdateAutoNoclip(root, nil, now); return end
+			if not target then UpdateAutoNoclip(root, nil, now); DriveLocalRecoveryWithoutTarget(root, hum, now, dt); return end
 		end
 	end
 	target = UpdateAutoNoclip(root, target, now)
-	if not target or not target.Parent then return end
+	if not target or not target.Parent then
+		DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
+		return
+	end
 
 	local rootPos = root.Position
 	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
@@ -10486,6 +10851,7 @@ local function ControllerStep(dt)
 	local moveAim = approachPos
 	local navigationDetour = false
 	local noclipExitMove = CoinEngine.NoclipWanted and CoinEngine.AutoNoclipMode == "exit-solid"
+	local airRecoveryMove = false
 	local collisionRestoreHold = noclipOn and not CoinEngine.NoclipWanted and CoinEngine.AutoNoclipMode == nil
 	if collisionRestoreHold then
 		moveAim = rootPos -- keep the last recovery frame stationary while the original CanCollide values are restored
@@ -10493,6 +10859,11 @@ local function ControllerStep(dt)
 	elseif noclipExitMove then
 		moveAim = EnsureNoclipExitDestination(root, target, now) or rootPos
 		navigationDetour = true -- suppress collection and coin-distance steering during the local recovery step
+	elseif CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
+		local landingAim = GetAirRecoveryDestination(root, target, now)
+		moveAim = landingAim or rootPos
+		navigationDetour = true -- the landing recovery is the sole active movement decision until support is confirmed
+		airRecoveryMove = true
 	elseif not CoinEngine.NoclipWanted and not (CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active) then
 		moveAim, navigationDetour = GetFarmNavigationAim(root, target, approachPos, now)
 	end
@@ -10668,34 +11039,44 @@ local function ControllerStep(dt)
 		-- a la moneda sigue controlando recogida/validacion, no el sentido de giro.
 		local steeringDelta = navigationDetour and moveDelta or delta
 		local steeringDist = navigationDetour and moveDist or dist
+		if (airRecoveryMove or noclipExitMove or collisionRestoreHold) and steeringDist <= 0.001 then
+			-- No hay destino local válido o se restaura colisión: no conservar un comando de movimiento obsoleto.
+			CoinEngine.LastCommandVelocity = Vector3.zero
+			if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+			lastFlightV = 0
+			velApplied = true
+		else
 		local dir = steeringDelta / math.max(steeringDist, 0.001)
 		local remaining = (navigationDetour and math.max(dist, steeringDist) or dist) - CoinEngine.StopDistance
 		local gain = Param(CoinEngine.FlightApproachGain, CoinEngine.SafeFlightApproachGain)
 		if CoinEngine.SoftBrake then gain = math.min(gain, CoinEngine.SoftBrakeGain) end
 		local v = math.min(currentSpeed, math.max(remaining, 0) * gain)
-		if noclipExitMove then
-			-- The collision-free phase is a local recovery manoeuvre, not permission to fly straight
-			-- toward the coin. Brake against the nearby exit waypoint so the character can restore collisions promptly.
-			local exitGap = math.max(0, steeringDist - 0.8)
-			v = math.min(currentSpeed, math.sqrt(2 * CoinEngine.MaxAcceleration * exitGap))
-			if steeringDist > 1.5 then v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed)) end
+		if noclipExitMove or airRecoveryMove then
+			-- La salida de sólido y el aterrizaje son maniobras locales: frenar por la distancia
+			-- a la moneda provocaba sobrepasos cuando el objetivo quedaba lejos.
+			local localGap = math.max(0, steeringDist - 0.8)
+			v = math.min(currentSpeed, math.sqrt(2 * CoinEngine.MaxAcceleration * localGap))
+			if steeringDist > 2.5 then v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed)) end
 		end
-		if CoinEngine.ChaseFix and not noclipExitMove then
+		if CoinEngine.ChaseFix and not noclipExitMove and not airRecoveryMove then
 			local lead = math.clamp(tt.vel:Dot(dir), 0, CoinEngine.ChaseMaxLead)
 			if lead > 0 then v = math.min(currentSpeed, v + lead) end
 		end
-		if navigationDetour then
+		if airRecoveryMove then
+			-- Se conserva el frenado calculado para la superficie, sin aceleración mínima hacia la moneda.
+			v = math.max(0, v)
+		elseif navigationDetour then
 			-- Coin braking does not apply during a validated side-step. A solid-exit waypoint is
 			-- the exception: its local braking calculation above must not be replaced by cruise speed.
 			if steeringDist > 1 and not noclipExitMove then
 				v = math.max(v, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 			end
-		elseif routeNavigation.target == target and routeNavigation.directPathBlocked then
+		elseif not airRecoveryMove and routeNavigation.target == target and routeNavigation.directPathBlocked then
 			-- Keep a bounded, nonzero command against a confirmed blocked route so stall detection
 			-- can recognize the obstruction; otherwise near-target braking could reduce the command
 			-- below the stall monitor's threshold and prevent the adaptive recovery from starting.
 			v = math.max(v, math.min(currentSpeed, math.max(8, CoinEngine.FlightMinSpeed)))
-		else
+		elseif not airRecoveryMove then
 			-- Coin braking belongs to the final direct approach only.
 			local brakeMargin = math.max(dist - CoinEngine.PickupDistance, 0)
 			local brakeCap = math.sqrt(2 * CoinEngine.MaxAcceleration * brakeMargin)
@@ -10713,12 +11094,13 @@ local function ControllerStep(dt)
 		if horiz.Magnitude > 0.05 and flightGyro then
 			flightGyro.CFrame = CFrame.lookAt(rootPos, rootPos + horiz)   -- de frente hacia donde vuela, siempre derecho
 		end
+		end -- steeringDist > 0 en recuperación aérea
 	end
 
 	-- El monitor sigue el waypoint validado mientras se rodea una pieza; medir solo la
 	-- distancia a la moneda penalizaba los movimientos laterales necesarios y creaba bucles.
 	local cur = CoinEngine.CurrentTarget
-	if cur then
+	if cur and not CoinEngine.AirRecoveryActive then
 		local loopAim = navigationDetour and moveAim or approachPos
 		if DetectCircularMotion(root, cur, loopAim, now) then
 			routeNavigation.loopRecoveryCount = (routeNavigation.loopRecoveryCount or 0) + 1
