@@ -1,6 +1,7 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
+-- V3.26: bounded decision cost, fast target prefetch, two-tier local detours, and time-bounded selective coin-route NoClip.
 -- V3.25: confirms an actually clear exit position before restoring collisions and centralizes the chain-acceleration factor.
 -- V3.24: bounded multi-offset obstacle routing, route hysteresis, and directed exit-solid recovery aim.
 -- Chain acceleration uses one shared 1.25 multiplier for both controller limits; the speed cap remains unchanged.
@@ -6091,9 +6092,13 @@ local CoinEngine = {
 	PingAdaptiveSpeed = false, -- V3.14: compatibilidad heredada; el ping ya no reduce la velocidad objetivo
 	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
 	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
-	NoclipWanted = false,      -- Solicitud temporal por atasco confirmado o salida de geometría
-	AutoNoclipMode = nil,      -- "exit-solid" o "escape-route"; las monedas bloqueadas primero buscan rodeo
+	NoclipWanted = false,      -- Solicitud temporal por ruta bloqueada cercana, atasco confirmado o salida de geometría
+	AutoNoclipMode = nil,      -- "coin-route" acotado, "exit-solid" de recuperación o "escape-route" de emergencia
 	AutoNoclipTarget = nil,
+	AutoNoclipStartPosition = nil,
+	AutoNoclipCoinRouteEnabled = true, -- interruptor de seguridad: false vuelve al redireccionamiento sin cruces de ruta
+	AutoNoclipCoinMaxTime = 0.90, -- NoClip de ruta solo por un tramo local; después se valida/restaura o recupera
+	AutoNoclipCoinMaxDistance = 60, -- no iniciar un cruce ciego hacia monedas lejanas
 	NoclipExitDestination = nil, -- punto local para salir del sólido; nunca apunta directo a la moneda
 	NoclipExitDestinationAt = 0,
 	NoclipExitStartPosition = nil,
@@ -6111,6 +6116,7 @@ local CoinEngine = {
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	RouteCheckCache = setmetatable({}, {__mode = "k"}), -- raycasts recientes por moneda; las claves no retienen instancias
+	NavigationPerf = {SelectionCount = 0, SelectionLastMs = 0, SelectionMaxMs = 0, DetourCount = 0, DetourLastMs = 0, DetourMaxMs = 0},
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
 	CollectCooldown = 4.0,      -- V3.11: evita perseguir de nuevo monedas tocadas que siguen temporalmente en el mapa
 	StuckTimeout = 0.95,       -- reevalua antes un objetivo sin progreso real
@@ -6207,6 +6213,7 @@ local function StopFlight()
 	CoinEngine.NoclipWanted = false
 	CoinEngine.AutoNoclipMode = nil
 	CoinEngine.AutoNoclipTarget = nil
+	CoinEngine.AutoNoclipStartPosition = nil
 end
 
 local function EnsureFlight(root, hum)
@@ -7076,7 +7083,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.25 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.26 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7263,7 +7270,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.25 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.26 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -8155,11 +8162,32 @@ local function EnsureNoclipExitDestination(root, target, now)
 	return nil
 end
 
+-- Instrumentacion ligera: registra picos de seleccion/desvio sin imprimir en cada Heartbeat.
+local nextNavigationPerfLogAt = 0
+local function RecordNavigationTiming(kind, startedAt, target)
+	local elapsedMs = math.max(0, (os.clock() - (startedAt or os.clock())) * 1000)
+	local perf = CoinEngine.NavigationPerf
+	if perf then
+		local prefix = kind == "detour" and "Detour" or "Selection"
+		perf[prefix .. "Count"] = (perf[prefix .. "Count"] or 0) + 1
+		perf[prefix .. "LastMs"] = elapsedMs
+		perf[prefix .. "MaxMs"] = math.max(perf[prefix .. "MaxMs"] or 0, elapsedMs)
+	end
+	local now = os.clock()
+	if elapsedMs >= 8 and now >= nextNavigationPerfLogAt then
+		nextNavigationPerfLogAt = now + 1.0
+		LogEvent(string.format("navigation-cost kind=%s ms=%.2f target=%s", kind,
+			elapsedMs, target and tostring(target.Name) or "none"))
+	end
+	return elapsedMs
+end
+
 -- Una pasada O(N) para puntuar; limita raycasts y revisa suelo sin repetir escaneos completos.
-local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
+local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
 	local candidates = {}
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
@@ -8180,30 +8208,39 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	end
 	if #candidates == 0 then return nil end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
-	local fallback, routeChecks = nil, 0
-	-- Los falsos positivos sin suelo no bloquean toda la busqueda: se omiten en la misma pasada.
-	for i = 1, math.min(32, #candidates) do
+
+	-- Puntuar todo el cache es barato; consultar suelo y geometria no. Solo se examina un
+	-- shortlist pequeño y se hace el numero de comprobaciones de ruta solicitado por el caller.
+	local fallback, routeChecks, groundChecks = nil, 0, 0
+	for i = 1, math.min(12, #candidates) do
 		local coin = candidates[i].coin
+		if groundChecks >= 8 then break end
+		groundChecks += 1
 		if IsGrounded(coin) then
-			if not fallback then fallback = coin end
-			if routeChecks < 8 then
+			fallback = fallback or coin
+			if maxRouteChecks == 0 then return fallback end -- prefetch: el controlador de ruta valida al ejecutar
+			if routeChecks < maxRouteChecks then
 				routeChecks += 1
 				if HasClearCoinRoute(fromPos, coin) then return coin end
 			end
 		else
-			CoinEngine.Blacklist[coin] = now + 2.5 -- descartado temporalmente, no durante toda la ronda
+			CoinEngine.Blacklist[coin] = now + 2.5
 		end
 	end
-	-- Si todas las rutas verificadas estan bloqueadas, el fallback deja que NoClip decida si cruzar.
+	-- El mejor candidato con suelo es preferible a bloquear el controlador buscando una ruta perfecta.
 	return fallback
 end
 
-local function PickNearest(fromPos, exclude, now)
+local function PickNearest(fromPos, exclude, now, routeCheckLimit)
+	local startedAt = os.clock()
 	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
-	local c = PickNearestRaw(fromPos, exclude, now, preferredGap)
-	if c then return c end
-	-- Solo ampliar la altura cuando no queda un candidato util en el nivel cercano.
-	return PickNearestRaw(fromPos, exclude, now, Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
+	local c = PickNearestRaw(fromPos, exclude, now, preferredGap, routeCheckLimit)
+	if not c then
+		-- Solo ampliar la altura cuando no queda un candidato util en el nivel cercano.
+		c = PickNearestRaw(fromPos, exclude, now, Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap), routeCheckLimit)
+	end
+	RecordNavigationTiming("selection", startedAt, c)
+	return c
 end
 
 -- V3.22: identify the local player's Murderer role from authoritative local script signals.
@@ -8405,18 +8442,20 @@ local function IsThreatSafeCoin(coin)
 	return not IsCoinTemporarilyExcluded(coin, os.clock())
 end
 
-local function PickThreatCoin(fromPos, exclude, now)
+local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit)
+	local startedAt = os.clock()
 	local threat = CoinEngine.ThreatResponse
 	local murderer = threat.Murderer or threat.CachedMurderer
 	local murderRoot = murderer and GetRoot(murderer)
 	if not threat.Active or not murderRoot then
-		return PickNearest(fromPos, exclude, now)
+		return PickNearest(fromPos, exclude, now, routeCheckLimit)
 	end
 
 	local murderPos = murderRoot.Position
 	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
 
 	local predictedMurderPos = murderPos
 	pcall(function()
@@ -8470,12 +8509,8 @@ local function PickThreatCoin(fromPos, exclude, now)
 					if not blacklistedUntil and IsSafeCoinPosition(coin.Position)
 						and not IsCoinTemporarilyExcluded(coin, now)
 						and verticalGap <= verticalLimit and distance <= maxDistance then
-						if IsGrounded(coin) then
-							local score, safetyGap = ScoreThreatCandidate(coin.Position)
-							candidates[#candidates + 1] = {coin = coin, score = score, safetyGap = safetyGap}
-						else
-							CoinEngine.Blacklist[coin] = now + 2.5
-						end
+						local score, safetyGap = ScoreThreatCandidate(coin.Position)
+						candidates[#candidates + 1] = {coin = coin, score = score, safetyGap = safetyGap}
 					end
 				end
 			end
@@ -8483,21 +8518,28 @@ local function PickThreatCoin(fromPos, exclude, now)
 		if #candidates == 0 then return nil end
 		table.sort(candidates, function(a, b) return a.score < b.score end)
 
-		-- Prefer a geometrically clear alternative. Check only the best-ranked few to keep
-		-- threat-aware selection responsive; if all are blocked, retain the best safe candidate
-		-- so the existing route planner/temporary recovery can handle the obstruction.
-		for i = 1, math.min(8, #candidates) do
-			local candidate = candidates[i].coin
-			if HasClearCoinRoute(fromPos, candidate) then return candidate end
+		-- Solo los candidatos mejor puntuados pagan el coste de verificar suelo y volumen del avatar.
+		local fallback, routeChecks = nil, 0
+		for i = 1, math.min(12, #candidates) do
+			local coin = candidates[i].coin
+			if IsGrounded(coin) then
+				fallback = fallback or coin
+				if maxRouteChecks == 0 then return fallback end
+				if routeChecks < maxRouteChecks then
+					routeChecks += 1
+					if HasClearCoinRoute(fromPos, coin) then return coin end
+				end
+			else
+				CoinEngine.Blacklist[coin] = now + 2.5
+			end
 		end
-		return candidates[1].coin
+		return fallback
 	end
 
-	-- Never fall back to coins inside the Murderer's temporary danger zone. If every candidate
-	-- is dangerous, return nil: the caller keeps the escape/hold priority instead of oscillating.
 	local candidate = FindCandidate(preferredGap)
-	if candidate then return candidate end
-	return FindCandidate(maxGap)
+	if not candidate then candidate = FindCandidate(maxGap) end
+	RecordNavigationTiming("selection", startedAt, candidate)
+	return candidate
 end
 
 local function UpdateThreatResponse(root, now)
@@ -8741,14 +8783,14 @@ local function PrepareNext(now)
 	if not cur or not cur.Parent then CoinEngine.NextTarget = nil; return end
 	local nxt
 	if CoinEngine.ThreatResponse.Active then
-		nxt = PickThreatCoin(cur.Position, cur, now)
+		nxt = PickThreatCoin(cur.Position, cur, now, 0)
 	else
-		nxt = PickNearest(cur.Position, cur, now)
+		nxt = PickNearest(cur.Position, cur, now, 0)
 	end
 	CoinEngine.NextTarget = nxt
-	-- Keep a warm alternative refreshed during travel. A prefetched coin can be collected
-	-- by another player, so never freeze candidate preparation at math.huge.
-	nextPrepareAt = now + (nxt and 0.12 or 0.06)
+	-- Prefetch puntua y valida suelo, pero no paga barridos de ruta: la ruta se comprueba
+	-- cuando la moneda pasa a ser el objetivo activo. Reduce trabajo duplicado entre Heartbeats.
+	nextPrepareAt = now + (nxt and 0.30 or 0.12)
 end
 
 local function SetCurrent(coin, now)
@@ -8837,7 +8879,7 @@ end
 local obstacleClusterParams = OverlapParams.new()
 obstacleClusterParams.FilterType = Enum.RaycastFilterType.Exclude
 obstacleClusterParams.RespectCanCollide = true
-obstacleClusterParams.MaxParts = 96
+obstacleClusterParams.MaxParts = 48
 
 local function ProjectedHalfExtent(part, axis)
 	local cf, size = part.CFrame, part.Size
@@ -8856,7 +8898,7 @@ local function GetObstacleClusterEnvelope(root, coin, hit, fromPos, direction, s
 	local ignore = BuildCoinRouteIgnore(coin)
 	obstacleClusterParams.FilterDescendantsInstances = ignore
 	local ok, nearbyParts = pcall(function()
-		return Workspace:GetPartBoundsInBox(CFrame.new(clusterCenter), Vector3.new(20, 10, 20), obstacleClusterParams)
+		return Workspace:GetPartBoundsInBox(CFrame.new(clusterCenter), Vector3.new(16, 8, 16), obstacleClusterParams)
 	end)
 	if ok and nearbyParts then
 		local processed = 0
@@ -8880,7 +8922,7 @@ local function GetObstacleClusterEnvelope(root, coin, hit, fromPos, direction, s
 					minSide = math.min(minSide, across - halfSide)
 					maxSide = math.max(maxSide, across + halfSide)
 					processed += 1
-					if processed >= 64 then break end
+					if processed >= 32 then break end
 				end
 			end
 		end
@@ -8908,8 +8950,6 @@ local function FindLocalRouteDetour(root, destination, coin, hit)
 	local approachAlong = math.max(0, clusterMinAlong - clearance)
 	local bypassAlong = math.min(horizontal.Magnitude - 0.75, clusterMaxAlong + clearance)
 	if bypassAlong <= approachAlong + 0.75 then
-		-- If the obstacle is close to either endpoint, use the raycast's local hit distance
-		-- as a conservative fallback, then let the three real volume sweeps reject unsafe legs.
 		approachAlong = math.max(0, math.min(hitAlong - clearance, horizontal.Magnitude * 0.22))
 		bypassAlong = math.min(horizontal.Magnitude - 0.55, math.max(hitAlong + clearance, clusterMaxAlong + clearance))
 	end
@@ -8917,56 +8957,47 @@ local function FindLocalRouteDetour(root, destination, coin, hit)
 
 	local sideExtent = math.max(math.abs(clusterMinSide), math.abs(clusterMaxSide))
 	local baseOffset = math.clamp(sideExtent + bodyRadius + 1.25, 3.0, 22.0)
-	-- Sample several clearances on both sides. A single offset can miss a second table leg,
-	-- chair cluster, or the far edge of a wide wall; these alternatives remain strictly bounded.
-	local offsets = {baseOffset, math.min(24, baseOffset + 2.5), math.min(26, baseOffset + 5.5), math.min(28, baseOffset + 9.0)}
+	-- Nivel rapido: ambos lados con la holgura minima. Solo si ambos fallan se amplia una vez.
+	local offsets = {baseOffset, math.min(26, baseOffset + 4.5)}
+	local signOrder = {-1, 1}
+	if routeNavigation.lastDetourPart == part and routeNavigation.lastDetourSide ~= 0 then
+		-- Evita repetir el mismo lateral tras una maniobra fallida; no calcula otro mapa.
+		signOrder = {-routeNavigation.lastDetourSide, routeNavigation.lastDetourSide}
+	end
 	local ignore = BuildCoinRouteIgnore(coin)
-	local bestPoints, bestCost, bestMeta = nil, math.huge, nil
-	local tested = {}
-	for _, sign in ipairs({-1, 1}) do
-		for offsetIndex, offset in ipairs(offsets) do
-			local unique = string.format("%d:%.1f", sign, offset)
-			if not tested[unique] then
-				tested[unique] = true
-				local sideStep = fromPos + direction * approachAlong + side * (offset * sign)
-				local sideT = math.clamp(approachAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
-				sideStep = Vector3.new(sideStep.X, fromPos.Y + delta.Y * sideT, sideStep.Z)
-				local bypass = fromPos + direction * bypassAlong + side * (offset * sign)
-				local bypassT = math.clamp(bypassAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
-				bypass = Vector3.new(bypass.X, fromPos.Y + delta.Y * bypassT, bypass.Z)
-				local pointsSafe = IsSafeCoinPosition(sideStep) and IsSafeCoinPosition(bypass)
-				local clearA = pointsSafe and HasClearCharacterPath(fromPos, sideStep, ignore, root, routeRayParams)
-				local clearB = clearA and HasClearCharacterPath(sideStep, bypass, ignore, root, routeRayParams)
-				local clearC = clearB and HasClearCharacterPath(bypass, destination, ignore, root, routeRayParams)
-				if clearA and clearB and clearC then
-					local legA = (sideStep - fromPos).Magnitude
-					local legB = (bypass - sideStep).Magnitude
-					local legC = (destination - bypass).Magnitude
-					local lengthCost = legA + legB + legC
-					local lateralCost = math.abs(offset) * 0.10
-					local turnCost = 0
-					if legA > 0.01 and legB > 0.01 then
-						turnCost += (1 - math.clamp((sideStep - fromPos).Unit:Dot((bypass - sideStep).Unit), -1, 1)) * 1.6
-					end
-					if legB > 0.01 and legC > 0.01 then
-						turnCost += (1 - math.clamp((bypass - sideStep).Unit:Dot((destination - bypass).Unit), -1, 1)) * 1.6
-					end
-					local sidePreference = 0
-					if routeNavigation.lastDetourPart == part and routeNavigation.lastDetourSide ~= 0
-						and routeNavigation.lastDetourSide == sign then
-						sidePreference = 0.75 -- on a repeated obstacle, prefer the opposite side unless its route costs more
-					end
-					local cost = lengthCost + lateralCost + turnCost + sidePreference
-					if cost < bestCost then
-						bestCost = cost
-						bestPoints = {sideStep, bypass}
-						bestMeta = {side = sign, offset = offset, cost = cost, offsetIndex = offsetIndex}
+	for offsetIndex, offset in ipairs(offsets) do
+		for _, sign in ipairs(signOrder) do
+			local sideStep = fromPos + direction * approachAlong + side * (offset * sign)
+			local sideT = math.clamp(approachAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
+			sideStep = Vector3.new(sideStep.X, fromPos.Y + delta.Y * sideT, sideStep.Z)
+			local bypass = fromPos + direction * bypassAlong + side * (offset * sign)
+			local bypassT = math.clamp(bypassAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
+			bypass = Vector3.new(bypass.X, fromPos.Y + delta.Y * bypassT, bypass.Z)
+			if IsSafeCoinPosition(sideStep) and IsSafeCoinPosition(bypass) then
+				local clearA = HasClearCharacterPath(fromPos, sideStep, ignore, root, routeRayParams)
+				if clearA then
+					local clearB = HasClearCharacterPath(sideStep, bypass, ignore, root, routeRayParams)
+					if clearB then
+						local clearC = HasClearCharacterPath(bypass, destination, ignore, root, routeRayParams)
+						if clearC then
+							local legA = (sideStep - fromPos).Magnitude
+							local legB = (bypass - sideStep).Magnitude
+							local legC = (destination - bypass).Magnitude
+							local cost = legA + legB + legC + math.abs(offset) * 0.10
+							if legA > 0.01 and legB > 0.01 then
+								cost += (1 - math.clamp((sideStep - fromPos).Unit:Dot((bypass - sideStep).Unit), -1, 1)) * 1.6
+							end
+							if legB > 0.01 and legC > 0.01 then
+								cost += (1 - math.clamp((bypass - sideStep).Unit:Dot((destination - bypass).Unit), -1, 1)) * 1.6
+							end
+							return {sideStep, bypass}, {side = sign, offset = offset, cost = cost, offsetIndex = offsetIndex}
+						end
 					end
 				end
 			end
 		end
 	end
-	return bestPoints, bestMeta
+	return nil
 end
 
 local function GetFarmNavigationAim(root, target, destination, now)
@@ -9054,7 +9085,9 @@ local function GetFarmNavigationAim(root, target, destination, now)
 		-- Same obstacle, but a meaningful position change allows a new geometric assessment.
 		routeNavigation.lastDetourPart = nil
 	end
+	local detourStartedAt = os.clock()
 	local detour, detourMeta = FindLocalRouteDetour(root, destination, target, hit)
+	RecordNavigationTiming("detour", detourStartedAt, target)
 	if detour and #detour > 0 then
 		routeNavigation.points = detour
 		routeNavigation.index = 1
@@ -9088,6 +9121,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	if State.NoClipActive then
 		CoinEngine.AutoNoclipMode = nil
 		CoinEngine.AutoNoclipTarget = nil
+		CoinEngine.AutoNoclipStartPosition = nil
 		CoinEngine.NoclipWanted = false
 		CoinEngine.NoclipExitDestination = nil
 		CoinEngine.NoclipExitDestinationAt = 0
@@ -9106,6 +9140,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 		end
 		CoinEngine.AutoNoclipMode = nil
 		CoinEngine.AutoNoclipTarget = nil
+		CoinEngine.AutoNoclipStartPosition = nil
 		CoinEngine.NoclipWanted = false
 		CoinEngine.AutoNoclipNextCheckAt = now + 0.04
 		SetCurrent(nil, now)
@@ -9300,20 +9335,53 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	end
 
 	if CoinEngine.AutoNoclipMode == "coin-route" then
-		-- Defensive cleanup for a legacy/stale mode: do not continue crossing an obstacle solely
-		-- because a local detour failed. NoClip is only retained to leave geometry already occupied.
-		if IsInsideSolid(root.Position) then
-			CoinEngine.AutoNoclipMode = "exit-solid"
-			CoinEngine.AutoNoclipStartedAt = now
-			CoinEngine.NoclipWanted = true
+		local routeAge = now - (CoinEngine.AutoNoclipStartedAt or now)
+		local sameTarget = target and target.Parent and target == CoinEngine.AutoNoclipTarget and IsValidCoin(target)
+		local movedFromStart = CoinEngine.AutoNoclipStartPosition
+			and (root.Position - CoinEngine.AutoNoclipStartPosition).Magnitude or 0
+		local routeClearNow = false
+		if sameTarget and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
+			routeClearNow = HasClearCoinRoute(root.Position, target)
+			CoinEngine.AutoNoclipNextCheckAt = now + 0.10
+		end
+		local targetGap = sameTarget and (target.Position - root.Position).Magnitude or math.huge
+		local shouldFinish = not sameTarget or routeClearNow or targetGap <= 4.0
+		local budgetExpired = routeAge >= (tonumber(CoinEngine.AutoNoclipCoinMaxTime) or 0.90)
+		local progressExpired = routeAge >= 0.38 and movedFromStart < 1.0
+		if shouldFinish or budgetExpired or progressExpired then
+			local inside = IsInsideSolid(root.Position) -- fresh, not cached, before restoring collisions
+			if inside then
+				CoinEngine.AutoNoclipMode = "exit-solid"
+				CoinEngine.AutoNoclipTarget = target
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.NoclipExitDestination = nil
+				CoinEngine.NoclipWanted = true
+				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
+				ResetRouteNavigation(CoinEngine.CurrentTarget, now)
+				LogEvent(string.format("auto-noclip coin-route->exit-solid age=%.2f moved=%.1f clear=%d expired=%d", routeAge,
+					movedFromStart, routeClearNow and 1 or 0, budgetExpired and 1 or 0))
+				return target
+			end
+			CoinEngine.AutoNoclipMode = nil
+			CoinEngine.AutoNoclipTarget = nil
+			CoinEngine.AutoNoclipStartPosition = nil
+			CoinEngine.NoclipWanted = false
+			CoinEngine.AutoNoclipNextCheckAt = now + 0.08
+			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
+			LogEvent(string.format("auto-noclip coin-route-stop age=%.2f moved=%.1f clear=%d expired=%d progressExpired=%d", routeAge,
+				movedFromStart, routeClearNow and 1 or 0, budgetExpired and 1 or 0, progressExpired and 1 or 0))
+			if sameTarget and (budgetExpired or progressExpired) and not routeClearNow then
+				return RerouteBlockedCoin(target, "coin-route-time-or-progress-budget")
+			end
 			return target
 		end
-		return RerouteBlockedCoin(target, "legacy-coin-route")
+		CoinEngine.NoclipWanted = true
+		return target
 	end
 
-	-- A blocked direct ray plus a failed local detour is not enough evidence to cross a wall.
-	-- Reroute to another coin first. The temporary exit mode is reserved for a body already
-	-- confirmed inside collidable geometry, where restoring collisions immediately could trap it.
+	-- Cuando un bloqueo no admite un desvio local validado, se permite un cruce NoClip
+	-- corto SOLO para una moneda cercana. La duracion y distancia estan acotadas; si no progresa,
+	-- se restaura colision en espacio libre o se pasa al recuperador de salida-solido.
 	if routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
 		and IsValidCoin(target) and routeNavigation.directPathBlocked then
 		local routeClearNow = HasClearCoinRoute(root.Position, target)
@@ -9323,19 +9391,36 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			routeNavigation.blockedHit = nil
 			routeNavigation.failedUntil = 0
 		else
-			local bodyInside = IsInsideSolid(root.Position) -- fresh query; do not trust the 75 ms cache here
+			local bodyInside = IsInsideSolid(root.Position) -- confirmacion fresca antes de cambiar colision
 			routeNavigation.noDetourPending = false
+			local targetGap = (target.Position - root.Position).Magnitude
 			if bodyInside then
 				CoinEngine.AutoNoclipMode = "exit-solid"
 				CoinEngine.AutoNoclipTarget = target
 				CoinEngine.AutoNoclipStartedAt = now
 				CoinEngine.NoclipWanted = true
+				CoinEngine.NoclipExitDestination = nil
 				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
-				LogEvent(string.format("auto-noclip start reason=confirmed-body-inside-solid dist=%.1f target=%s",
-					(target.Position - root.Position).Magnitude, target.Name))
+				LogEvent(string.format("auto-noclip start reason=confirmed-body-inside-solid dist=%.1f target=%s", targetGap, target.Name))
 				return target
+			elseif CoinEngine.AutoNoclipCoinRouteEnabled ~= false
+				and targetGap <= (tonumber(CoinEngine.AutoNoclipCoinMaxDistance) or 60)
+				and not (threat.Active and threat.EmergencyEscape) then
+				CoinEngine.AutoNoclipMode = "coin-route"
+				CoinEngine.AutoNoclipTarget = target
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.AutoNoclipStartPosition = root.Position
+				CoinEngine.NoclipWanted = true
+				CoinEngine.AutoNoclipNextCheckAt = now + 0.10
+				LogEvent(string.format("auto-noclip start reason=no-fast-detour dist=%.1f target=%s budget=%.2f", targetGap,
+					target.Name, tonumber(CoinEngine.AutoNoclipCoinMaxTime) or 0.90))
+				return target
+			else
+				local reason = CoinEngine.AutoNoclipCoinRouteEnabled == false and "coin-route-disabled"
+					or (targetGap > (tonumber(CoinEngine.AutoNoclipCoinMaxDistance) or 60)
+					and "no-detour-target-too-far" or "no-fast-detour-not-started")
+				return RerouteBlockedCoin(target, reason)
 			end
-			return RerouteBlockedCoin(target, "preflight-no-valid-detour")
 		end
 	end
 
@@ -9805,65 +9890,59 @@ local function ControllerStep(dt)
 		nextPrepareAt = now
 	end
 
-	-- Mejora de objetivo con histéresis (evita oscilar por pequeñas diferencias)
+	-- Mejora de objetivo con histéresis. Se evalua con menor frecuencia y no vuelve a escanear
+	-- todo el cache mientras una ruta bloqueada/desvio sigue siendo valida.
 	if now >= nextImproveCheck then
-		nextImproveCheck = now + 0.18
 		local cur = CoinEngine.CurrentTarget
-		local cand
-		if CoinEngine.ThreatResponse.Active then
-			cand = PickThreatCoin(root.Position, nil, now)
-		else
-			cand = PickNearest(root.Position, nil, now)
-		end
-		if cand and cand ~= cur and cur and cur.Parent then
-			local dc = ThreatAwareCoinScore(root.Position, cur.Position, now)
-			local dn = ThreatAwareCoinScore(root.Position, cand.Position, now)
-			local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
-			-- Preserve the active coin while a route is being followed/replanned. Without this hold,
-			-- the 0.14 s target-improvement loop could replace a valid side-step before it reached the corner.
-			local activeDetour = routeNavigation.target == cur
-				and (routeNavigation.index or 1) <= #(routeNavigation.points or {})
-			local routeHold = routeNavigation.target == cur and (activeDetour
-				or routeNavigation.directPathBlocked or routeNavigation.noDetourPending
-				or (now - (routeNavigation.lastDetourAt or 0)) < 0.60)
-			local routeNoProgress = (now - (lastProgress or now)) >= 0.14
-			if routeNoProgress and not shouldSwitch and not routeHold then
-				local currentRouteBlocked = not HasClearCoinRoute(root.Position, cur)
-				if currentRouteBlocked and HasClearCoinRoute(root.Position, cand) then
-					shouldSwitch = true
-					LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1 stalled=1")
-				end
-			end
+		local activeDetour = cur and routeNavigation.target == cur
+			and (routeNavigation.index or 1) <= #(routeNavigation.points or {})
+		local routeHold = cur and routeNavigation.target == cur and (activeDetour
+			or routeNavigation.directPathBlocked or routeNavigation.noDetourPending
+			or (now - (routeNavigation.lastDetourAt or 0)) < 0.60)
+		nextImproveCheck = now + (routeHold and 0.45 or 0.40)
+		if cur and cur.Parent and not routeHold then
+			local cand
 			if CoinEngine.ThreatResponse.Active then
-				local threat = CoinEngine.ThreatResponse
-				if not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
-					shouldSwitch = true
-				else
-					local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
-					if murderRoot then
-						local murderPos = murderRoot.Position
-						local currentGap = (cur.Position - murderPos).Magnitude
-						local candidateGap = (cand.Position - murderPos).Magnitude
-						local away = root.Position - murderPos
-						local currentRoute = cur.Position - root.Position
-						local candidateRoute = cand.Position - root.Position
-						local currentAwayDot, candidateAwayDot = 0, 0
-						if away.Magnitude > 0.01 and currentRoute.Magnitude > 0.01 then
-							currentAwayDot = currentRoute.Unit:Dot(away.Unit)
-						end
-						if away.Magnitude > 0.01 and candidateRoute.Magnitude > 0.01 then
-							candidateAwayDot = candidateRoute.Unit:Dot(away.Unit)
-						end
-						-- Switch if the candidate opens a meaningful distance gap, or is noticeably
-						-- more aligned with escape while not sacrificing much separation.
-						if candidateGap >= currentGap + 6
-							or (candidateAwayDot >= currentAwayDot + 0.45 and candidateGap >= currentGap - 4) then
-							shouldSwitch = true
+				cand = PickThreatCoin(root.Position, nil, now, 1)
+			else
+				cand = PickNearest(root.Position, nil, now, 1)
+			end
+			if cand and cand ~= cur and cur and cur.Parent then
+				local dc = ThreatAwareCoinScore(root.Position, cur.Position, now)
+				local dn = ThreatAwareCoinScore(root.Position, cand.Position, now)
+				local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
+				local routeNoProgress = (now - (lastProgress or now)) >= 0.14
+				if routeNoProgress and not shouldSwitch then
+					local currentRouteBlocked = not HasClearCoinRoute(root.Position, cur)
+					if currentRouteBlocked and HasClearCoinRoute(root.Position, cand) then
+						shouldSwitch = true
+						LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1 stalled=1")
+					end
+				end
+				if CoinEngine.ThreatResponse.Active then
+					local threat = CoinEngine.ThreatResponse
+					if not IsThreatSafeCoin(cur) and IsThreatSafeCoin(cand) then
+						shouldSwitch = true
+					else
+						local murderRoot = threat.Murderer and GetRoot(threat.Murderer)
+						if murderRoot then
+							local murderPos = murderRoot.Position
+							local currentGap = (cur.Position - murderPos).Magnitude
+							local candidateGap = (cand.Position - murderPos).Magnitude
+							local away = root.Position - murderPos
+							local currentRoute = cur.Position - root.Position
+							local candidateRoute = cand.Position - root.Position
+							local currentAwayDot, candidateAwayDot = 0, 0
+							if away.Magnitude > 0.01 and currentRoute.Magnitude > 0.01 then currentAwayDot = currentRoute.Unit:Dot(away.Unit) end
+							if away.Magnitude > 0.01 and candidateRoute.Magnitude > 0.01 then candidateAwayDot = candidateRoute.Unit:Dot(away.Unit) end
+							if candidateGap >= currentGap + 6 or (candidateAwayDot >= currentAwayDot + 0.45 and candidateGap >= currentGap - 4) then
+								shouldSwitch = true
+							end
 						end
 					end
 				end
+				if shouldSwitch then SetCurrent(cand, now) end
 			end
-			if shouldSwitch then SetCurrent(cand, now) end
 		end
 	end
 
