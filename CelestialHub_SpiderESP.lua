@@ -1,5 +1,5 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
--- V3.34 AutoFarm Extreme V2: existing spatial-index fast path, reduced duplicate validation, and Tween Speed max 100.
+-- V3.35 AutoFarm Extreme V3: compact-cluster passives, adaptive obstacle checks, and continuous coin chaining.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
@@ -6199,6 +6199,24 @@ local CoinEngine = {
 	ChainNeighborRadius = 18,
 	ChainNeighborWeight = 1.25,
 	ChainNeighborBonusCap = 4,
+	ChainGroupRadius = 10.0, -- grupo compacto, distinto de la vecindad amplia usada para puntuar cadenas
+	ChainGroupMinCoins = 3, -- objetivo actual + al menos dos monedas accesibles
+	ChainGroupCheckLimit = 4, -- comprobaciones de ruta acotadas por evaluacion
+	ChainGroupCheckInterval = 0.25,
+	ChainGroupNextCheckAt = 0,
+	ChainGroupLastRevision = -1,
+	ChainGroupTarget = nil,
+	ChainGroupOrigin = nil,
+	ChainGroupActive = false,
+	ChainGroupMemberCount = 0,
+	ChainGroupAccessibleCoins = setmetatable({}, {__mode = "k"}),
+	ChainGroupMultiplier = 1.15,
+	PassiveSpeedMultiplier = 1.10,
+	ConfiguredSliderSpeed = 45,
+	SpeedBonusMultiplier = 1.0,
+	LastLoggedSpeedBonusMultiplier = 0,
+	ObstacleRouteRefreshInterval = 0.10,
+	ObstacleRouteCacheTTL = 0.10,
 	LastChainTransitionMs = -1, -- touch-request -> objetivo siguiente; no es confirmacion del servidor
 	MaxChainTransitionMs = 0,
 	ChainTransitionCount = 0,
@@ -6274,7 +6292,7 @@ local CoinEngine = {
 	SpeedSafetyHoldCap = 100,
 	CommandAcceleration = 150, -- aceleracion normal; el +25% se aplica solo durante el encadenamiento
 	RiskCommandAccelerationFloor = 80, -- suelo normal adaptativo; el +25% se aplica solo durante el encadenamiento
-	MaxCommandStepPerFrame = 1.8, -- permite 100 a 60 FPS; frames lentos conservan un techo proporcional al dt real
+	MaxCommandStepPerFrame = 2.2, -- permite la solicitud combinada (100 x 1.10 x 1.15) en frames estables; NoClip conserva 1.5
 	NearTargetAccelerationMultiplier = 1.35,
 	RampTime = 0.55,           -- rampa normal; el ajuste de encadenamiento se aplica localmente
 	MinCollectInterval = 0.04, -- debounce normal; no sustituye el tiempo fisico de recoleccion
@@ -6796,8 +6814,15 @@ end
 
 local function GetCoinChainBonus(coin)
 	local count = math.max(0, tonumber(CoinEngine.CoinNeighborCount[coin]) or 0)
-	return math.min(count, tonumber(CoinEngine.ChainNeighborBonusCap) or 4)
+	local bonus = math.min(count, tonumber(CoinEngine.ChainNeighborBonusCap) or 4)
 		* (tonumber(CoinEngine.ChainNeighborWeight) or 1.25)
+	-- If the current compact cluster was verified for physical accessibility, favor its
+	-- members for the next leg. The extra score is contextual and never compounds speed.
+	local current = CoinEngine.CurrentTarget
+	if CoinEngine.ChainGroupActive and current and current.Parent and coin ~= current and CoinEngine.ChainGroupAccessibleCoins[coin] then
+		bonus += 2.5
+	end
+	return bonus
 end
 
 local function RegisterCoin(coin)
@@ -7459,7 +7484,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.34 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.35 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7646,7 +7671,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.34 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.35 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -8422,13 +8447,14 @@ local function BuildCoinRouteIgnore(coin)
 	return ignore
 end
 
-local function HasClearCoinRoute(fromPos, coin)
+local function HasClearCoinRoute(fromPos, coin, requestedCacheTtl)
 	if not coin or not coin.Parent or not IsValidCoin(coin) then return false, nil end
 	local now = os.clock()
 	local coinPosition = coin.Position
 	local cached = CoinEngine.RouteCheckCache[coin]
+	local cacheTtl = math.clamp(tonumber(requestedCacheTtl) or 0.12, 0.04, 0.12)
 	-- Cache corta: reusa el barrido solo si raiz y moneda apenas se han movido.
-	if cached and now - cached.at <= 0.12
+	if cached and now - cached.at <= cacheTtl
 		and (fromPos - cached.fromPos).Magnitude <= 1.0
 		and (coinPosition - cached.targetPos).Magnitude <= 0.15 then
 		return cached.clear, cached.hit
@@ -9328,6 +9354,142 @@ local function ResetRouteNavigation(target, now)
 	CoinEngine.routeNavigation.blockedHit = nil
 end
 
+-- Passive chain skill: enable +15% only after a compact cluster and its short links
+-- have passed the existing physical route checks. Evaluation is cached and bounded.
+CoinEngine.UpdateChainGroupState = function(root, now)
+	now = tonumber(now) or os.clock()
+	local target = CoinEngine.CurrentTarget
+	local revision = tonumber(CoinEngine.CoinCacheRevision) or 0
+	local previousActive = CoinEngine.ChainGroupActive == true
+	local interval = math.max(0.10, tonumber(CoinEngine.ChainGroupCheckInterval) or 0.20)
+	local origin = CoinEngine.ChainGroupOrigin
+	local invalidContext = not root or not target or not target.Parent
+		or CoinEngine.ThreatResponse.Active or CoinEngine.NoclipWanted or noclipOn
+	if not invalidContext then invalidContext = not IsAvailable(target, now) end
+	if invalidContext then
+		CoinEngine.ChainGroupActive = false
+		CoinEngine.ChainGroupMemberCount = 0
+		table.clear(CoinEngine.ChainGroupAccessibleCoins)
+		CoinEngine.ChainGroupTarget = target
+		CoinEngine.ChainGroupLastRevision = revision
+		CoinEngine.ChainGroupOrigin = target and target.Parent and target.Position or nil
+		CoinEngine.ChainGroupNextCheckAt = now + interval
+		if previousActive then
+			CoinEngine.NextTargetCacheRevision = -1
+			CoinEngine.NextTargetPreparedAt = 0
+			nextPrepareAt = now
+			LogEvent("passive-chain-group active=0 reason=context-changed")
+		end
+		return false
+	end
+	if target == CoinEngine.ChainGroupTarget and revision == CoinEngine.ChainGroupLastRevision
+		and origin and (target.Position - origin).Magnitude < 1.5 and now < (CoinEngine.ChainGroupNextCheckAt or 0) then
+		return previousActive
+	end
+	CoinEngine.ChainGroupTarget = target
+	CoinEngine.ChainGroupLastRevision = revision
+	CoinEngine.ChainGroupOrigin = target.Position
+	CoinEngine.ChainGroupNextCheckAt = now + interval
+	CoinEngine.ChainGroupActive = false
+	CoinEngine.ChainGroupMemberCount = 0
+	table.clear(CoinEngine.ChainGroupAccessibleCoins)
+	local radius = math.max(4, tonumber(CoinEngine.ChainGroupRadius) or 10)
+	local radiusSquared = radius * radius
+	local candidates = {}
+	local seen = {}
+	local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
+	local tx, ty, tz = target.Position.X, target.Position.Y, target.Position.Z
+	local cx, cy, cz = math.floor(tx / cellSize), math.floor(ty / cellSize), math.floor(tz / cellSize)
+	for ix = cx - 1, cx + 1 do
+		for iy = cy - 1, cy + 1 do
+			for iz = cz - 1, cz + 1 do
+				local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+				if bucket then
+					for coin in pairs(bucket) do
+						if coin ~= target and not seen[coin] and IsAvailable(coin, now) then
+							seen[coin] = true
+							local pos = coin.Position
+							local dx, dy, dz = pos.X - tx, pos.Y - ty, pos.Z - tz
+							local d2 = dx * dx + dy * dy + dz * dz
+							if d2 <= radiusSquared and math.abs(dy) <= 4.5 then
+								if #candidates < 8 then
+									candidates[#candidates + 1] = {coin = coin, d2 = d2}
+								else
+									local farthestIndex = 1
+									for candidateIndex = 2, #candidates do
+										if candidates[candidateIndex].d2 > candidates[farthestIndex].d2 then
+											farthestIndex = candidateIndex
+										end
+									end
+									if d2 < candidates[farthestIndex].d2 then
+										candidates[farthestIndex] = {coin = coin, d2 = d2}
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	if #candidates < ((tonumber(CoinEngine.ChainGroupMinCoins) or 3) - 1) then
+		if previousActive then
+			CoinEngine.NextTargetCacheRevision = -1
+			CoinEngine.NextTargetPreparedAt = 0
+			nextPrepareAt = now
+			LogEvent("passive-chain-group active=0 reason=not-compact")
+		end
+		return false
+	end
+	if not IsGrounded(target) or not HasClearCoinRoute(root.Position, target, CoinEngine.ObstacleRouteCacheTTL) then
+		if previousActive then
+			CoinEngine.NextTargetCacheRevision = -1
+			CoinEngine.NextTargetPreparedAt = 0
+			nextPrepareAt = now
+			LogEvent("passive-chain-group active=0 reason=target-route-not-clear")
+		end
+		return false
+	end
+	table.sort(candidates, function(a, b) return a.d2 < b.d2 end)
+	local reachable = 1 -- el objetivo actual ya tiene ruta validada desde la posicion del jugador
+	CoinEngine.ChainGroupAccessibleCoins[target] = true
+	local checked = 0
+	local maxChecks = math.clamp(math.floor(tonumber(CoinEngine.ChainGroupCheckLimit) or 4), 2, 4)
+	local fromHeight = math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15)
+	local fromPosition = target.Position + Vector3.new(0, fromHeight, 0)
+	local char = LocalPlayer and LocalPlayer.Character
+	local container = FindCoinContainer()
+	for _, candidate in ipairs(candidates) do
+		if checked >= maxChecks or reachable >= (tonumber(CoinEngine.ChainGroupMinCoins) or 3) then break end
+		checked += 1
+		local coin = candidate.coin
+		if IsAvailable(coin, now) and IsGrounded(coin) then
+			local contactHeight = math.max(0.5, (root.Size.Y + coin.Size.Y) * 0.5 - 0.15)
+			local ignore = {target, coin}
+			if char then ignore[#ignore + 1] = char end
+			if container then ignore[#ignore + 1] = container end
+			local clear = HasClearCharacterPath(fromPosition, coin.Position + Vector3.new(0, contactHeight, 0), ignore, root, CoinEngine.routeRayParams)
+			if clear then
+				reachable += 1
+				CoinEngine.ChainGroupAccessibleCoins[coin] = true
+			end
+		end
+	end
+	local active = reachable >= (tonumber(CoinEngine.ChainGroupMinCoins) or 3)
+	CoinEngine.ChainGroupActive = active
+	CoinEngine.ChainGroupMemberCount = active and reachable or 0
+	if not active then table.clear(CoinEngine.ChainGroupAccessibleCoins) end
+	if active ~= previousActive then
+		CoinEngine.NextTargetCacheRevision = -1
+		CoinEngine.NextTargetPreparedAt = 0
+		nextPrepareAt = now
+		LogEvent(string.format("passive-chain-group active=%d members=%d radius=%.1f routeChecks=%d speedMultiplier=%.2f",
+			active and 1 or 0, CoinEngine.ChainGroupMemberCount, radius, checked,
+			active and (tonumber(CoinEngine.ChainGroupMultiplier) or 1.15) or 1.0))
+	end
+	return active
+end
+
 local function PrepareNext(now, force)
 	local cur = CoinEngine.CurrentTarget
 	if not cur or not cur.Parent then
@@ -9384,6 +9546,15 @@ end
 local function SetCurrent(coin, now)
 	local targetChanged = coin ~= CoinEngine.CurrentTarget
 	CoinEngine.CurrentTarget = coin
+	if targetChanged then
+		CoinEngine.ChainGroupActive = false
+		CoinEngine.ChainGroupMemberCount = 0
+		table.clear(CoinEngine.ChainGroupAccessibleCoins)
+		CoinEngine.ChainGroupTarget = nil
+		CoinEngine.ChainGroupOrigin = nil
+		CoinEngine.ChainGroupLastRevision = -1
+		CoinEngine.ChainGroupNextCheckAt = 0
+	end
 	CoinEngine.NextTarget = nil
 	CoinEngine.NextTargetCacheRevision = -1
 	CoinEngine.NextTargetPreparedAt = 0
@@ -9756,7 +9927,7 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	local points = CoinEngine.routeNavigation.points or {}
 	local index = tonumber(CoinEngine.routeNavigation.index) or 1
 	if index <= #points and now >= (CoinEngine.routeNavigation.nextSegmentCheckAt or 0) then
-		CoinEngine.routeNavigation.nextSegmentCheckAt = now + 0.14
+		CoinEngine.routeNavigation.nextSegmentCheckAt = now + (tonumber(CoinEngine.ObstacleRouteRefreshInterval) or 0.14)
 		local legClear = HasClearCharacterPath(root.Position, points[index], BuildCoinRouteIgnore(target), root, CoinEngine.routeRayParams)
 		if not legClear then
 			LogEvent(string.format("route-leg-invalidated target=%s waypoint=%d", target.Name, index))
@@ -9799,12 +9970,12 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	if CoinEngine.routeNavigation.directPathKnown and not CoinEngine.routeNavigation.directPathBlocked and now < (CoinEngine.routeNavigation.directPathClearUntil or 0) then
 		return destination, false
 	end
-	CoinEngine.routeNavigation.nextPlanAt = now + 0.08
-	local clear, hit = HasClearCoinRoute(root.Position, target)
+	CoinEngine.routeNavigation.nextPlanAt = now + math.clamp((tonumber(CoinEngine.ObstacleRouteRefreshInterval) or 0.08) * 1.5, 0.08, 0.20)
+	local clear, hit = HasClearCoinRoute(root.Position, target, CoinEngine.ObstacleRouteCacheTTL)
 	CoinEngine.routeNavigation.directPathKnown = true
 	CoinEngine.routeNavigation.directPathBlocked = not clear
 	if clear then
-		CoinEngine.routeNavigation.directPathClearUntil = now + 0.22
+		CoinEngine.routeNavigation.directPathClearUntil = now + math.clamp((tonumber(CoinEngine.ObstacleRouteRefreshInterval) or 0.14) * 1.5, 0.08, 0.22)
 		CoinEngine.routeNavigation.verticalRouteBlocked = false
 		CoinEngine.routeNavigation.verticalSurfaceBlocked = false
 		CoinEngine.routeNavigation.noDetourPending = false
@@ -10603,6 +10774,16 @@ function CoinEngine.CleanupRoundCaches()
 	CoinEngine.NextTargetCacheRevision = -1
 	CoinEngine.NextTargetPreparedAt = 0
 	CoinEngine.NextTargetOriginPosition = nil
+	CoinEngine.ChainGroupActive = false
+	CoinEngine.ChainGroupMemberCount = 0
+	table.clear(CoinEngine.ChainGroupAccessibleCoins)
+	CoinEngine.ChainGroupTarget = nil
+	CoinEngine.ChainGroupOrigin = nil
+	CoinEngine.ChainGroupLastRevision = -1
+	CoinEngine.ChainGroupNextCheckAt = 0
+	CoinEngine.SpeedBonusMultiplier = 1
+	CoinEngine.ObstacleRouteRefreshInterval = 0.10
+	CoinEngine.ObstacleRouteCacheTTL = 0.10
 	CoinEngine.NoclipRerouteAfterExit = false
 	CoinEngine.NoclipRerouteReason = nil
 	CoinEngine.NoclipRerouteTarget = nil
@@ -11126,9 +11307,25 @@ local function ControllerStep(dt)
 		end
 	end
 
+	-- Revalidate group context once per short interval; the method reuses spatial and route caches.
+	if CoinEngine.UpdateChainGroupState then CoinEngine.UpdateChainGroupState(root, now) end
 	local safe = SafeOn()
-	local sliderSpeed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
-	local speed = sliderSpeed
+	CoinEngine.ConfiguredSliderSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
+	local sliderSpeed = math.min(CoinEngine.ConfiguredSliderSpeed, Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	-- One central, non-accumulating formula: normal farming gets +10%; a verified compact
+	-- cluster adds x1.15. Keep both bonuses off during the existing adaptive NoClip envelope.
+	CoinEngine.SpeedBonusMultiplier = ((CoinEngine.NoclipWanted or noclipOn) and 1
+		or (tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10))
+		* ((CoinEngine.ChainGroupActive and not CoinEngine.ThreatResponse.Active
+			and not (CoinEngine.NoclipWanted or noclipOn)) and (tonumber(CoinEngine.ChainGroupMultiplier) or 1.15) or 1)
+	local speed = CoinEngine.ConfiguredSliderSpeed * CoinEngine.SpeedBonusMultiplier
+	if math.abs((tonumber(CoinEngine.LastLoggedSpeedBonusMultiplier) or 0) - CoinEngine.SpeedBonusMultiplier) > 0.001 then
+		LogEvent(string.format("autofarm-passive-speed configured=%.1f cappedBase=%.1f multiplier=%.3f requested=%.1f group=%d members=%d noclipEnvelope=%d",
+			CoinEngine.ConfiguredSliderSpeed, sliderSpeed, CoinEngine.SpeedBonusMultiplier, speed,
+			CoinEngine.ChainGroupActive and 1 or 0, tonumber(CoinEngine.ChainGroupMemberCount) or 0,
+			(CoinEngine.NoclipWanted or noclipOn) and 1 or 0))
+		CoinEngine.LastLoggedSpeedBonusMultiplier = CoinEngine.SpeedBonusMultiplier
+	end
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
 	-- Estabilidad adaptativa V3.22.2:
@@ -11154,7 +11351,7 @@ local function ControllerStep(dt)
 	-- de 16/22, el limite se deriva del tiempo real entre actualizaciones: el comando no
 	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 100
 	-- con frames estables y conserva una reduccion proporcional si el cliente se ralentiza.
-	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
+	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed) * (tonumber(CoinEngine.SpeedBonusMultiplier) or 1)
 	local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
 	-- Keep adaptive NoClip on its previous 80-speed / 1.5-step safety envelope. The expanded
 	-- slider range applies to ordinary coin movement, not to temporary NoClip navigation.
@@ -11235,6 +11432,10 @@ local function ControllerStep(dt)
 		CoinEngine.LastSafetyReason = safetyReason
 	end
 	CoinEngine.LastSafetyCap = speed
+	-- Probe more often at high commanded speeds, but keep the interval bounded to avoid per-frame
+	-- full route work. NoClip independently overrides its safety cap and step budget below.
+	CoinEngine.ObstacleRouteRefreshInterval = math.clamp(4.5 / math.max(speed, 1), 0.06, 0.14)
+	CoinEngine.ObstacleRouteCacheTTL = math.min(0.12, CoinEngine.ObstacleRouteRefreshInterval)
 	dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	if CoinEngine.ThreatResponse.Active then chainAccelerationActive = false end
