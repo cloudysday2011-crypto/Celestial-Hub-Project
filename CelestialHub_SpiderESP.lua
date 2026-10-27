@@ -4389,6 +4389,91 @@ local function PowerObjectLooksActive(obj)
 	return false
 end
 
+-- Estado de ronda independiente del nombre de rol cacheado. El resultado se cachea brevemente
+-- porque tanto el detector de poderes como el renderizador consultan este estado a alta frecuencia.
+_G.Celestial.MM2LobbyPhaseCache = {checkedAt = 0, value = false}
+_G.Celestial.IsMM2LobbyPhaseConfirmed = function()
+	if _G.Celestial.GameMode ~= "MM2" then return false end
+	local now = tick()
+	local cache = _G.Celestial.MM2LobbyPhaseCache
+	if cache and now - (tonumber(cache.checkedAt) or 0) < 0.25 then return cache.value == true end
+	if not cache then
+		cache = {checkedAt = 0, value = false}
+		_G.Celestial.MM2LobbyPhaseCache = cache
+	end
+
+	local confirmed = false
+	local roundState = _G.Celestial.RoundTimerState
+	local timerRemaining = roundState and tonumber(roundState.remaining) or nil
+	-- RoundTimerState inicia en phase="Idle", ended=true; solo se toma el fin del
+	-- temporizador como evidencia cuando el estado ya corresponde a una ronda.
+	if roundState and roundState.phase == "Round"
+		and (roundState.ended == true or (timerRemaining ~= nil and timerRemaining <= 0)) then
+		confirmed = true
+	end
+
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not confirmed and root then
+		for _, name in ipairs({"Lobby", "Lobby3D", "LobbyArea", "MainLobby", "LobbyMap", "LobbySpawn", "WaitingRoom", "WaitingRoomSpawn"}) do
+			local zone = Workspace:FindFirstChild(name, true)
+			if zone then
+				local inside = root:IsDescendantOf(zone)
+				if not inside and zone:IsA("BasePart") then
+					local ok, localPosition = pcall(function() return zone.CFrame:PointToObjectSpace(root.Position) end)
+					if ok then
+						local half = zone.Size * 0.5
+						inside = math.abs(localPosition.X) <= half.X + 8
+							and math.abs(localPosition.Y) <= half.Y + 10
+							and math.abs(localPosition.Z) <= half.Z + 8
+					end
+				elseif not inside and zone:IsA("Model") then
+					local ok, cf, size = pcall(function() return zone:GetBoundingBox() end)
+					if ok and cf and size and size.X <= 240 and size.Y <= 140 and size.Z <= 240 then
+						local localPosition = cf:PointToObjectSpace(root.Position)
+						inside = math.abs(localPosition.X) <= size.X * 0.5 + 8
+							and math.abs(localPosition.Y) <= size.Y * 0.5 + 10
+							and math.abs(localPosition.Z) <= size.Z * 0.5 + 8
+					end
+				end
+				if inside then confirmed = true; break end
+			end
+		end
+	end
+
+	-- El texto visible de fin de ronda/intermission sirve como segunda señal cuando el mapa
+	-- no expone un contenedor de Lobby fácil de reconocer.
+	if not confirmed then
+		local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if playerGui then
+			local ok, descendants = pcall(function() return playerGui:GetDescendants() end)
+			if ok and descendants then
+				for index, obj in ipairs(descendants) do
+					if index > 1400 then break end
+					if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+						local text = string.lower(tostring(obj.Text or ""))
+						if text:find("intermission", 1, true) or text:find("waiting for players", 1, true)
+							or text:find("waiting for more players", 1, true)
+							or text:find("round over", 1, true) or text:find("game over", 1, true)
+							or text:find("murderer wins", 1, true) or text:find("innocents win", 1, true)
+							or text:find("hero wins", 1, true) or text:find("sheriff wins", 1, true)
+							or text:find("voting for", 1, true) or text:find("esperando jugadores", 1, true)
+							or text:find("fin de la ronda", 1, true) or text:find("ronda terminada", 1, true)
+							or text:find("partida terminada", 1, true) then
+							confirmed = true
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+
+	cache.checkedAt = now
+	cache.value = confirmed
+	return confirmed
+end
+
 local function IsPowerCurrentlyActive(plr, powerName)
 	if not plr or not powerName then return false end
 	local definition = POWER_DEFINITIONS[powerName]
@@ -4415,24 +4500,26 @@ local function IsPowerCurrentlyActive(plr, powerName)
 			if root then _G.Celestial.PowerDetector.GhostLastKnownCFrame = root.CFrame end
 		end
 		local roundState = _G.Celestial.RoundTimerState
-		local roundActive
-		if roundState then
+		local roundActive = not _G.Celestial.IsMM2LobbyPhaseConfirmed()
+		if roundActive and roundState then
 			roundActive = roundState.phase == "Round" and not roundState.ended
 				and (roundState.remaining == nil or roundState.remaining > 0)
-		else roundActive = State.MurdererName == plr.Name end
+		elseif roundActive then
+			roundActive = State.MurdererName == plr.Name
+		end
 		local stillAlive = (humanoid and humanoid.Health > 0) or (not humanoid and _G.Celestial.PowerDetector.GhostLastKnownHealth > 0)
 		local missingFromMap = roundActive and stillAlive
 			and _G.Celestial.PowerDetector.GhostLastSeenAt > 0
 			and (not characterInWorkspace or not root)
 			and plr.Parent == Players
+		local ghostVisualActive = roundActive and fullyTransparent
 		detector.GhostLastTransparency = transparency
-		detector.GhostVisualActive = fullyTransparent
+		detector.GhostVisualActive = ghostVisualActive
 		detector.GhostMissingActive = missingFromMap
-		detector.GhostActive = fullyTransparent or missingFromMap
+		detector.GhostActive = ghostVisualActive or missingFromMap
 		if detector.GhostActive then
 			detector.GhostESPPlayer = plr
 			detector.GhostActivationAt = detector.GhostActivationAt > 0 and detector.GhostActivationAt or tick()
-			State.MurdererName = plr.Name
 		else
 			detector.GhostActivationAt = 0
 			if detector.GhostESPPlayer == plr then detector.GhostESPPlayer = nil end
@@ -5691,6 +5778,29 @@ _G.Celestial.ConnectionRoleScanner =
 			elseif _G.Celestial.SpiderESPAPI and _G.Celestial.SpiderESPAPI.IsActive() then
 				_G.Celestial.SpiderESPAPI.Stop()
 			end
+			local mm2LobbyPhase = _G.Celestial.GameMode == "MM2" and not infectionBarnActive
+				and _G.Celestial.IsMM2LobbyPhaseConfirmed()
+			if mm2LobbyPhase then
+				State.MurdererName = ""
+				State.SheriffName = ""
+				State.HeroName = ""
+				State.OriginalSheriff = nil
+				State.HasGunBeenDropped = false
+				local ghostDetector = _G.Celestial.PowerDetector
+				if ghostDetector then
+					ghostDetector.GhostActive = false
+					ghostDetector.GhostVisualActive = false
+					ghostDetector.GhostMissingActive = false
+					ghostDetector.GhostESPPlayer = nil
+					ghostDetector.GhostActivationAt = 0
+					ghostDetector.GhostLastPlayer = nil
+					ghostDetector.GhostLastCharacter = nil
+					ghostDetector.GhostLastSeenAt = 0
+					ghostDetector.GhostLastKnownHealth = 0
+					ghostDetector.GhostLastKnownCFrame = nil
+					ghostDetector.GhostLastTransparency = 0
+				end
+			end
 			if #activePlayers <= 1 then
 				State.MurdererName = ""
 				State.SheriffName = ""
@@ -5712,7 +5822,7 @@ _G.Celestial.ConnectionRoleScanner =
 				CheckDuelsMatchState()
 				RefreshDuelsTeamAssignments()
 			end
-			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive then
+			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive and not mm2LobbyPhase then
 				local foundMurder = ""
 				local currentGunHolder = nil
 				for _, plr in ipairs(activePlayers) do
@@ -5928,13 +6038,28 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
+	if _G.Celestial.IsMM2LobbyPhaseConfirmed() then
+		if detector then
+			detector.GhostActive = false
+			detector.GhostVisualActive = false
+			detector.GhostMissingActive = false
+			detector.GhostESPPlayer = nil
+			detector.GhostActivationAt = 0
+		end
+		if _G.Celestial.GhostESPProxy then
+			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
+			_G.Celestial.GhostESPProxy = nil
+		end
+		return
+	end
 	local murderer = nil
 	if State.MurdererName ~= "" then murderer = Players:FindFirstChild(State.MurdererName) end
-	if not murderer and detector and detector.CurrentPower == "Ghost"
+	if not murderer and detector and detector.CurrentPower == "Ghost" and detector.GhostActive == true
 		and detector.CurrentPlayer and detector.CurrentPlayer.Parent == Players then
 		murderer = detector.CurrentPlayer
 	end
-	if not murderer and detector and detector.GhostESPPlayer and detector.GhostESPPlayer.Parent == Players then
+	if not murderer and detector and detector.GhostActive == true
+		and detector.GhostESPPlayer and detector.GhostESPPlayer.Parent == Players then
 		murderer = detector.GhostESPPlayer
 	end
 	if not murderer then
@@ -5968,30 +6093,6 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 	end
 	local charInWorkspace = char.Parent == Workspace
 	if not charInWorkspace and not ghostActiveLatched then return end
-	local ghostVisual = false
-	if detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer then
-		local transparency = GetGhostTransparency(char)
-		ghostVisual = transparency >= 0.98
-		if ghostVisual then
-			detector.GhostLastTransparency = transparency
-			detector.GhostVisualActive = true
-			detector.GhostActive = true
-			detector.GhostESPPlayer = murderer
-			if detector.GhostActivationAt == 0 then detector.GhostActivationAt = now end
-			State.MurdererName = murderer.Name
-		else detector.GhostVisualActive = false end
-	end
-	local ghostActive = ghostVisual
-		or (detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer and detector.GhostActive == true)
-	-- The role scanner owns ordinary Murder/Sheriff/Hero colors. This controller must not
-	-- repaint a stale Murder highlight while Ghost is inactive.
-	if not ghostActive then
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
-		return
-	end
 	local hl = _G.Celestial.Highlights[murderer]
 	if not hl or not hl.Parent then
 		hl = Instance.new("Highlight")
@@ -5999,6 +6100,18 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		hl.Parent = _G.Celestial.ESPFolder
 		_G.Celestial.Highlights[murderer] = hl
 	end
+	local ghostVisual = false
+	-- El detector de poderes decide si Ghost está activo; el renderizador solo presenta ese estado.
+	-- Así la transparencia no puede reactivar por sí sola un Ghost de la ronda anterior.
+	if detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer
+		and detector.GhostActive == true then
+		local transparency = GetGhostTransparency(char)
+		ghostVisual = transparency >= 0.98
+		detector.GhostLastTransparency = transparency
+		detector.GhostVisualActive = ghostVisual
+	end
+	local ghostActive = ghostVisual
+		or (detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer and detector.GhostActive == true)
 	local ghostAdornee = char
 	if ghostActive then
 		local proxyModel = AntiFlingQuantum.EnsureGhostESPProxy()
@@ -8032,11 +8145,10 @@ end
 
 local function IsAvailable(coin, now)
 	if not coin or not CoinEngine.CoinCache[coin] or not coin.Parent then return false end
-	if not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+	if not IsValidCoin(coin) then
 		UnregisterCoin(coin)
 		return false
 	end
-	if not IsSafeCoinPosition(coin.Position) then return false end
 	if IsCoinTemporarilyExcluded(coin, now) then return false end
 	local bl = CoinEngine.Blacklist[coin]
 	if bl then
@@ -8323,6 +8435,8 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	local candidates = {}
 	local immediateBest, immediateBestScore = nil, math.huge
 	local immediateCheckedCoin, immediateGrounded = nil, false
+	local immediateRouteCheckConsumed = false
+	local immediateFastPathAttempted = false
 	local immediateRadius = math.min(maxDistance, 18.0)
 	local immediateVerticalGap = math.min(maxGap, Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap))
 	local immediateForward = Vector3.zero
@@ -8340,7 +8454,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	end
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
-			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+			if not coin.Parent or not IsValidCoin(coin) then
 				UnregisterCoin(coin)
 			else
 				local bl = CoinEngine.Blacklist[coin]
@@ -8348,15 +8462,30 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 				local delta = coin.Position - fromPos
 				local verticalGap = math.abs(delta.Y)
 				local distance = delta.Magnitude
-				if not bl and IsSafeCoinPosition(coin.Position) and not IsCoinTemporarilyExcluded(coin, now)
+				if not bl and not IsCoinTemporarilyExcluded(coin, now)
 					and verticalGap <= maxGap and distance <= maxDistance then
 					candidates[#candidates + 1] = {coin = coin}
-					if maxRouteChecks > 0 and distance <= immediateRadius and verticalGap <= immediateVerticalGap then
-						local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
-						local forwardDot = 0
-						if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
-							forwardDot = immediateForward:Dot(horizontalDelta.Unit)
+					local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+					local forwardDot = 0
+					if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
+						forwardDot = immediateForward:Dot(horizontalDelta.Unit)
+					end
+					-- Caso urgente: moneda a <=4 studs y claramente delante, o prácticamente tocando
+					-- al jugador. Solo se acepta si pasa suelo y ruta; si no, continúa el selector normal.
+					if maxRouteChecks > 0 and not immediateFastPathAttempted and distance <= math.min(immediateRadius, 4.0)
+						and verticalGap <= immediateVerticalGap
+						and ((forwardDot >= 0.82 and horizontalDelta.Magnitude > 0.35) or distance <= 2.25) then
+						immediateFastPathAttempted = true
+						immediateCheckedCoin = coin
+						immediateGrounded = IsGrounded(coin)
+						if immediateGrounded then
+							immediateRouteCheckConsumed = true
+							if HasClearCoinRoute(fromPos, coin) then return coin end
+						else
+							CoinEngine.Blacklist[coin] = now + 2.5
 						end
+					end
+					if maxRouteChecks > 0 and distance <= immediateRadius and verticalGap <= immediateVerticalGap then
 						if forwardDot >= 0.15 or distance <= 8.0 or horizontalDelta.Magnitude <= 4.5 then
 							local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
 							if quickScore < immediateBestScore then
@@ -8374,10 +8503,11 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	-- Como el barrido del volumen es la prueba decisiva, un candidato inmediato solo recibe
 	-- una validacion de suelo y una de ruta. Si no pasa, se conserva como dato evaluado y el
 	-- selector habitual continua sin repetir esas mismas comprobaciones para la misma moneda.
-	if immediateBest and maxRouteChecks > 0 then
+	if immediateBest and maxRouteChecks > 0 and not immediateCheckedCoin then
 		immediateCheckedCoin = immediateBest
 		immediateGrounded = IsGrounded(immediateBest)
 		if immediateGrounded then
+			immediateRouteCheckConsumed = true
 			if HasClearCoinRoute(fromPos, immediateBest) then return immediateBest end
 		else
 			CoinEngine.Blacklist[immediateBest] = now + 2.5
@@ -8393,7 +8523,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 
 	-- Puntuar todo el cache es barato; consultar suelo y geometria no. Solo se examina un
 	-- shortlist pequeño y se hace el numero de comprobaciones de ruta solicitado por el caller.
-	local fallback, routeChecks = nil, 0
+	local fallback, routeChecks = nil, (immediateRouteCheckConsumed and maxRouteChecks or 0)
 	local groundChecks = immediateCheckedCoin and 1 or 0
 	for i = 1, math.min(12, #candidates) do
 		local coin = candidates[i].coin
@@ -8683,7 +8813,7 @@ local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit)
 		local candidates = {}
 		for coin in pairs(CoinEngine.CoinCache) do
 			if coin ~= exclude then
-				if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
+				if not coin.Parent or not IsValidCoin(coin) then
 					UnregisterCoin(coin)
 				else
 					local blacklistedUntil = CoinEngine.Blacklist[coin]
@@ -8694,8 +8824,7 @@ local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit)
 					local delta = coin.Position - fromPos
 					local verticalGap = math.abs(delta.Y)
 					local distance = delta.Magnitude
-					if not blacklistedUntil and IsSafeCoinPosition(coin.Position)
-						and not IsCoinTemporarilyExcluded(coin, now)
+					if not blacklistedUntil and not IsCoinTemporarilyExcluded(coin, now)
 						and verticalGap <= verticalLimit and distance <= maxDistance then
 						local score, safetyGap = ScoreThreatCandidate(coin.Position)
 						candidates[#candidates + 1] = {coin = coin, score = score, safetyGap = safetyGap}
