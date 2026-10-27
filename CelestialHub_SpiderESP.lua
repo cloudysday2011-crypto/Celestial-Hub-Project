@@ -6074,7 +6074,7 @@ local CoinEngine = {
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
-	AutoNoclipCheckInterval = 0.045,
+	AutoNoclipCheckInterval = 0.12,
 	NoclipConn = nil,
 	GroundOk = {},             -- [coin] = true cuando se comprobo que hay suelo bajo la moneda
 	PickupDistance = 0.45,      -- V3.11: radio respecto al punto de contacto ajustado a la altura del personaje
@@ -6338,17 +6338,10 @@ end
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
-	local name = string.lower(obj.Name or "")
-	if name == "coincontainer" then return false end
-	-- Nombres conocidos de monedas recolectables; no aceptar cualquier pieza
-	-- decorativa solo porque su nombre contenga "coin" o "cash".
-	local exactNames = {
-		coin = true, coin_server = true, coin_client = true, coin_pickup = true,
-		cash = true, cash_server = true, collectable = true, collectible = true,
-	}
-	if exactNames[name] then return true end
-	if name:match("^coin[_%-]%w+$") then return true end
-	if name:match("^cash[_%-]%w+$") then return true end
+	local name = string.lower(obj.Name)
+	if name == "coin" or name:find("coin") or name:find("cash") or name == "collectable" or name == "collectible" then
+		return name ~= "coincontainer"
+	end
 	return false
 end
 
@@ -7739,7 +7732,7 @@ local function HasClearCoinRoute(fromPos, coin)
 	return ok and hit == nil
 end
 
--- Una sola pasada O(N) para puntuar; solo hace hasta cinco raycasts sobre los candidatos mejor puntuados.
+-- Una sola pasada O(N) para puntuar; solo hace hasta cinco raycasts al comparar rutas candidatas.
 local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
@@ -7756,21 +7749,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 				local verticalGap = math.abs(delta.Y)
 				local distance = delta.Magnitude
 				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
-					-- Priorizar la fuente oficial de monedas; la distancia sigue decidiendo
-					-- entre candidatos de confianza similar.
-					local confidence = 0
-					local officialContainer = FindCoinContainer()
-					if officialContainer and coin:IsDescendantOf(officialContainer) then
-						confidence = 18
-					else
-						local n = string.lower(coin.Name)
-						if n == "coin" or n == "coin_server" or n == "coin_client"
-							or n == "cash" or n == "collectable" or n == "collectible" then
-							confidence = 8
-						end
-					end
-					local score = CoinTravelScore(fromPos, coin.Position) - confidence
-					candidates[#candidates + 1] = {coin = coin, score = score, distance = distance}
+					candidates[#candidates + 1] = {coin = coin, score = CoinTravelScore(fromPos, coin.Position)}
 				end
 			end
 		end
@@ -8288,12 +8267,9 @@ local function AdvanceTarget(root, now)
 	if c then
 		SetCurrent(c, now)
 	else
-		-- La caché puede quedar vacía durante un reparentado de un frame.
-		-- Retrasar brevemente el estado idle permite que DescendantAdded/Rescan repueble objetivos.
 		CoinEngine.CurrentTarget = nil
 		CoinEngine.NextTarget = nil
-		noTargetUntil = now + 0.025
-		nextPrepareAt = now + 0.025
+		noTargetUntil = now + 0.15
 	end
 end
 
@@ -8752,7 +8728,7 @@ local function ControllerStep(dt)
 
 	-- Mejora de objetivo con histéresis (evita oscilar por pequeñas diferencias)
 	if now >= nextImproveCheck then
-		nextImproveCheck = now + 0.075
+		nextImproveCheck = now + 0.18
 		local cur = CoinEngine.CurrentTarget
 		local cand
 		if CoinEngine.ThreatResponse.Active then
@@ -8811,7 +8787,7 @@ local function ControllerStep(dt)
 	-- Se mantienen las colisiones; un bloqueo persistente provoca una redireccion de ruta, no NoClip.
 	-- La velocidad efectiva tambien considera los picos de ping medidos.
 	if now >= nextSolidGuardCheck then
-		nextSolidGuardCheck = now + 0.06
+		nextSolidGuardCheck = now + 0.12
 		if IsInsideSolid(root.Position) then
 			solidOverlapActive = true
 			solidOverlapSince = solidOverlapSince or now
@@ -8954,7 +8930,6 @@ local function ControllerStep(dt)
 	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
 		ramp = math.min(ramp, 0.30) -- acelera la respuesta sin anular la rampa ni el limite de velocidad
 	end
-	-- La rampa progresiva original se conserva entre objetivos validos.
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
@@ -9068,64 +9043,32 @@ local function ControllerStep(dt)
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
-					-- Cadena continua: intenta usar el objetivo precalculado; si ya no sirve,
-					-- elige otra moneda inmediatamente. La ruta bloqueada no cancela la cadena:
-					-- UpdateAutoNoclip decide si corresponde un cruce temporal coordinado.
-					local maxChainDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-					local maxChainVertical = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+					-- Cadena de monedas: aprovecha la siguiente moneda precalculada si sigue disponible
+					-- y tiene ruta despejada. Mantiene una pausa corta y evita un barrido completo entre toques.
 					local chainNext = preparedNextCoin and preparedNextCoin ~= target
 						and IsAvailable(preparedNextCoin, now)
-						and (preparedNextCoin.Position - root.Position).Magnitude <= maxChainDistance
-						and math.abs(preparedNextCoin.Position.Y - root.Position.Y) <= maxChainVertical
-						and IsThreatSafeCoin(preparedNextCoin)
-					if not chainNext then
-						local immediateNext
-						if CoinEngine.ThreatResponse.Active then
-							immediateNext = PickThreatCoin(root.Position, target, now)
-						else
-							immediateNext = PickNearest(root.Position, target, now)
-						end
-						if immediateNext and IsAvailable(immediateNext, now)
-							and (immediateNext.Position - root.Position).Magnitude <= maxChainDistance
-							and math.abs(immediateNext.Position.Y - root.Position.Y) <= maxChainVertical
-							and IsThreatSafeCoin(immediateNext) then
-							preparedNextCoin = immediateNext
-							chainNext = true
-						end
-					end
+						and (preparedNextCoin.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+						and math.abs(preparedNextCoin.Position.Y - root.Position.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+						and HasClearCoinRoute(root.Position, preparedNextCoin)
 					if POST_COLLECT_PAUSE_ENABLED then
 						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
 					end
 					if chainNext then
 						SetCurrent(preparedNextCoin, now)
-						-- No frenar a la velocidad minima entre monedas; conservar el impulso
-						-- evita el paron visible cuando hay grupos de monedas.
-						currentSpeed = math.max(currentSpeed, CoinEngine.FlightMinSpeed)
-						lastFlightV = math.max(lastFlightV, CoinEngine.FlightMinSpeed)
-						nextPrepareAt = now + 0.01
-						LogEvent("coin-chain-next continuous=1 routeCheckedByNoclip=1")
+						currentSpeed = math.min(currentSpeed, CoinEngine.FlightMinSpeed)
+						lastFlightV = math.min(lastFlightV, CoinEngine.FlightMinSpeed)
+						nextPrepareAt = now + 0.03
+						LogEvent("coin-chain-next clear-route=1")
 					else
-						-- Solo detenerse si de verdad no hay ningun objetivo disponible.
-						-- AdvanceTarget hace una ultima busqueda inmediata antes de declarar el idle.
-						CoinEngine.CurrentTarget = nil
-						CoinEngine.NextTarget = nil
-						AdvanceTarget(root, now)
-						if CoinEngine.CurrentTarget then
-							currentSpeed = math.max(currentSpeed, CoinEngine.FlightMinSpeed)
-							lastFlightV = math.max(lastFlightV, CoinEngine.FlightMinSpeed)
-							nextPrepareAt = now + 0.01
-							LogEvent("coin-chain-recovered immediate=1")
-						else
 						currentSpeed = 0
 						lastFlightV = 0
+						CoinEngine.CurrentTarget = nil
+						CoinEngine.NextTarget = nil
+						nextPrepareAt = pauseUntil
 						CoinEngine.LastCommandVelocity = Vector3.zero
 						if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
-						LogEvent("coin-chain-idle no-available-target=1")
 					end
-					end
-					-- Si hay un objetivo siguiente, conserva la ultima orden de vuelo este frame;
-					-- SafeControllerStep solo pone la velocidad a cero cuando no se aplico ninguna.
-					velApplied = CoinEngine.CurrentTarget ~= nil
+					velApplied = false
 					LogEvent(string.format("coin-post-collect-pause enabled=%d hold=%.2f chain=%d", POST_COLLECT_PAUSE_ENABLED and 1 or 0, POST_COLLECT_PAUSE_ENABLED and POST_COLLECT_PAUSE or 0, chainNext and 1 or 0))
 
 					-- Lotes FIJOS por monedas recogidas: 13, 13, 13 y 11 (total 50). No depende de la interfaz del juego.
