@@ -6419,8 +6419,17 @@ local function UnregisterCoin(coin)
 	CoinEngine.Attempts[coin] = nil
 	CoinEngine.GroundOk[coin] = nil
 	CoinEngine.RouteCheckCache[coin] = nil
-	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
-	if CoinEngine.NextTarget == coin then CoinEngine.NextTarget = nil end
+	local lostCurrent = CoinEngine.CurrentTarget == coin
+	local lostNext = CoinEngine.NextTarget == coin
+	if lostCurrent then CoinEngine.CurrentTarget = nil end
+	if lostNext then CoinEngine.NextTarget = nil end
+	-- Wake the selector immediately when an event removes either active or prefetched target.
+	-- Do not reset currentSpeed/LastCommandVelocity here: the movement controller owns steering
+	-- and can redirect on its next Heartbeat without a full flight reset.
+	if lostCurrent or lostNext then
+		nextPrepareAt = 0
+		noTargetUntil = 0
+	end
 end
 
 local COIN_SOURCE_NAMES = {"Map", "Normal", "Round"}
@@ -8304,7 +8313,9 @@ local function PrepareNext(now)
 		nxt = PickNearest(cur.Position, cur, now)
 	end
 	CoinEngine.NextTarget = nxt
-	nextPrepareAt = nxt and math.huge or (now + 0.25)
+	-- Keep a warm alternative refreshed during travel. A prefetched coin can be collected
+	-- by another player, so never freeze candidate preparation at math.huge.
+	nextPrepareAt = now + (nxt and 0.12 or 0.06)
 end
 
 local function SetCurrent(coin, now)
@@ -8800,7 +8811,13 @@ local function ControllerStep(dt)
 	end
 
 	-- Preparar el siguiente objetivo mientras se viaja al actual
-	if not CoinEngine.NextTarget and now >= nextPrepareAt then PrepareNext(now) end
+	-- Keep a candidate warm while traveling, but refresh it periodically so a collected,
+	-- moved, or newly spawned coin cannot leave the queue stale for the rest of the route.
+	if now >= nextPrepareAt then PrepareNext(now) end
+	if CoinEngine.NextTarget and not IsAvailable(CoinEngine.NextTarget, now) then
+		CoinEngine.NextTarget = nil
+		nextPrepareAt = now
+	end
 
 	-- Mejora de objetivo con histéresis (evita oscilar por pequeñas diferencias)
 	if now >= nextImproveCheck then
