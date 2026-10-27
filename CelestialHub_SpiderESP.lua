@@ -1,3 +1,6 @@
+-- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
+-- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
+-- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
 -- StabilityLog19: confirmed Infection Barn context, shared role classification, +25% passive speed, event-first coin registration.
 -- V3.39 AutoFarm Extreme V4: context-aware decision coordination; NoClip internals preserved.
 -- Infection Barn special behavior requires explicit mode evidence plus the matching loaded map.
@@ -2060,6 +2063,9 @@ end
 -- ====================================================================
 
 local AntiFlingQuantum = {
+	RosterSnapshot = {},
+	RosterSet = {},
+	RosterRevision = 0,
 	ProtectedPlayers = {},
 	SuspiciousPlayers = {},
 	DangerousPlayers = {},
@@ -2379,9 +2385,33 @@ local function DetachPlayer(player)
 	end
 end
 
-for _, player in ipairs(Players:GetPlayers()) do AttachPlayer(player) end
-AntiFlingQuantum.PlayerAddedConnection = Players.PlayerAdded:Connect(function(player) AttachPlayer(player) end)
-AntiFlingQuantum.PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player) DetachPlayer(player) end)
+AntiFlingQuantum.RosterSnapshot = Players:GetPlayers()
+AntiFlingQuantum.RosterSet = {}
+for _, player in ipairs(AntiFlingQuantum.RosterSnapshot) do
+	AntiFlingQuantum.RosterSet[player] = true
+	AttachPlayer(player)
+end
+AntiFlingQuantum.PlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
+	AttachPlayer(player)
+	if not AntiFlingQuantum.RosterSet[player] then
+		AntiFlingQuantum.RosterSet[player] = true
+		table.insert(AntiFlingQuantum.RosterSnapshot, player)
+		AntiFlingQuantum.RosterRevision += 1
+	end
+end)
+AntiFlingQuantum.PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+	DetachPlayer(player)
+	if AntiFlingQuantum.RosterSet[player] then
+		AntiFlingQuantum.RosterSet[player] = nil
+		for i = #AntiFlingQuantum.RosterSnapshot, 1, -1 do
+			if AntiFlingQuantum.RosterSnapshot[i] == player then
+				table.remove(AntiFlingQuantum.RosterSnapshot, i)
+				break
+			end
+		end
+		AntiFlingQuantum.RosterRevision += 1
+	end
+end)
 
 function AntiFlingQuantum.DetectWorldRelocation(allPlayers, now)
 	if now < (AntiFlingQuantum.WorldRelocationUntil or 0) then return true end
@@ -3260,6 +3290,7 @@ local QMAScheduler = {
 	RosterSet = {},
 	ProcessedThisCycle = {},
 	CycleSerial = 0,
+	RosterRevision = -1,
 }
 
 function QMAScheduler.RebuildQueue(allPlayers)
@@ -3287,26 +3318,19 @@ function QMAScheduler.RebuildQueue(allPlayers)
 	QMAScheduler.Index = 1
 	QMAScheduler.NextBatchTime = tick()
 	QMAScheduler.LastPlayerCount = N
+	QMAScheduler.RosterRevision = tonumber(AntiFlingQuantum.RosterRevision) or 0
 	QMAScheduler.RosterInitialized = true
 	QMAScheduler.CycleComplete = false
 	QMAScheduler.CycleSerial += 1
 end
 
 function QMAScheduler.HasRosterChanged(allPlayers)
-	if not QMAScheduler.RosterInitialized or #allPlayers ~= #QMAScheduler.Queue then
-		return true
-	end
-	local current = {}
-	for _, plr in ipairs(allPlayers) do
-		if plr then current[plr] = true end
-	end
-	for _, plr in ipairs(QMAScheduler.Queue) do
-		if not current[plr] then return true end
-	end
-	for plr in pairs(current) do
-		if not QMAScheduler.RosterSet[plr] then return true end
-	end
-	return false
+	-- PlayerAdded/PlayerRemoving maintain RosterRevision. Avoid allocating and comparing
+	-- a fresh player set on every Heartbeat just to rediscover an unchanged roster.
+	local rosterRevision = tonumber(AntiFlingQuantum.RosterRevision) or 0
+	return not QMAScheduler.RosterInitialized
+		or rosterRevision ~= QMAScheduler.RosterRevision
+		or #allPlayers ~= #QMAScheduler.Queue
 end
 
 function QMAScheduler.GetSharedData(allPlayers, now)
@@ -3353,6 +3377,7 @@ function QMAScheduler.GetSharedData(allPlayers, now)
 end
 
 local function AntiFlingQuantumFastTick(now)
+	local playerRoster = AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()
 	local myRoot = GetRoot()
 	local myHumanoid = GetHumanoid()
 	if not myRoot or not myHumanoid or myHumanoid.Health <= 0 then
@@ -3387,19 +3412,19 @@ local function AntiFlingQuantumFastTick(now)
 		if now - (AntiFlingQuantum.LastPassThroughCheck or 0) >= 0.25 then
 			AntiFlingQuantum.LastPassThroughCheck = now
 			-- Isolate only character-to-character physical collision; map and coin parts are untouched.
-			AntiFlingQuantum.EnsurePlayerPassThrough(Players:GetPlayers(), now)
+			AntiFlingQuantum.EnsurePlayerPassThrough(playerRoster, now)
 		end
 		
 		local existingDanger = next(AntiFlingQuantum.DangerousPlayers) ~= nil
 		local isolateNow = emergencyIsolation or existingDanger
-		AntiFlingQuantum.UpdateLocalPlayerIsolation(Players:GetPlayers(), isolateNow, now, isolationReason)
+		AntiFlingQuantum.UpdateLocalPlayerIsolation(playerRoster, isolateNow, now, isolationReason)
 		
 		if residualDetected or isolateNow or AntiFlingQuantum.CriticalMode then
 			StabilizeLocalCharacter(myRoot, AntiFlingQuantum.CriticalMode or isolateNow, true)
 		end
 	else
 		AntiFlingQuantum.ClearPlayerPassThrough()
-		AntiFlingQuantum.UpdateLocalPlayerIsolation(Players:GetPlayers(), false, now)
+		AntiFlingQuantum.UpdateLocalPlayerIsolation(playerRoster, false, now)
 	end
 	CleanupInvalidPlayers()
 end
@@ -3486,14 +3511,21 @@ local function OTI_ResolveOwner(obj, myRoot)
 	if data and data.Owner and data.Owner.Parent and now - (data.OwnerLastCheck or 0) < 0.35 then
 		return data.Owner, data.OwnerReason or "cached"
 	end
+	local playerRoster = AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()
 	local ancestor = obj
 	local depth = 0
 	while ancestor and depth < 5 do
-		local nameLower = string.lower(ancestor.Name or "")
-		for _, plr in ipairs(Players:GetPlayers()) do
+		local ancestorName = tostring(ancestor.Name or "")
+		local exactPlayer = Players:FindFirstChild(ancestorName)
+		if exactPlayer and exactPlayer ~= LocalPlayer and #exactPlayer.Name >= 3 then
+			return exactPlayer, "name:" .. ancestorName
+		end
+		local nameLower = string.lower(ancestorName)
+		-- Keep the previous substring fallback for custom object names, but reuse the event cache.
+		for _, plr in ipairs(playerRoster) do
 			if plr ~= LocalPlayer then
 				local n = string.lower(plr.Name)
-				if #n >= 3 and nameLower:find(n, 1, true) then return plr, "name:" .. ancestor.Name end
+				if #n >= 3 and nameLower:find(n, 1, true) then return plr, "name:" .. ancestorName end
 			end
 		end
 		ancestor = ancestor.Parent
@@ -3504,7 +3536,7 @@ local function OTI_ResolveOwner(obj, myRoot)
 	if velocity.Magnitude < 12 and angular < 180 then return nil, nil end
 	local pos = obj.Position
 	local bestPlr, bestDist = nil, 8
-	for _, plr in ipairs(Players:GetPlayers()) do
+	for _, plr in ipairs(playerRoster) do
 		if plr ~= LocalPlayer then
 			local root = GetRoot(plr)
 			if root then
@@ -3627,7 +3659,8 @@ local function OTI_Tick()
 	if not State.OTIActive then return end
 	local myRoot = GetRoot()
 	if not myRoot then return end
-	local now, myPos = tick(), GetRoot().Position
+	local now, myPos = tick(), myRoot.Position
+	local playerRoster = AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()
 	if now - OTI.LastPoolRefresh >= GetOTIPoolRefreshInterval() then
 		OTI.LastPoolRefresh = now; pcall(OTI_RefreshPool, myPos)
 	end
@@ -3710,7 +3743,7 @@ local function OTI_Tick()
 			for obj, score in pairs(entry.objects) do
 				if obj and obj.Parent and score >= otCritThreshold and not OTI_IsHeldOrInteractive(obj) then
 					local pos = obj.Position
-					for _, plr in ipairs(Players:GetPlayers()) do
+					for _, plr in ipairs(playerRoster) do
 						if plr ~= owner and plr ~= LocalPlayer then
 							local root = GetRoot(plr)
 							if root and (root.Position - pos).Magnitude <= GetOTIThreatDistance() then criticalEvidence = true; break end
@@ -3789,7 +3822,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 		pcall(AntiFlingQuantumFastTick, now)
 	end
 	
-	local allPlayers = Players:GetPlayers()
+	local allPlayers = AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()
 	if QMAScheduler.HasRosterChanged(allPlayers) then
 		QMAScheduler.RebuildQueue(allPlayers)
 		_G.Celestial.BeginRealPlayerScanCycle(allPlayers)
@@ -4163,6 +4196,10 @@ local PowerWatchRevision = 0
 _G.Celestial.PowerWatchConnections = PowerWatchConnections
 
 local function ClearPowerWatchers()
+	if PowerWatchPlayer == nil and PowerWatchCharacter == nil
+		and #PowerWatchConnections == 0 and next(PowerWatchInstances) == nil then
+		return
+	end
 	for _, connection in pairs(PowerWatchConnections) do
 		pcall(function() connection:Disconnect() end)
 	end
@@ -4217,8 +4254,17 @@ local function SetupPowerWatchers(murderPlayer)
 	end
 end
 
+AntiFlingQuantum.GhostTransparencyCache = AntiFlingQuantum.GhostTransparencyCache
+	or setmetatable({}, {__mode = "k"})
+AntiFlingQuantum.GhostTransparencyCacheTTL = 0.075
 local function GetGhostTransparency(character)
 	if not character then return 0 end
+	local now = os.clock()
+	local cache = AntiFlingQuantum.GhostTransparencyCache
+	local cached = cache[character]
+	if cached and now - cached.at < AntiFlingQuantum.GhostTransparencyCacheTTL then
+		return cached.value
+	end
 	local maxTransparency = 0
 	local partCount = 0
 	local nearlyTransparentCount = 0
@@ -4230,8 +4276,9 @@ local function GetGhostTransparency(character)
 			if effectiveTransparency >= 0.98 then nearlyTransparentCount += 1 end
 		end
 	end
-	if partCount >= 3 and nearlyTransparentCount >= math.max(3, math.ceil(partCount * 0.80)) then return 1 end
-	return maxTransparency
+	local result = (partCount >= 3 and nearlyTransparentCount >= math.max(3, math.ceil(partCount * 0.80))) and 1 or maxTransparency
+	AntiFlingQuantum.GhostTransparencyCache[character] = {at = now, value = result}
+	return result
 end
 
 local function NormalizePowerText(value)
@@ -4551,28 +4598,39 @@ local function IsPowerCurrentlyActive(plr, powerName)
 			detector.SprintLastSampleAt = 0
 			detector.SprintConfirmCount = 0
 			detector.SprintSpikeAt = 0
+			detector.SprintPeerMedianAt = 0
+			detector.SprintPeerMedianRosterRevision = -1
 		end
-		local innocentWalkSpeeds = {}
-		for _, otherPlr in ipairs(Players:GetPlayers()) do
-			if otherPlr ~= LocalPlayer and otherPlr ~= plr then
-				local hum = GetHumanoid(otherPlr)
-				if hum and hum.Health > 0 then
-					local walkSpeed = tonumber(hum.WalkSpeed) or 0
-					if walkSpeed > 0 and walkSpeed < 100 then table.insert(innocentWalkSpeeds, walkSpeed) end
+		local rosterRevision = tonumber(AntiFlingQuantum.RosterRevision) or 0
+		local peerSampleDue = now - (detector.SprintPeerMedianAt or 0) >= 0.50
+			or detector.SprintPeerMedianRosterRevision ~= rosterRevision
+		if peerSampleDue then
+			local innocentWalkSpeeds = {}
+			for _, otherPlr in ipairs(AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()) do
+				if otherPlr ~= LocalPlayer and otherPlr ~= plr then
+					local hum = GetHumanoid(otherPlr)
+					if hum and hum.Health > 0 then
+						local walkSpeed = tonumber(hum.WalkSpeed) or 0
+						if walkSpeed > 0 and walkSpeed < 100 then table.insert(innocentWalkSpeeds, walkSpeed) end
+					end
 				end
 			end
-		end
-		local innocentWalkSpeed = 16
-		if #innocentWalkSpeeds > 0 then
-			table.sort(innocentWalkSpeeds)
-			local middle = (#innocentWalkSpeeds + 1) / 2
-			if middle % 1 == 0 then innocentWalkSpeed = innocentWalkSpeeds[middle]
-			else
-				local lower = innocentWalkSpeeds[math.floor(middle)]
-				local upper = innocentWalkSpeeds[math.ceil(middle)]
-				innocentWalkSpeed = (lower + upper) / 2
+			local peerMedian = 16
+			if #innocentWalkSpeeds > 0 then
+				table.sort(innocentWalkSpeeds)
+				local middle = (#innocentWalkSpeeds + 1) / 2
+				if middle % 1 == 0 then peerMedian = innocentWalkSpeeds[middle]
+				else
+					local lower = innocentWalkSpeeds[math.floor(middle)]
+					local upper = innocentWalkSpeeds[math.ceil(middle)]
+					peerMedian = (lower + upper) / 2
+				end
 			end
+			detector.SprintPeerMedianWalkSpeed = peerMedian
+			detector.SprintPeerMedianAt = now
+			detector.SprintPeerMedianRosterRevision = rosterRevision
 		end
+		local innocentWalkSpeed = tonumber(detector.SprintPeerMedianWalkSpeed) or 16
 		if (detector.SprintBaselineWalkSpeed or 0) <= 0 then detector.SprintBaselineWalkSpeed = innocentWalkSpeed end
 		local murdererWalkSpeed = tonumber(murderHumanoid.WalkSpeed) or 0
 		local murderVelocity = murderRoot.AssemblyLinearVelocity
@@ -4659,7 +4717,9 @@ _G.Celestial.PowerDetector = {
 	SprintActive = false, SprintRatio = 0, SprintBaselineWalkSpeed = 0,
 	SprintLastWalkSpeed = 0, SprintLastMoveSpeed = 0, SprintLastSampleAt = 0,
 	SprintLastPlayer = nil, SprintLastCharacter = nil, SprintConfirmCount = 0,
-	SprintSpikeAt = 0
+	SprintSpikeAt = 0, SprintPeerMedianWalkSpeed = 16, SprintPeerMedianAt = 0,
+	SprintPeerMedianRosterRevision = -1,
+	Fallback = {Murderer = nil, Character = nil, NextScanAt = 0, RosterRevision = -1, Initialized = false}
 }
 
 local function UpdatePowerDetectorState()
@@ -4670,6 +4730,7 @@ local function UpdatePowerDetectorState()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
+	local now = tick()
 	local murderName = State.MurdererName
 	local murderPlayer = murderName ~= "" and Players:FindFirstChild(murderName) or nil
 	if not murderPlayer and detector.CurrentPower == "Ghost"
@@ -4677,13 +4738,35 @@ local function UpdatePowerDetectorState()
 		and detector.CurrentPlayer.Parent == Players then
 		murderPlayer = detector.CurrentPlayer
 	end
-	if not murderPlayer then
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if plr ~= LocalPlayer and plr.Character then
-				local hum = GetHumanoid(plr)
-				if hum and hum.Health > 0 then
-					local isKnife = CheckPlayerInventory(plr)
-					if isKnife then murderPlayer = plr; break end
+	if murderPlayer then
+		detector.Fallback.Murderer = murderPlayer
+		detector.Fallback.Character = murderPlayer.Character
+		detector.Fallback.RosterRevision = tonumber(AntiFlingQuantum.RosterRevision) or 0
+		detector.Fallback.NextScanAt = now + 0.22
+		detector.Fallback.Initialized = true
+	else
+		local rosterRevision = tonumber(AntiFlingQuantum.RosterRevision) or 0
+		local cached = detector.Fallback.Murderer
+		local cachedInvalid = cached ~= nil and (cached.Parent ~= Players or cached.Character ~= detector.Fallback.Character)
+		local rosterChanged = rosterRevision ~= detector.Fallback.RosterRevision
+		if detector.Fallback.Initialized and cached and not cachedInvalid and not rosterChanged
+			and now < detector.Fallback.NextScanAt then
+			murderPlayer = cached
+		elseif now >= detector.Fallback.NextScanAt or cachedInvalid or rosterChanged or not detector.Fallback.Initialized then
+			detector.Fallback.Initialized = true
+			detector.Fallback.NextScanAt = now + 0.22
+			detector.Fallback.RosterRevision = rosterRevision
+			detector.Fallback.Murderer = nil
+			detector.Fallback.Character = nil
+			for _, plr in ipairs(AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()) do
+				if plr ~= LocalPlayer and plr.Character then
+					local hum = GetHumanoid(plr)
+					if hum and hum.Health > 0 and CheckPlayerInventory(plr) then
+						murderPlayer = plr
+						detector.Fallback.Murderer = plr
+						detector.Fallback.Character = plr.Character
+						break
+					end
 				end
 			end
 		end
@@ -4710,7 +4793,6 @@ local function UpdatePowerDetectorState()
 		return
 	end
 	SetupPowerWatchers(murderPlayer)
-	local now = tick()
 	local character = murderPlayer.Character
 	local cache = PowerDetectionCache[murderPlayer]
 	local detectedPower
@@ -7163,6 +7245,8 @@ end
 local COIN_SOURCE_NAMES = {"Map", "Normal", "Round"}
 local coinSourceRoots = {container = nil, named = {}}
 local nextCoinSourceRefreshAt = 0
+CoinEngine.LastWorkspaceFallbackScanAt = -math.huge
+CoinEngine.WorkspaceFallbackScanInterval = 4.0
 local function RefreshCoinSourceRoots()
 	local now = os.clock()
 	if now < nextCoinSourceRefreshAt then return end
@@ -7220,8 +7304,13 @@ local function RescanCoins()
 	end
 	-- Fallback compatible con mapas que guardan monedas directamente en Workspace.
 	-- ScanContainer solo registra BaseParts cuyo nombre coincide con CoinNameMatches y pasa IsValidCoin.
-	if found == 0 and CoinEngine.CoinCount == 0 then
+	local now = os.clock()
+	if found == 0 and CoinEngine.CoinCount == 0
+		and now - (CoinEngine.LastWorkspaceFallbackScanAt or -math.huge) >= (CoinEngine.WorkspaceFallbackScanInterval or 4.0) then
+		-- Full Workspace fallback is only a safety net. New coin instances are registered by
+		-- DescendantAdded immediately, so repeated whole-world scans while the cache is empty add cost without improving event response.
 		found = ScanContainer(Workspace)
+		CoinEngine.LastWorkspaceFallbackScanAt = now
 	end
 	lastContainer = container
 	if found > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.5) end
@@ -8884,6 +8973,66 @@ local function RecordNavigationTiming(kind, startedAt, target)
 	return elapsedMs
 end
 
+-- Bounded shortlist used by prefetch calls (routeCheckLimit == 0). The old path allocated
+-- one table per coin and sorted the complete cache even though prefetch only validates up to
+-- eight ground candidates and never performs a route raycast. Try the nearby spatial cells first.
+CoinEngine.InsertBoundedCoinCandidate = function(shortlist, coin, score, limit)
+	if #shortlist >= limit and score >= shortlist[#shortlist].score then return end
+	local entry = {coin = coin, score = score}
+	local insertAt = #shortlist + 1
+	for i = 1, #shortlist do
+		if score < shortlist[i].score then insertAt = i; break end
+	end
+	table.insert(shortlist, insertAt, entry)
+	if #shortlist > limit then table.remove(shortlist) end
+end
+
+CoinEngine.PickNearestPrefetchBounded = function(fromPos, exclude, now, maxGap, maxDistance)
+	local shortlist, limit = {}, 12
+	local maxDistanceSq = maxDistance * maxDistance
+	local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
+	local localRadius = math.min(maxDistance, cellSize)
+	local localRadiusSq = localRadius * localRadius
+	local cx, cy, cz = math.floor(fromPos.X / cellSize), math.floor(fromPos.Y / cellSize), math.floor(fromPos.Z / cellSize)
+	local function consider(coin, localOnly)
+		if not coin or coin == exclude or not CoinEngine.CoinCache[coin] then return end
+		if not coin.Parent or not IsValidCoin(coin) then UnregisterCoin(coin); return end
+		local blacklistedUntil = CoinEngine.Blacklist[coin]
+		if blacklistedUntil and blacklistedUntil <= now then CoinEngine.Blacklist[coin] = nil; blacklistedUntil = nil end
+		if blacklistedUntil or IsCoinTemporarilyExcluded(coin, now) then return end
+		local pos = coin.Position
+		local dx, dy, dz = pos.X - fromPos.X, pos.Y - fromPos.Y, pos.Z - fromPos.Z
+		local distanceSq = dx * dx + dy * dy + dz * dz
+		if math.abs(dy) > maxGap or distanceSq > maxDistanceSq then return end
+		if localOnly and distanceSq > localRadiusSq then return end
+		local score = ThreatAwareCoinScore(fromPos, pos, now) - GetCoinChainBonus(coin)
+		CoinEngine.InsertBoundedCoinCandidate(shortlist, coin, score, limit)
+	end
+	for ix = cx - 1, cx + 1 do
+		for iy = cy - 1, cy + 1 do
+			for iz = cz - 1, cz + 1 do
+				local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+				if bucket then for coin in pairs(bucket) do consider(coin, true) end end
+			end
+		end
+	end
+	local function firstGroundedCandidate()
+		for i = 1, math.min(8, #shortlist) do
+			local coin = shortlist[i].coin
+			if IsGrounded(coin) then return coin end
+			CoinEngine.Blacklist[coin] = now + 2.5
+		end
+		return nil
+	end
+	local localWinner = firstGroundedCandidate()
+	if localWinner then return localWinner end
+	-- Only pay for a full-cache pass when the local spatial neighborhood has no usable coin.
+	table.clear(shortlist)
+	for coin in pairs(CoinEngine.CoinCache) do consider(coin, false) end
+	-- InsertBoundedCoinCandidate keeps this shortlist sorted as it is built.
+	return firstGroundedCandidate()
+end
+
 -- Una pasada O(N) para puntuar; limita raycasts y revisa suelo sin repetir escaneos completos.
 -- Atajo de moneda inmediata: aprovecha la misma pasada del cache para identificar un candidato
 -- cercano y hacia el rumbo actual. Si el volumen directo esta libre, se devuelve antes de ordenar
@@ -8893,6 +9042,9 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
+	if maxRouteChecks == 0 then
+		return CoinEngine.PickNearestPrefetchBounded(fromPos, exclude, now, maxGap, maxDistance)
+	end
 	local candidates = {}
 	local immediateBest, immediateBestScore = nil, math.huge
 	local immediateCheckedCoin, immediateGrounded = nil, false
@@ -8919,7 +9071,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 		local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
 		local cx, cy, cz = math.floor(fromPos.X / cellSize), math.floor(fromPos.Y / cellSize), math.floor(fromPos.Z / cellSize)
 		local localBest, localBestScore = nil, math.huge
-		local immediateDistanceLimit = math.min(immediateRadius, 4.0)
+		local immediateDistanceLimit = math.min(immediateRadius, 6.0)
 		local immediateDistanceLimitSq = immediateDistanceLimit * immediateDistanceLimit
 		for ix = cx - 1, cx + 1 do
 			for iy = cy - 1, cy + 1 do
@@ -8945,7 +9097,8 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 										if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
 											forwardDot = immediateForward:Dot(horizontalDelta.Unit)
 										end
-										if (forwardDot >= 0.82 and horizontalDelta.Magnitude > 0.35) or distance <= 2.25 then
+										if (forwardDot >= -0.10 and horizontalDelta.Magnitude > 0.35)
+											or horizontalDelta.Magnitude <= 4.0 or distance <= 2.25 then
 											local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
 											quickScore -= GetCoinChainBonus(coin)
 											if quickScore < localBestScore then
@@ -9171,7 +9324,7 @@ local function ResolveFarmMurderer(now)
 	threat.NextRoleScanAt = now + threat.RoleScanInterval
 
 	-- Low-frequency fallback mirrors the Dangerometer's inventory-based Murderer check.
-	for _, plr in ipairs(Players:GetPlayers()) do
+	for _, plr in ipairs(AntiFlingQuantum.RosterSnapshot or Players:GetPlayers()) do
 		if IsLiveThreatPlayer(plr) then
 			local ok, isKnife = pcall(CheckPlayerInventory, plr)
 			if ok and isKnife then
