@@ -1,11 +1,12 @@
--- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
--- V3.38 AutoFarm Extreme V3: centralized movement priority, predictive Murder approach, coherent escape speed; NoClip internals preserved.
+-- StabilityLog19: confirmed Infection Barn context, shared role classification, +25% passive speed, event-first coin registration.
+-- V3.39 AutoFarm Extreme V4: context-aware decision coordination; NoClip internals preserved.
+-- Infection Barn special behavior requires explicit mode evidence plus the matching loaded map.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
 -- V3.25: confirms an actually clear exit position before restoring collisions and centralizes the chain-acceleration factor.
 -- V3.24: bounded multi-offset obstacle routing, route hysteresis, and directed exit-solid recovery aim.
--- Chain acceleration uses one shared 1.25 multiplier for both controller limits; the speed cap remains unchanged.
+-- The chain-only 1.25 acceleration factor remains separate from the new permanent 1.25 speed multiplier.
 -- Keeps the configured cruise cap and chain-only acceleration; avoids aiming through the whole map while exiting a solid.
 -- V3.23: based on V3.22; keeps position-stability limits while making emergency routing frame-budget adaptive.
 -- Adds target/role/threat context to each diagnostic sample for better Invalid Position analysis.
@@ -1984,8 +1985,8 @@ local COLOR_GHOST    = Color3.fromRGB(225, 225, 225)
 local COLOR_TEAM_SELF = Color3.fromRGB(255, 100, 50)
 local COLOR_TEAM_ENEMY = Color3.fromRGB(160, 0, 255)
 local COLOR_LOBBY_WHITE = Color3.fromRGB(255, 255, 255)
-local COLOR_INFECTION_SURVIVOR = Color3.fromRGB(255, 176, 0) -- #FFB000
-local COLOR_INFECTION_ZOMBIE = Color3.fromRGB(57, 255, 20) -- #39FF14
+local COLOR_INFECTION_SURVIVOR = Color3.fromRGB(90, 220, 255) -- #5ADCFF (celeste)
+local COLOR_INFECTION_ZOMBIE = Color3.fromRGB(0, 95, 45) -- #005F2D (verde oscuro)
 
 -- ====================================================================
 -- HELPERS
@@ -5595,65 +5596,285 @@ end
 -- INFECTION BARN ESP (isolated override; normal MM2/DUELS/SPIDER colors untouched)
 -- ====================================================================
 local InfectionBarnESP = {
-	Active = false,
+	Active = false, -- true only when mode + map + loaded-player conditions are corroborated
 	MapCheckedAt = 0,
-	MapLoaded = false,
+	MapLoaded = false, -- raw map evidence; not sufficient to activate Infection behavior
+	MapSignalObject = nil, -- cached exact map marker; revalidated before reuse
+	MapDeepScanCheckedAt = 0,
+	LastCharacterReadyAt = 0,
+	ModeCheckedAt = 0,
+	ModeSignalDetected = false,
+	ModeSignalText = nil,
+	ModeSignalObject = nil,
+	ModeSignalAttribute = nil,	
+	ModeSignalProperty = nil,
+	Confirmed = false,
+	ContextStatus = "UNKNOWN",
 	RoundStartedAt = 0,
 	LastWeaponState = {},
 	AvatarBaseline = {},
 	RoleByPlayer = {},
 }
 _G.Celestial.InfectionBarnESP = InfectionBarnESP
+-- Shared context contract for the context/role decision engine and the AutoFarm controller.
+-- The movement authority remains the existing CoinEngine.ControllerStep.
+_G.Celestial.AutoFarmDecisionContext = _G.Celestial.AutoFarmDecisionContext or {}
+_G.Celestial.AutoFarmDecisionContext.Status = "UNKNOWN"
+_G.Celestial.AutoFarmDecisionContext.IsInfectionBarn = false
+_G.Celestial.AutoFarmDecisionContext.MapConfirmed = false
+_G.Celestial.AutoFarmDecisionContext.ModeConfirmed = false
+_G.Celestial.AutoFarmDecisionContext.RoundModeSignal = nil
+_G.Celestial.AutoFarmDecisionContext.RoleByPlayer = InfectionBarnESP.RoleByPlayer
+_G.Celestial.AutoFarmDecisionContext.MovementAuthority = "CoinEngine.ControllerStep"
 
 local function CH_NormalizeMapToken(value)
 	if type(value) ~= "string" then return "" end
 	return string.upper((value:gsub("[^%w]", "")))
 end
 
+InfectionBarnESP.ReadExplicitModeSignal = function(now, allowDeepScan)
+	now = tonumber(now) or tick()
+	local modeKeys = {
+		GAMEMODE = true, CURRENTGAMEMODE = true, GAMEMODENAME = true,
+		MODE = true, CURRENTMODE = true, MODENAME = true,
+		ROUNDMODE = true, ROUNDTYPE = true, GAMETYPE = true,
+		CURRENTGAMETYPE = true, EVENTMODE = true, INFECTIONMODE = true,
+		ISINFECTION = true, ISINFECTIONMODE = true, ROUNDTITLE = true, MODELABEL = true,
+		GAMEMODELABEL = true, CURRENTMODELABEL = true, ROUNDMODELABEL = true,
+		MODEINDICATOR = true, EVENTMODELABEL = true, ROUNDINFO = true,
+	}
+	local function ModeValueMatches(keyName, value)
+		local key = CH_NormalizeMapToken(keyName)
+		if not modeKeys[key] then return false end
+		if type(value) == "string" then
+			local token = CH_NormalizeMapToken(value)
+			return token:find("INFECTION", 1, true) ~= nil
+		elseif type(value) == "boolean" and value then
+			return key == "ISINFECTION" or key == "ISINFECTIONMODE" or key == "INFECTIONMODE"
+		end
+		return false
+	end
+	local function ReadSignalObject(obj, prop, attributeName)
+		if not obj then return nil end
+		local ok, value = pcall(function()
+			if prop == "attribute" then return obj:GetAttribute(attributeName) end
+			if prop == "text" then return obj.Text end
+			if prop == "value" then return obj.Value end
+			return nil
+		end)
+		return ok and value or nil
+	end
+	local function RememberSignal(obj, prop, attributeName, keyName, value)
+		InfectionBarnESP.ModeSignalObject = obj
+		InfectionBarnESP.ModeSignalProperty = prop
+		InfectionBarnESP.ModeSignalAttribute = attributeName
+		InfectionBarnESP.ModeSignalText = tostring(value)
+		InfectionBarnESP.ModeSignalDetected = true
+		InfectionBarnESP.ModeCheckedAt = now
+		return true
+	end
+	-- Re-read an already located live signal each context pass. This catches round-mode changes
+	-- without repeating a complete descendant scan every Heartbeat/render update.
+	local cached = InfectionBarnESP.ModeSignalObject
+	if cached then
+		local cachedValue = ReadSignalObject(cached, InfectionBarnESP.ModeSignalProperty, InfectionBarnESP.ModeSignalAttribute)
+		local cachedKeyName = InfectionBarnESP.ModeSignalProperty == "attribute"
+			and InfectionBarnESP.ModeSignalAttribute or cached.Name
+		if cached.Parent and ModeValueMatches(cachedKeyName, cachedValue) then
+			InfectionBarnESP.ModeSignalDetected = true
+			InfectionBarnESP.ModeSignalText = tostring(cachedValue)
+			return true, InfectionBarnESP.ModeSignalText
+		end
+		InfectionBarnESP.ModeSignalObject = nil
+		InfectionBarnESP.ModeSignalAttribute = nil
+		InfectionBarnESP.ModeSignalProperty = nil
+		InfectionBarnESP.ModeSignalText = nil
+		InfectionBarnESP.ModeSignalDetected = false
+	end
+	-- Cheap root-attribute checks run every pass so a direct replicated mode flag is observed promptly.
+	local roots = {Workspace, ReplicatedStorage, LocalPlayer:FindFirstChild("PlayerGui")}
+	for _, root in ipairs(roots) do
+		if root then
+			local attrs = {}
+			pcall(function() attrs = root:GetAttributes() end)
+			for key, value in pairs(attrs) do
+				if ModeValueMatches(key, value) then
+					RememberSignal(root, "attribute", key, key, value)
+					return true, tostring(value)
+				end
+			end
+		end
+	end
+	-- If the map itself is not a Barn candidate, do not scan all descendants for mode metadata.
+	-- Descendant discovery is deliberately throttled and bounded; names must identify mode metadata.
+	if not allowDeepScan then
+		return InfectionBarnESP.ModeSignalDetected == true, InfectionBarnESP.ModeSignalText
+	end
+	if now - (InfectionBarnESP.ModeCheckedAt or 0) < 1.25 then
+		return InfectionBarnESP.ModeSignalDetected == true, InfectionBarnESP.ModeSignalText
+	end
+	InfectionBarnESP.ModeCheckedAt = now
+	for _, root in ipairs(roots) do
+		if root then
+			local descendants = {}
+			pcall(function() descendants = root:GetDescendants() end)
+			local limit = math.min(#descendants, 3000)
+			for i = 1, limit do
+				local obj = descendants[i]
+				local attrs = {}
+				pcall(function() attrs = obj:GetAttributes() end)
+				for key, value in pairs(attrs) do
+					if ModeValueMatches(key, value) then
+						RememberSignal(obj, "attribute", key, key, value)
+						return true, tostring(value)
+					end
+				end
+				local prop, value = nil, nil
+				if obj:IsA("StringValue") or obj:IsA("BoolValue") then
+					prop, value = "value", obj.Value
+				elseif obj:IsA("TextLabel") or obj:IsA("TextButton") then
+					prop, value = "text", obj.Text
+				end
+				if prop and ModeValueMatches(obj.Name, value) then
+					RememberSignal(obj, prop, nil, obj.Name, value)
+					return true, tostring(value)
+				end
+			end
+		end
+	end
+	InfectionBarnESP.ModeSignalDetected = false
+	InfectionBarnESP.ModeSignalText = nil
+	return false, nil
+end
+
 local function CH_IsInfectionBarnMapLoaded()
 	local now = tick()
 	if now - InfectionBarnESP.MapCheckedAt < 0.45 then
-		return InfectionBarnESP.MapLoaded
+		return InfectionBarnESP.Confirmed == true
 	end
 	InfectionBarnESP.MapCheckedAt = now
-	local found = false
+	local mapFound = false
+	local mapObject = nil
+	local explicitOtherMap = false
+	local function IsBarnInfectionMap(value)
+		local token = CH_NormalizeMapToken(value)
+		return token == "INFECTIONBARN" or token == "BARNINFECTION"
+	end
+	-- Prefer cheap replicated map attributes. A concrete different MapName/CurrentMap
+	-- invalidates old descendant evidence from the prior round.
 	pcall(function()
-		for _, attributeName in ipairs({"MapName", "CurrentMap", "Map"}) do
+		for _, attributeName in ipairs({"MapName", "CurrentMap"}) do
 			local value = Workspace:GetAttribute(attributeName)
 			local token = CH_NormalizeMapToken(value)
-			if token == "INFECTIONBARN" or token == "BARNINFECTION" then found = true; break end
+			if token ~= "" then
+				if IsBarnInfectionMap(value) then mapFound = true; break end
+				explicitOtherMap = true
+			end
 		end
-		if not found then
+		if not mapFound and not explicitOtherMap then
+			if IsBarnInfectionMap(Workspace:GetAttribute("Map")) then
+				mapFound = true
+			else
+				local cachedMap = InfectionBarnESP.MapSignalObject
+				if cachedMap and cachedMap.Parent and cachedMap:IsDescendantOf(Workspace) then
+					if (cachedMap:IsA("Model") or cachedMap:IsA("Folder") or cachedMap:IsA("StringValue"))
+						and (IsBarnInfectionMap(cachedMap.Name)
+							or (cachedMap:IsA("StringValue") and (cachedMap.Name == "MapName" or cachedMap.Name == "CurrentMap" or cachedMap.Name == "Map") and IsBarnInfectionMap(cachedMap.Value))) then
+						mapFound = true
+						mapObject = cachedMap
+					else
+					InfectionBarnESP.MapSignalObject = nil
+				end
+				else
+					InfectionBarnESP.MapSignalObject = nil
+				end
+			end
+		end
+		-- Full Workspace reconciliation is a fallback, not a 2-Hz operation on every normal map.
+		-- Explicit map attributes and a still-valid cached map marker avoid this traversal entirely.
+		if not mapFound and not explicitOtherMap and now - (InfectionBarnESP.MapDeepScanCheckedAt or 0) >= 0.85 then
+			InfectionBarnESP.MapDeepScanCheckedAt = now
 			for _, obj in ipairs(Workspace:GetDescendants()) do
 				if (obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("StringValue")) then
-					local token = CH_NormalizeMapToken(obj.Name)
-					if token == "INFECTIONBARN" or token == "BARNINFECTION" then
-						found = true
+					if IsBarnInfectionMap(obj.Name) then
+						mapFound = true
+						mapObject = obj
 						break
 					end
-					if obj:IsA("StringValue") and (obj.Name == "MapName" or obj.Name == "CurrentMap") then
-						token = CH_NormalizeMapToken(obj.Value)
-						if token == "INFECTIONBARN" or token == "BARNINFECTION" then found = true; break end
+					if obj:IsA("StringValue") and (obj.Name == "MapName" or obj.Name == "CurrentMap" or obj.Name == "Map")
+						and IsBarnInfectionMap(obj.Value) then
+						mapFound = true
+						mapObject = obj
+						break
 					end
 				end
 			end
 		end
 	end)
-	InfectionBarnESP.MapLoaded = found
-	if found and not InfectionBarnESP.Active then
+	if mapFound then
+		InfectionBarnESP.MapSignalObject = mapObject -- nil when root attributes supplied the map evidence
+	elseif explicitOtherMap or now - (InfectionBarnESP.MapDeepScanCheckedAt or 0) >= 0.85 then
+		InfectionBarnESP.MapSignalObject = nil
+	end
+	local modeConfirmed, modeText = InfectionBarnESP.ReadExplicitModeSignal(now, mapFound)
+	local gameTypeConfirmed = _G.Celestial.GameMode == "MM2"
+	local playersReady = #Players:GetPlayers() > 1
+	local localCharacter = LocalPlayer.Character
+	local characterReady = localCharacter ~= nil
+		and localCharacter:FindFirstChild("HumanoidRootPart") ~= nil
+		and localCharacter:FindFirstChildOfClass("Humanoid") ~= nil
+	local coreContextConfirmed = mapFound and modeConfirmed and gameTypeConfirmed and playersReady
+	-- A loaded local character is required for initial confirmation. During a short respawn gap,
+	-- preserve the already-confirmed mode only while map + explicit mode + server evidence remain valid.
+	local confirmed = coreContextConfirmed and characterReady
+	if characterReady then InfectionBarnESP.LastCharacterReadyAt = now end
+	if not confirmed and InfectionBarnESP.Active and coreContextConfirmed
+		and now - (InfectionBarnESP.LastCharacterReadyAt or 0) <= 1.5 then
+		confirmed = true
+	end
+	InfectionBarnESP.MapLoaded = mapFound
+	InfectionBarnESP.ModeSignalDetected = modeConfirmed
+	InfectionBarnESP.Confirmed = confirmed
+	if confirmed then
+		InfectionBarnESP.ContextStatus = "INFECTION_BARN"
+	elseif mapFound then
+		InfectionBarnESP.ContextStatus = "UNKNOWN_INFECTION_CANDIDATE"
+	elseif _G.Celestial.GameMode == "MM2" then
+		InfectionBarnESP.ContextStatus = "MM2_UNCONFIRMED_ROUND_MODE"
+	elseif _G.Celestial.GameMode == "DUELS" or _G.Celestial.GameMode == "SPIDER" then
+		InfectionBarnESP.ContextStatus = "OTHER_GAME_MODE"
+	else
+		InfectionBarnESP.ContextStatus = "UNKNOWN"
+	end
+	local context = _G.Celestial.AutoFarmDecisionContext
+	if context then
+		context.Status = InfectionBarnESP.ContextStatus
+		context.IsInfectionBarn = confirmed
+		context.MapConfirmed = mapFound
+		context.ModeConfirmed = modeConfirmed and gameTypeConfirmed
+		context.RoundReady = characterReady and playersReady
+		context.RoundModeSignal = modeText
+		context.GameMode = _G.Celestial.GameMode
+		context.RoleByPlayer = InfectionBarnESP.RoleByPlayer
+		context.UpdatedAt = now
+	end
+	if confirmed and not InfectionBarnESP.Active then
 		InfectionBarnESP.Active = true
 		InfectionBarnESP.RoundStartedAt = now
 		InfectionBarnESP.LastWeaponState = {}
 		InfectionBarnESP.AvatarBaseline = {}
 		InfectionBarnESP.RoleByPlayer = {}
-	elseif not found and InfectionBarnESP.Active then
+	elseif not confirmed and InfectionBarnESP.Active then
 		InfectionBarnESP.Active = false
 		InfectionBarnESP.RoundStartedAt = 0
 		InfectionBarnESP.LastWeaponState = {}
 		InfectionBarnESP.AvatarBaseline = {}
 		InfectionBarnESP.RoleByPlayer = {}
+		InfectionBarnESP.LastCharacterReadyAt = 0
 	end
-	return found
+	-- Keep the shared role table reference current if a mode transition reset the table.
+	if context then context.RoleByPlayer = InfectionBarnESP.RoleByPlayer end
+	return confirmed
 end
 
 local function CH_GetAvatarScaleSignature(plr)
@@ -5721,6 +5942,15 @@ local function CH_InfectionClassificationReady()
 	return false
 end
 
+-- Single classifier shared by the ESP and any context-aware decision logic.
+InfectionBarnESP.GetRole = function(plr, classificationReady)
+	if classificationReady == nil then classificationReady = CH_InfectionClassificationReady() end
+	return CH_GetInfectionRole(plr, classificationReady == true)
+end
+_G.Celestial.GetInfectionBarnRole = function(plr)
+	if not InfectionBarnESP.Confirmed then return "UNKNOWN" end
+	return InfectionBarnESP.GetRole(plr, CH_InfectionClassificationReady())
+end
 _G.Celestial.IsInfectionBarnESPActive = CH_IsInfectionBarnMapLoaded
 
 _G.Celestial.Highlights = _G.Celestial.Highlights or {}
@@ -5944,7 +6174,7 @@ _G.Celestial.ConnectionRoleScanner =
 								else roleColor = COLOR_LOBBY_WHITE end
 							end
 							if infectionBarnActive then
-								local infectionRole = CH_GetInfectionRole(plr, infectionClassificationReady)
+								local infectionRole = InfectionBarnESP.GetRole(plr, infectionClassificationReady)
 								if infectionRole == "ZOMBIE" then roleColor = COLOR_INFECTION_ZOMBIE
 								elseif infectionRole == "SURVIVOR" then roleColor = COLOR_INFECTION_SURVIVOR
 								else roleColor = COLOR_LOBBY_WHITE end
@@ -5978,7 +6208,7 @@ _G.Celestial.ConnectionRoleScanner =
 						selfHl.Adornee = myChar
 						local selfColor = COLOR_INNOCENT
 						if infectionBarnActive then
-							local infectionRole = CH_GetInfectionRole(LocalPlayer, infectionClassificationReady)
+							local infectionRole = InfectionBarnESP.GetRole(LocalPlayer, infectionClassificationReady)
 							if infectionRole == "ZOMBIE" then selfColor = COLOR_INFECTION_ZOMBIE
 							elseif infectionRole == "SURVIVOR" then selfColor = COLOR_INFECTION_SURVIVOR
 							else selfColor = COLOR_LOBBY_WHITE end
@@ -6212,6 +6442,7 @@ local CoinEngine = {
 	ChainGroupAccessibleCoins = setmetatable({}, {__mode = "k"}),
 	ChainGroupMultiplier = 1.15,
 	PassiveSpeedMultiplier = 1.10,
+	PassiveFarmSpeedMultiplier = 1.25, -- nuevo impulso pasivo permanente de velocidad base del AutoFarm
 	ConfiguredSliderSpeed = 45,
 	SpeedBonusMultiplier = 1.0,
 	LastLoggedSpeedBonusMultiplier = 0,
@@ -6304,8 +6535,8 @@ local CoinEngine = {
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
 	SpeedSafetyHoldUntil = 0,
 	SpeedSafetyHoldCap = 100,
-	CommandAcceleration = 150, -- aceleracion normal; el +25% se aplica solo durante el encadenamiento
-	RiskCommandAccelerationFloor = 80, -- suelo normal adaptativo; el +25% se aplica solo durante el encadenamiento
+	CommandAcceleration = 150, -- aceleracion normal; el factor 1.25 de aceleracion solo afecta el encadenamiento
+	RiskCommandAccelerationFloor = 80, -- suelo adaptativo; el factor de aceleracion 1.25 no sustituye el pasivo de velocidad
 	MaxCommandStepPerFrame = 2.2, -- permite la solicitud combinada (100 x 1.10 x 1.15) en frames estables; NoClip conserva 1.5
 	NearTargetAccelerationMultiplier = 1.35,
 	RampTime = 0.55,           -- rampa normal; el ajuste de encadenamiento se aplica localmente
@@ -6980,13 +7211,18 @@ local function RescanCoins()
 end
 
 local function OnDescendantAdded(obj)
-	if obj:IsA("BasePart") and CoinNameMatches(obj) then
-		task.defer(function()
-			if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
-				RegisterCoin(obj)
-			end
-		end)
+	if not (obj:IsA("BasePart") and CoinNameMatches(obj)) then return end
+	-- Fast path: valid newly-parented coins are registered in the same event callback, with no
+	-- intentional scheduler wait. Defer once only if the instance is still being assembled.
+	if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
+		RegisterCoin(obj)
+		return
 	end
+	task.defer(function()
+		if CoinEngine.Active and obj.Parent and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
+			RegisterCoin(obj)
+		end
+	end)
 end
 
 local function OnDescendantRemoving(obj)
@@ -9150,6 +9386,45 @@ end
 local function UpdateThreatResponse(root, now)
 	local threat = CoinEngine.ThreatResponse
 	if not threat.Enabled or not root then return nil, math.huge end
+
+	-- Infection Barn is an explicit, corroborated context, not a map-name guess. In that mode
+	-- zombie roles are not treated as the conventional MM2 Murder threat. Clear any stale normal-
+	-- mode escape state once, then let the same controller resume the coin pipeline.
+	local context = _G.Celestial and _G.Celestial.AutoFarmDecisionContext
+	if context and context.IsInfectionBarn == true and context.MapConfirmed == true and context.ModeConfirmed == true then
+		local wasThreatActive = threat.Active or threat.EmergencyEscape or threat.Murderer ~= nil or threat.CachedMurderer ~= nil
+			or threat.EscapePreparedFor ~= nil or threat.CoinThreatSnapshot ~= nil
+		threat.Active = false
+		threat.EmergencyEscape = false
+		threat.SafeReleaseSince = nil
+		threat.EscapeDestination = nil
+		threat.EscapeDestinationComputedAt = 0
+		threat.EscapePreparedAt = 0
+		threat.EscapePreparedOriginPosition = nil
+		threat.EscapePreparedMurderPosition = nil
+		threat.EscapePreparedFor = nil
+		threat.LastLineOfSightClear = false
+		threat.LineOfSightPlayer = nil
+		threat.NextLineOfSightCheckAt = 0
+		threat.EscapePathBlocked = false
+		threat.CheckedEscapeDestination = nil
+		threat.EscapeRouteBlockedNow = false
+		threat.NextEscapeRouteCheckAt = 0
+		threat.NextEscapeDestinationAt = 0
+		threat.Murderer = nil
+		threat.CachedMurderer = nil
+		threat.CoinThreatSnapshot = nil
+		threat.LastDistance = math.huge
+		threat.LastMeasuredMurderer = nil
+		threat.LastMeasuredDistance = math.huge
+		threat.LastMeasuredAt = now
+		threat.LastClosingSpeed = 0
+		threat.ClosingSpeedSamples = 0
+		threat.LastSeenAt = now
+		threat.LastDistanceAboveSafeAt = now
+		if wasThreatActive and threat.CoinDangerState then table.clear(threat.CoinDangerState) end
+		return wasThreatActive and "infection-barn-context-confirmed" or nil, math.huge
+	end
 
 	-- Si el jugador local es el Murderer, esta respuesta queda desactivada.
 	if CoinEngine.DetectLocalMurderer(now) then
@@ -11497,6 +11772,7 @@ local function ControllerStep(dt)
 		-- its original 80-speed and 1.5-per-update ceilings, so this does not alter NoClip policy.
 		if not (CoinEngine.NoclipWanted or noclipOn or State.NoClipActive) then
 			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10
+			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.PassiveFarmSpeedMultiplier) or 1.25
 		end
 		if CoinEngine.EmergencyRecoveryActive then
 			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45
@@ -11504,7 +11780,7 @@ local function ControllerStep(dt)
 		CoinEngine.EscapeSliderEnvelope = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
 		local safetyCap = math.min(CoinEngine.ConfiguredEscapeSpeed, CoinEngine.EscapeSliderEnvelope) * CoinEngine.EscapeSpeedMultiplier
 		if SafeOn() then
-			safetyCap = math.min(safetyCap, CoinEngine.EscapeSliderEnvelope) -- Safe Mode keeps its explicit existing ceiling.
+			safetyCap = math.min(safetyCap, CoinEngine.EscapeSliderEnvelope) -- Safe Mode retains its existing hard ceiling.
 		elseif not CoinEngine.EscapeUsesAdaptiveNoclip then
 			safetyCap = math.min(safetyCap, (tonumber(CoinEngine.BaseMaxSpeed) or 100) * CoinEngine.EscapeSpeedMultiplier)
 		end
@@ -11723,10 +11999,11 @@ local function ControllerStep(dt)
 	local safe = SafeOn()
 	CoinEngine.ConfiguredSliderSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
 	local sliderSpeed = math.min(CoinEngine.ConfiguredSliderSpeed, Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
-	-- One central, non-accumulating formula: normal farming gets +10%; a verified compact
-	-- cluster adds x1.15. Keep both bonuses off during the existing adaptive NoClip envelope.
+	-- One central, non-accumulating formula: +10% and +25% passives, plus x1.15 only
+	-- for a verified compact group. Preserve the existing adaptive NoClip envelope unchanged.
 	CoinEngine.SpeedBonusMultiplier = ((CoinEngine.NoclipWanted or noclipOn) and 1
-		or (tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10))
+		 or ((tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10)
+			* (tonumber(CoinEngine.PassiveFarmSpeedMultiplier) or 1.25)))
 		* ((CoinEngine.ChainGroupActive and not CoinEngine.ThreatResponse.Active
 			and not (CoinEngine.NoclipWanted or noclipOn)) and (tonumber(CoinEngine.ChainGroupMultiplier) or 1.15) or 1)
 	CoinEngine.LastBaseEffectiveSpeed = sliderSpeed * CoinEngine.SpeedBonusMultiplier
