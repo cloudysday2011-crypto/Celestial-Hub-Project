@@ -8303,12 +8303,32 @@ local function RecordNavigationTiming(kind, startedAt, target)
 end
 
 -- Una pasada O(N) para puntuar; limita raycasts y revisa suelo sin repetir escaneos completos.
+-- Atajo de moneda inmediata: aprovecha la misma pasada del cache para identificar un candidato
+-- cercano y hacia el rumbo actual. Si el volumen directo esta libre, se devuelve antes de ordenar
+-- todos los candidatos o explorar alternativas; si esta bloqueado, continua el selector original.
 local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
 	local candidates = {}
+	local immediateBest, immediateBestScore = nil, math.huge
+	local immediateCheckedCoin, immediateGrounded = nil, false
+	local immediateRadius = math.min(maxDistance, 18.0)
+	local immediateVerticalGap = math.min(maxGap, Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap))
+	local immediateForward = Vector3.zero
+	if maxRouteChecks > 0 then
+		local root = GetRoot()
+		local commanded = CoinEngine.LastCommandVelocity or Vector3.zero
+		local planar = Vector3.new(commanded.X, 0, commanded.Z)
+		if planar.Magnitude >= 5 then
+			immediateForward = planar.Unit
+		elseif root then
+			local look = root.CFrame.LookVector
+			local lookPlanar = Vector3.new(look.X, 0, look.Z)
+			if lookPlanar.Magnitude > 0.05 then immediateForward = lookPlanar.Unit end
+		end
+	end
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
 			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
@@ -8321,32 +8341,71 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 				local distance = delta.Magnitude
 				if not bl and IsSafeCoinPosition(coin.Position) and not IsCoinTemporarilyExcluded(coin, now)
 					and verticalGap <= maxGap and distance <= maxDistance then
-					candidates[#candidates + 1] = {coin = coin, score = ThreatAwareCoinScore(fromPos, coin.Position, now)}
+					candidates[#candidates + 1] = {coin = coin}
+					if maxRouteChecks > 0 and distance <= immediateRadius and verticalGap <= immediateVerticalGap then
+						local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+						local forwardDot = 0
+						if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
+							forwardDot = immediateForward:Dot(horizontalDelta.Unit)
+						end
+						if forwardDot >= 0.15 or distance <= 8.0 or horizontalDelta.Magnitude <= 4.5 then
+							local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
+							if quickScore < immediateBestScore then
+								immediateBestScore = quickScore
+								immediateBest = coin
+							end
+						end
+					end
 				end
 			end
 		end
 	end
 	if #candidates == 0 then return nil end
+
+	-- Como el barrido del volumen es la prueba decisiva, un candidato inmediato solo recibe
+	-- una validacion de suelo y una de ruta. Si no pasa, se conserva como dato evaluado y el
+	-- selector habitual continua sin repetir esas mismas comprobaciones para la misma moneda.
+	if immediateBest and maxRouteChecks > 0 then
+		immediateCheckedCoin = immediateBest
+		immediateGrounded = IsGrounded(immediateBest)
+		if immediateGrounded then
+			if HasClearCoinRoute(fromPos, immediateBest) then return immediateBest end
+		else
+			CoinEngine.Blacklist[immediateBest] = now + 2.5
+		end
+	end
+
+	-- Solo calcular las puntuaciones completas si la pasada rapida no pudo devolver una moneda
+	-- directamente accesible. En el camino exitoso se omiten tanto este trabajo como table.sort.
+	for _, candidate in ipairs(candidates) do
+		candidate.score = ThreatAwareCoinScore(fromPos, candidate.coin.Position, now)
+	end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
 
 	-- Puntuar todo el cache es barato; consultar suelo y geometria no. Solo se examina un
 	-- shortlist pequeño y se hace el numero de comprobaciones de ruta solicitado por el caller.
-	local fallback, routeChecks, groundChecks = nil, 0, 0
+	local fallback, routeChecks = nil, 0
+	local groundChecks = immediateCheckedCoin and 1 or 0
 	for i = 1, math.min(12, #candidates) do
 		local coin = candidates[i].coin
 		if groundChecks >= 8 then break end
-		groundChecks += 1
-		if IsGrounded(coin) then
-			fallback = fallback or coin
-			if maxRouteChecks == 0 then return fallback end -- prefetch: el controlador de ruta valida al ejecutar
-			if routeChecks < maxRouteChecks then
-				routeChecks += 1
-				if HasClearCoinRoute(fromPos, coin) then return coin end
-			end
+		if coin == immediateCheckedCoin then
+			if immediateGrounded then fallback = fallback or coin end
 		else
-			CoinEngine.Blacklist[coin] = now + 2.5
+			groundChecks += 1
+			if IsGrounded(coin) then
+				fallback = fallback or coin
+				if maxRouteChecks == 0 then return fallback end -- prefetch: el controlador de ruta valida al ejecutar
+				if routeChecks < maxRouteChecks then
+					routeChecks += 1
+					if HasClearCoinRoute(fromPos, coin) then return coin end
+				end
+			else
+				CoinEngine.Blacklist[coin] = now + 2.5
+			end
 		end
 	end
+	if not fallback and immediateGrounded then fallback = immediateCheckedCoin end
 	-- El mejor candidato con suelo es preferible a bloquear el controlador buscando una ruta perfecta.
 	return fallback
 end
