@@ -3,7 +3,8 @@
 -- Infection Barn special behavior requires explicit mode evidence plus the matching loaded map.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
--- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
+-- V3.40 surgical: validated direct descent to a coin below, with a 9s exception limited to that maneuver.
+-- Keeps the ordinary airborne recovery, route planner, and adaptive NoClip internals unchanged.
 -- V3.25: confirms an actually clear exit position before restoring collisions and centralizes the chain-acceleration factor.
 -- V3.24: bounded multi-offset obstacle routing, route hysteresis, and directed exit-solid recovery aim.
 -- The chain-only 1.25 acceleration factor remains separate from the new permanent 1.25 speed multiplier.
@@ -6603,6 +6604,18 @@ local CoinEngine = {
 	AirborneProbeInterval = 0.08,
 	AirborneLookDownDistance = 100,
 	AirborneSince = nil,
+	-- Exceptional aerial window reserved for a validated, nearly vertical descent to the selected coin.
+	VerticalCoinDescentActive = false,
+	VerticalCoinDescentTarget = nil,
+	VerticalCoinDescentStartedAt = nil,
+	VerticalCoinDescentNextValidateAt = 0,
+	VerticalCoinDescentBlockedTarget = nil,
+	VerticalCoinDescentBlockedUntil = 0,
+	VerticalCoinDescentMaxTime = 9.0,
+	VerticalCoinDescentStartHorizontalTolerance = 4.5,
+	VerticalCoinDescentKeepHorizontalTolerance = 5.5,
+	VerticalCoinDescentMinDrop = 2.0,
+	VerticalCoinDescentValidateInterval = 0.12,
 	AirRecoveryActive = false,
 	AirRecoveryDestination = nil,
 	AirRecoveryDestinationAt = 0,
@@ -6744,6 +6757,12 @@ local function StopFlight()
 	CoinEngine.AutoNoclipTarget = nil
 	CoinEngine.AutoNoclipStartPosition = nil
 	CoinEngine.AirborneSince = nil
+	CoinEngine.VerticalCoinDescentActive = false
+	CoinEngine.VerticalCoinDescentTarget = nil
+	CoinEngine.VerticalCoinDescentStartedAt = nil
+	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	CoinEngine.VerticalCoinDescentBlockedTarget = nil
+	CoinEngine.VerticalCoinDescentBlockedUntil = 0
 	CoinEngine.AirRecoveryActive = false
 	CoinEngine.AirRecoveryDestination = nil
 	CoinEngine.AirRecoveryDestinationAt = 0
@@ -10677,10 +10696,38 @@ local function AirRecoveryIgnore(coin)
 	return ignore
 end
 
+-- Session reset for the local vertical-descent exception. A timeout can blacklist only the
+-- target that failed; normal exits leave it eligible for the usual navigator.
+CoinEngine.ResetVerticalCoinDescent = function(now, reason, blacklistTarget)
+	now = tonumber(now) or os.clock()
+	local oldTarget = CoinEngine.VerticalCoinDescentTarget
+	local oldStartedAt = CoinEngine.VerticalCoinDescentStartedAt
+	local wasActive = CoinEngine.VerticalCoinDescentActive == true
+	if blacklistTarget and oldTarget then
+		local untilAt = now + math.max(1.5, tonumber(CoinEngine.StuckBlacklist) or 3.0)
+		CoinEngine.VerticalCoinDescentBlockedTarget = oldTarget
+		CoinEngine.VerticalCoinDescentBlockedUntil = untilAt
+		if oldTarget.Parent then CoinEngine.Blacklist[oldTarget] = untilAt end
+	end
+	CoinEngine.VerticalCoinDescentActive = false
+	CoinEngine.VerticalCoinDescentTarget = nil
+	CoinEngine.VerticalCoinDescentStartedAt = nil
+	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	if wasActive and CoinEngine.routeNavigation and ResetRouteNavigation then
+		ResetRouteNavigation(CoinEngine.CurrentTarget, now)
+	end
+	if wasActive then
+		local elapsed = oldStartedAt and math.max(0, now - oldStartedAt) or 0
+		LogEvent(string.format("vertical-coin-descent end reason=%s elapsed=%.2f target=%s blacklist=%d",
+			tostring(reason or "ended"), elapsed, oldTarget and tostring(oldTarget.Name) or "none", blacklistTarget and 1 or 0))
+	end
+end
+
 local function UpdateAirborneRecoveryState(root, now)
 	if CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape then
 		-- Escape is the sole movement intent during an urgent threat. Keep AirborneSince for
-		-- supervision, but don't run a competing landing planner in parallel with the escape route.
+		-- supervision, but don't run a competing landing planner or vertical-coin exception.
+		if CoinEngine.VerticalCoinDescentActive then CoinEngine.ResetVerticalCoinDescent(now, "preempted-by-escape", false) end
 		CoinEngine.AirRecoveryActive = false
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
@@ -10691,6 +10738,7 @@ local function UpdateAirborneRecoveryState(root, now)
 		return false
 	end
 	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive then
+		if CoinEngine.VerticalCoinDescentActive then CoinEngine.ResetVerticalCoinDescent(now, "farm-or-context-inactive", false) end
 		CoinEngine.AirborneSince = nil
 		CoinEngine.AirRecoveryActive = false
 		CoinEngine.AirRecoveryDestination = nil
@@ -10708,7 +10756,14 @@ local function UpdateAirborneRecoveryState(root, now)
 		return false
 	end
 	if now < (CoinEngine.AirRecoveryNextProbeAt or 0) then
-		return CoinEngine.AirRecoveryActive == true
+		local descentActive = CoinEngine.VerticalCoinDescentActive == true
+		local descentAge = descentActive and CoinEngine.VerticalCoinDescentStartedAt
+			and math.max(0, now - CoinEngine.VerticalCoinDescentStartedAt) or 0
+		local descentLimit = math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
+		if not descentActive or descentAge < descentLimit then
+			return CoinEngine.AirRecoveryActive == true
+		end
+		-- At the deadline, bypass the sampling throttle and confirm support before recovery.
 	end
 	CoinEngine.AirRecoveryNextProbeAt = now + (tonumber(CoinEngine.AirborneProbeInterval) or 0.08)
 	CoinEngine.airSupportParams.FilterDescendantsInstances = AirRecoveryIgnore(nil)
@@ -10722,6 +10777,7 @@ local function UpdateAirborneRecoveryState(root, now)
 	local supported = ok and supportHit ~= nil and supportHit.Normal.Y >= 0.55
 	CoinEngine.AirRecoveryLastSupported = supported == true
 	if supported then
+		if CoinEngine.VerticalCoinDescentActive then CoinEngine.ResetVerticalCoinDescent(now, "support-confirmed", false) end
 		if CoinEngine.AirRecoveryActive then
 			LogEvent(string.format("air-recovery-landed elapsed=%.2f reason=%s",
 				math.max(0, now - (CoinEngine.AirborneSince or now)), tostring(CoinEngine.AirRecoveryReason or "surface")))
@@ -10740,6 +10796,39 @@ local function UpdateAirborneRecoveryState(root, now)
 	end
 	CoinEngine.AirborneSince = CoinEngine.AirborneSince or now
 	local airborneFor = now - CoinEngine.AirborneSince
+
+	-- A verified coin-below descent owns a separate 9-second timer that starts only when
+	-- the direct, safe path was confirmed. While it remains valid, the normal 3-second-style
+	-- airborne recovery is suppressed; invalidation or timeout returns to the existing recovery.
+	if CoinEngine.VerticalCoinDescentActive then
+		local descentTarget = CoinEngine.VerticalCoinDescentTarget
+		local targetStillValid = descentTarget and descentTarget.Parent and CoinEngine.CoinCache[descentTarget]
+			and IsAvailable(descentTarget, now)
+		if not targetStillValid then
+			CoinEngine.ResetVerticalCoinDescent(now, "target-invalidated", false)
+		else
+			local descentElapsed = now - (CoinEngine.VerticalCoinDescentStartedAt or now)
+			local descentLimit = math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
+			if descentElapsed >= descentLimit then
+				local failedTarget = descentTarget
+				CoinEngine.ResetVerticalCoinDescent(now, "nine-second-timeout", true)
+				if CoinEngine.CurrentTarget == failedTarget then SetCurrent(nil, now) end
+				CoinEngine.AirRecoveryActive = true
+				CoinEngine.AirRecoveryDestination = nil
+				CoinEngine.AirRecoveryDestinationAt = 0
+				CoinEngine.AirRecoveryDestinationTarget = nil
+				CoinEngine.AirRecoveryDestinationStart = root.Position
+				CoinEngine.AirRecoveryNoDestinationSince = nil
+				CoinEngine.AirRecoveryReason = "vertical-coin-descent-timeout"
+				CoinEngine.AirRecoveryRetryAt = 0
+				LogEvent(string.format("vertical-coin-descent timeout elapsed=%.2f limit=%.2f action=existing-air-recovery", descentElapsed, descentLimit))
+				return true
+			end
+			-- Do not reset the timer on target/waypoint churn. Only a confirmed support,
+			-- invalid target, invalid path, or this hard timeout ends the exception.
+			return false
+		end
+	end
 
 	-- Si no existe superficie segura tras varios intentos y todavía quedan monedas, no mantener
 	-- al personaje congelado indefinidamente: liberar la recuperación una vez para que el mismo
@@ -10864,6 +10953,97 @@ local function GetAirRecoveryDestination(root, target, now)
 		LogEvent("air-recovery-no-safe-landing;hold-position-and-reprobe")
 	end
 	return nil, "no-safe-landing-found"
+end
+
+-- Reuse the current coin target and the existing character-volume path check. This state is
+-- strictly local to an aligned, validated downward approach; it does not create a mover or NoClip.
+CoinEngine.UpdateVerticalCoinDescent = function(root, target, approachPos, now)
+	now = tonumber(now) or os.clock()
+	local active = CoinEngine.VerticalCoinDescentActive == true
+	local threat = CoinEngine.ThreatResponse
+	local preempted = not root or not target or not target.Parent or target ~= CoinEngine.CurrentTarget
+		or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive
+		or (threat and threat.Active and threat.EmergencyEscape)
+		or CoinEngine.NoclipWanted or noclipOn or CoinEngine.AutoNoclipMode ~= nil
+	if preempted then
+		if active then CoinEngine.ResetVerticalCoinDescent(now, "navigation-preempted", false) end
+		return false
+	end
+	if not CoinEngine.CoinCache[target] or not IsAvailable(target, now) then
+		if active then CoinEngine.ResetVerticalCoinDescent(now, "target-invalidated", false) end
+		return false
+	end
+	local delta = approachPos - root.Position
+	local horizontalGap = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	local targetChanged = active and CoinEngine.VerticalCoinDescentTarget ~= target
+	local minDrop = math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMinDrop) or 2.0)
+	local horizontalLimit = active and (tonumber(CoinEngine.VerticalCoinDescentKeepHorizontalTolerance) or 5.5)
+		or (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
+	local belowAligned = delta.Y < -(active and minDrop * 0.5 or minDrop) and horizontalGap <= horizontalLimit
+	if not belowAligned then
+		if active then CoinEngine.ResetVerticalCoinDescent(now, "no-longer-directly-below", false) end
+		return false
+	end
+	if CoinEngine.VerticalCoinDescentBlockedTarget == target then
+		if now < (CoinEngine.VerticalCoinDescentBlockedUntil or 0) then return false end
+		CoinEngine.VerticalCoinDescentBlockedTarget = nil
+		CoinEngine.VerticalCoinDescentBlockedUntil = 0
+	end
+	-- Do not start an airborne exception while physical support is currently confirmed. If the
+	-- character has just left an edge, the next existing support probe will make this false.
+	if not active and CoinEngine.AirRecoveryLastSupported == true then return false end
+	-- A timed-out descent must finish its normal recovery before any new special descent starts.
+	if not active and CoinEngine.AirRecoveryActive and CoinEngine.AirRecoveryReason == "vertical-coin-descent-timeout" then
+		return false
+	end
+	local interval = math.max(0.08, tonumber(CoinEngine.VerticalCoinDescentValidateInterval) or 0.12)
+	local mustValidate = not active or targetChanged or now >= (CoinEngine.VerticalCoinDescentNextValidateAt or 0)
+	if mustValidate then
+		local safe = IsSafeCoinPosition(approachPos) and not IsInsideSolid(approachPos)
+		local clear = false
+		if safe then
+			clear = HasClearCharacterPath(root.Position, approachPos, BuildCoinRouteIgnore(target), root, CoinEngine.routeRayParams) == true
+		end
+		if not clear then
+			if active then CoinEngine.ResetVerticalCoinDescent(now, "direct-route-invalidated", false) end
+			return false
+		end
+		if not active or targetChanged then ResetRouteNavigation(target, now) end
+		CoinEngine.routeNavigation.directPathKnown = true
+		CoinEngine.routeNavigation.directPathBlocked = false
+		CoinEngine.routeNavigation.directPathClearUntil = now + interval
+		CoinEngine.routeNavigation.verticalRouteBlocked = false
+		CoinEngine.routeNavigation.verticalSurfaceBlocked = false
+		CoinEngine.routeNavigation.noDetourPending = false
+		CoinEngine.VerticalCoinDescentNextValidateAt = now + interval
+	end
+	if not active then
+		CoinEngine.VerticalCoinDescentActive = true
+		CoinEngine.VerticalCoinDescentTarget = target
+		CoinEngine.VerticalCoinDescentStartedAt = now
+		LogEvent(string.format("vertical-coin-descent start dy=%.1f horizontal=%.2f exception=9.00 target=%s",
+			delta.Y, horizontalGap, tostring(target.Name)))
+	elseif targetChanged then
+		-- A different valid coin directly below may continue the same uninterrupted descent;
+		-- preserve the original start time instead of resetting the 9-second budget.
+		CoinEngine.VerticalCoinDescentTarget = target
+		LogEvent(string.format("vertical-coin-descent retarget elapsed=%.2f target=%s",
+			math.max(0, now - (CoinEngine.VerticalCoinDescentStartedAt or now)), tostring(target.Name)))
+	end
+	-- A newly validated direct descent supersedes only generic airborne landing recovery. A hard-timeout
+	-- recovery is intentionally not canceled here.
+	if CoinEngine.AirRecoveryActive and CoinEngine.AirRecoveryReason ~= "vertical-coin-descent-timeout" then
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		CoinEngine.AirRecoveryRetryAt = 0
+		LogEvent("air-recovery-canceled reason=validated-vertical-coin-descent")
+	end
+	return true
 end
 
 -- Temporary crossing may begin immediately after preflight proves that direct travel is
@@ -11370,6 +11550,9 @@ local function CollectCoin(root, coin, now)
 	CoinEngine.Attempts[coin] = n
 	if n >= 3 then CoinEngine.Blacklist[coin] = now + 8 end
 	if CoinEngine.CurrentTarget == coin then CoinEngine.CurrentTarget = nil end
+	if CoinEngine.VerticalCoinDescentActive and CoinEngine.VerticalCoinDescentTarget == coin then
+		CoinEngine.ResetVerticalCoinDescent(now, "coin-collected", false)
+	end
 	return true
 end
 
@@ -11407,6 +11590,12 @@ function CoinEngine.CleanupRoundCaches()
 		CoinEngine.ThreatResponse.SafeReleaseSince = nil
 	end
 	CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
+	CoinEngine.VerticalCoinDescentActive = false
+	CoinEngine.VerticalCoinDescentTarget = nil
+	CoinEngine.VerticalCoinDescentStartedAt = nil
+	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	CoinEngine.VerticalCoinDescentBlockedTarget = nil
+	CoinEngine.VerticalCoinDescentBlockedUntil = 0
 	CoinEngine.NextTargetCacheRevision = -1
 	CoinEngine.NextTargetPreparedAt = 0
 	CoinEngine.NextTargetOriginPosition = nil
@@ -11694,6 +11883,12 @@ local function ControllerStep(dt)
 		end
 	end
 
+	-- Pre-classify the already-selected coin before airborne supervision so a genuine direct descent
+	-- owns its timer before ordinary airborne recovery can trigger. This reuses the existing target.
+	if CoinEngine.CurrentTarget and CoinEngine.CurrentTarget.Parent then
+		CoinEngine.UpdateVerticalCoinDescent(root, CoinEngine.CurrentTarget,
+			CoinEngine.CurrentTarget.Position + Vector3.new(0, math.max(0.5, (root.Size.Y + CoinEngine.CurrentTarget.Size.Y) * 0.5 - 0.15), 0), now)
+	end
 	-- Track air time before pause/position-reconciliation early returns. Emergency escape still owns
 	-- the movement branch below, but landing recovery is already armed for when escape ends.
 	UpdateAirborneRecoveryState(root, now)
@@ -12192,6 +12387,10 @@ local function ControllerStep(dt)
 			if not target then UpdateAutoNoclip(root, nil, now); DriveLocalRecoveryWithoutTarget(root, hum, now, dt); return end
 		end
 	end
+	-- Identify a valid coin-below descent before generic route recovery can repeat horizontal planning.
+	-- The helper starts its 9-second timer only after physical-path validation succeeds.
+	CoinEngine.UpdateVerticalCoinDescent(root, target,
+		target.Position + Vector3.new(0, math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15), 0), now)
 	target = UpdateAutoNoclip(root, target, now)
 	if not target or not target.Parent then
 		DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
@@ -12217,6 +12416,10 @@ local function ControllerStep(dt)
 	elseif noclipExitMove then
 		moveAim = EnsureNoclipExitDestination(root, target, now) or rootPos
 		navigationDetour = true -- suppress collection and coin-distance steering during the local recovery step
+	elseif CoinEngine.VerticalCoinDescentActive and CoinEngine.VerticalCoinDescentTarget == target
+		and not CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
+		moveAim = approachPos -- direct validated descent; bypass horizontal waypoint/detour evaluation
+		navigationDetour = false
 	elseif CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
 		local landingAim = GetAirRecoveryDestination(root, target, now)
 		moveAim = landingAim or rootPos
