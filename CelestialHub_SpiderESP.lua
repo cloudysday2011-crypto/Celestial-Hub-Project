@@ -6080,8 +6080,8 @@ local CoinEngine = {
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
 	AutoNoclipMaxCrossTime = 2.25,
-	AutoNoclipCheckInterval = 0.03, -- revisa obstaculos con latencia baja sin raycastear varias veces por frame
-	NoclipStuckConfirmTime = 0.18, -- respaldo para atascos que no pudieron predecirse
+	AutoNoclipCheckInterval = 0.09, -- evita raycasts redundantes en cada pocos Heartbeats
+	NoclipStuckConfirmTime = 0.22, -- activa recuperacion solo tras falta de progreso real
 	NoclipExitSolidMaxTime = 1.10, -- nunca mantener la recuperación sin límite
 	NoclipRetryCooldown = 0.35,
 	NoclipConn = nil,
@@ -7803,8 +7803,8 @@ local function HasClearCoinRoute(fromPos, coin)
 	local coinPosition = coin.Position
 	local cached = CoinEngine.RouteCheckCache[coin]
 	-- Reusa un raycast muy reciente solo si el personaje y la moneda apenas cambiaron de posicion.
-	if cached and now - cached.at <= 0.025
-		and (fromPos - cached.fromPos).Magnitude <= 0.65
+	if cached and now - cached.at <= 0.075
+		and (fromPos - cached.fromPos).Magnitude <= 1.25
 		and (coinPosition - cached.targetPos).Magnitude <= 0.15 then
 		return cached.clear
 	end
@@ -8369,7 +8369,7 @@ local function PrepareNext(now)
 	CoinEngine.NextTarget = nxt
 	-- Keep a warm alternative refreshed during travel. A prefetched coin can be collected
 	-- by another player, so never freeze candidate preparation at math.huge.
-	nextPrepareAt = now + (nxt and 0.06 or 0.04)
+	nextPrepareAt = now + (nxt and 0.12 or 0.06)
 end
 
 local function SetCurrent(coin, now)
@@ -8431,11 +8431,11 @@ local function HasConfirmedRouteStall(root, target, now)
 	end
 	local elapsed = now - (noclipStallTrack.at or now)
 	if elapsed < 0.075 then return false end
-	local displacement = (root.Position - noclipStallTrack.pos).Magnitude
 	local towardProgress = (noclipStallTrack.distance or distance) - distance
 	local commandedSpeed = (CoinEngine.LastCommandVelocity or Vector3.zero).Magnitude
-	-- At low commanded speed or near a target, slow travel is expected rather than a wall stall.
-	if commandedSpeed < 8 or distance < 8 or displacement >= 0.55 or towardProgress >= 0.45 then
+	-- Movement sideways or in a loop is not target progress. Only meaningful distance
+	-- reduction clears the stall timer; near-contact and low-command states are exempt.
+	if commandedSpeed < 8 or distance < 3 or towardProgress >= 0.45 then
 		noclipStallTrack.stalledSince = nil
 	else
 		noclipStallTrack.stalledSince = noclipStallTrack.stalledSince or (now - elapsed)
@@ -8444,7 +8444,7 @@ local function HasConfirmedRouteStall(root, target, now)
 	noclipStallTrack.distance = distance
 	noclipStallTrack.at = now
 	return noclipStallTrack.stalledSince ~= nil
-		and (now - noclipStallTrack.stalledSince) >= (tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.32)
+		and (now - noclipStallTrack.stalledSince) >= (tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22)
 end
 
 -- Temporary crossing is allowed only after an actual movement stall has been confirmed.
@@ -8457,14 +8457,16 @@ local function UpdateAutoNoclip(root, target, now)
 		return target
 	end
 
-	local insideSolid = IsInsideSolidForNoclip(root.Position, now)
+	-- Overlap queries are expensive; do not run one during ordinary movement. Probe only
+	-- during an active recovery, emergency escape, or a stall that has already been confirmed.
 	local stalledFor = math.max(0, now - (lastProgress or now))
-	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.32
+	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22
 
-	-- Escape has movement priority, but proximity alone must not enable NoClip. If a recovery
-	-- was already crossing geometry, keep it only while still overlapping; otherwise restore it.
+	-- Escape has movement priority. Keep an already-started crossing only while it is
+	-- necessary to exit geometry; proximity to the Murderer alone never enables NoClip.
 	if threat.EmergencyEscape and threat.Active and threat.Murderer then
-		if (CoinEngine.AutoNoclipMode == "coin-route" or CoinEngine.AutoNoclipMode == "exit-solid") and insideSolid then
+		local inside = IsInsideSolidForNoclip(root.Position, now)
+		if (CoinEngine.AutoNoclipMode == "coin-route" or CoinEngine.AutoNoclipMode == "exit-solid") and inside then
 			if CoinEngine.AutoNoclipMode ~= "exit-solid" then
 				CoinEngine.AutoNoclipMode = "exit-solid"
 				CoinEngine.AutoNoclipStartedAt = now
@@ -8479,8 +8481,7 @@ local function UpdateAutoNoclip(root, target, now)
 			else
 				CoinEngine.NoclipWanted = true
 			end
-		elseif insideSolid and stalledFor >= stuckConfirm
-			and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
+		elseif inside and stalledFor >= stuckConfirm and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
 			CoinEngine.AutoNoclipMode = "exit-solid"
 			CoinEngine.AutoNoclipStartedAt = now
 			CoinEngine.NoclipWanted = true
@@ -8493,10 +8494,9 @@ local function UpdateAutoNoclip(root, target, now)
 		return target
 	end
 
-
 	if CoinEngine.AutoNoclipMode == "exit-solid" then
 		local elapsed = now - (CoinEngine.AutoNoclipStartedAt or now)
-		if not insideSolid then
+		if not IsInsideSolidForNoclip(root.Position, now) then
 			CoinEngine.AutoNoclipMode = nil
 			CoinEngine.AutoNoclipTarget = nil
 			CoinEngine.NoclipWanted = false
@@ -8516,7 +8516,7 @@ local function UpdateAutoNoclip(root, target, now)
 
 	if CoinEngine.AutoNoclipMode == "coin-route" then
 		if not target or not target.Parent or target ~= CoinEngine.AutoNoclipTarget then
-			if insideSolid then
+			if IsInsideSolidForNoclip(root.Position, now) then
 				CoinEngine.AutoNoclipMode = "exit-solid"
 				CoinEngine.AutoNoclipStartedAt = now
 				CoinEngine.NoclipWanted = true
@@ -8530,15 +8530,16 @@ local function UpdateAutoNoclip(root, target, now)
 			return target
 		end
 
-		if now >= CoinEngine.AutoNoclipNextCheckAt then
-			CoinEngine.AutoNoclipNextCheckAt = now + CoinEngine.AutoNoclipCheckInterval
+		if now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
+			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.09)
 			local routeClear = HasClearCoinRoute(root.Position, target)
-			if routeClear and not insideSolid then
+			local inside = IsInsideSolidForNoclip(root.Position, now)
+			if routeClear and not inside then
 				CoinEngine.AutoNoclipMode = nil
 				CoinEngine.AutoNoclipTarget = nil
 				CoinEngine.NoclipWanted = false
 				LogEvent("auto-noclip stop reason=route-clear-and-progress-space")
-			elseif insideSolid and not routeClear then
+			elseif inside and not routeClear then
 				-- Keep the temporary crossing active while the root remains within the obstruction.
 				CoinEngine.NoclipWanted = true
 			elseif now - CoinEngine.AutoNoclipStartedAt >= CoinEngine.AutoNoclipMaxCrossTime then
@@ -8548,7 +8549,7 @@ local function UpdateAutoNoclip(root, target, now)
 				CoinEngine.AutoNoclipTarget = nil
 				CoinEngine.NoclipWanted = false
 				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-				LogEvent(string.format("auto-noclip abort reason=cross-timeout elapsed=%.2f inside=%d", now - CoinEngine.AutoNoclipStartedAt, insideSolid and 1 or 0))
+				LogEvent(string.format("auto-noclip abort reason=cross-timeout elapsed=%.2f inside=%d", now - CoinEngine.AutoNoclipStartedAt, inside and 1 or 0))
 				return nil
 			else
 				CoinEngine.NoclipWanted = true
@@ -8557,37 +8558,31 @@ local function UpdateAutoNoclip(root, target, now)
 		return target
 	end
 
-	-- Prediccion anticipada: si el trayecto directo de vuelo esta bloqueado, prepara el cruce
-	-- antes de que el personaje choque. El raycast excluye personaje, moneda y contenedor; el
-	-- modo sigue siendo temporal y termina al despejarse la ruta, al cambiar el objetivo o por timeout.
+	-- A blocked ray is only evidence that the straight line is obstructed, not proof that
+	-- NoClip is needed. Keep the normal collision path while it is making real progress.
+	-- Evaluate a route ray only after the progress monitor confirms a stall, cutting routine
+	-- raycasts while the character is already moving successfully toward the coin.
 	if target and target.Parent and IsValidCoin(target)
 		and (target.Position - root.Position).Magnitude > 3
 		and now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
-		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.03)
-		local routeClear = HasClearCoinRoute(root.Position, target)
-		if not routeClear then
-			-- Un solo resultado de trayectoria bloqueada basta para preparar la activacion:
-			-- esperar al stall confirmaba el problema demasiado tarde y dejaba al personaje parado.
-			CoinEngine.AutoNoclipMode = "coin-route"
-			CoinEngine.AutoNoclipTarget = target
-			CoinEngine.AutoNoclipStartedAt = now
-			CoinEngine.NoclipWanted = true
-			LogEvent(string.format("auto-noclip start reason=preemptive-route-blocked dist=%.1f target=%s",
-				(target.Position - root.Position).Magnitude, target.Name))
-			return target
-		end
-
-		-- Respaldo para atascos parciales que el raycast central no predijo (p. ej. otra
-		-- pieza del rig queda enganchada). Solo se activa tras confirmar falta de progreso.
+		CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.09)
 		local progressAge = math.max(0, now - (lastProgress or now))
-		if progressAge >= stuckConfirm and HasConfirmedRouteStall(root, target, now) then
-			CoinEngine.AutoNoclipMode = insideSolid and "exit-solid" or "coin-route"
-			CoinEngine.AutoNoclipTarget = target
-			CoinEngine.AutoNoclipStartedAt = now
-			CoinEngine.NoclipWanted = true
-			LogEvent(string.format("auto-noclip start reason=confirmed-stall-fallback stalled=%.2f dist=%.1f target=%s",
-				progressAge, (target.Position - root.Position).Magnitude, target.Name))
-			return target
+		-- Keep the short stall sampler warm even before the global progress timer expires;
+		-- otherwise the confirmation window would start late and delay recovery twice.
+		local confirmedMotionStall = HasConfirmedRouteStall(root, target, now)
+		if progressAge >= stuckConfirm and confirmedMotionStall then
+			local routeBlocked = not HasClearCoinRoute(root.Position, target)
+			local inside = IsInsideSolidForNoclip(root.Position, now)
+			if routeBlocked or inside then
+				CoinEngine.AutoNoclipMode = inside and "exit-solid" or "coin-route"
+				CoinEngine.AutoNoclipTarget = target
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.NoclipWanted = true
+				LogEvent(string.format("auto-noclip start reason=confirmed-stall blocked=%d inside=%d stalled=%.2f dist=%.1f target=%s",
+					routeBlocked and 1 or 0, inside and 1 or 0, progressAge,
+					(target.Position - root.Position).Magnitude, target.Name))
+				return target
+			end
 		end
 	end
 
@@ -8715,14 +8710,11 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Recuperación ante tirones: el último log llegó a 94.6 ms, justo por debajo del umbral
-	-- anterior de 100 ms. Al perder un intervalo largo, no continuar una trayectoria vieja.
-	-- Esto NO cambia el slider ni su límite: pausa brevemente, pone en cero la orden de este frame
-	-- (SafeControllerStep ya garantiza velocidad cero cuando velApplied=false) y recalcula la ruta.
+	-- Protección contra tirones: un pico aislado queda limitado por el presupuesto de
+	-- desplazamiento/frame más abajo. Solo una demora grave o una racha lenta reinicia la ruta.
 	if tonumber(dt) and dt >= 0.085 then
 		local hitchDt = tonumber(dt) or 0
-		-- Escalate recovery only when this hitch is part of a recent slow-frame burst.
-		-- A single isolated hitch gets a short hold; repeated hitches get more time to settle.
+		-- Count recent slow frames to distinguish one-off stalls from a sustained performance drop.
 		local recentSlowCount = 0
 		for i = #recentSlowFrameTimes, 1, -1 do
 			if now - recentSlowFrameTimes[i] <= slowFrameWindowSeconds then
@@ -8731,32 +8723,38 @@ local function ControllerStep(dt)
 				break
 			end
 		end
-		local recovery = hitchDt >= 0.25 and 0.90 or (hitchDt >= 0.12 and 0.55 or 0.25)
-		if recentSlowCount >= 4 then recovery = math.max(recovery, 0.65) end
-		if recentSlowCount >= 7 then recovery = math.max(recovery, 0.85) end
-		pauseUntil = math.max(pauseUntil, now + recovery)
-		currentSpeed = 0
-		CoinEngine.LastCommandVelocity = Vector3.zero
-		-- If the current coin is still behind solid geometry after a hitch, blacklist it briefly
-		-- so the next target scan can choose another route instead of resuming into the obstruction.
-		local hitchRoot = GetRoot()
-		local hitchTarget = CoinEngine.CurrentTarget
-		local blockedTarget = false
-		if hitchRoot and hitchTarget and hitchTarget.Parent then
-			local ok, blocked = pcall(function()
-				return not HasClearCoinRoute(hitchRoot.Position, hitchTarget)
-			end)
-			blockedTarget = ok and blocked == true
+		-- A single moderate hitch is already constrained by frameSpeedCap below. Do not
+		-- turn it into a full stop + acceleration restart; reserve hard recovery for a severe
+		-- hitch or a sustained burst of slow frames.
+		local hardRecovery = hitchDt >= 0.18 or recentSlowCount >= 3
+		if hardRecovery then
+			local recovery = hitchDt >= 0.25 and 0.65 or 0.25
+			if recentSlowCount >= 4 then recovery = math.max(recovery, 0.55) end
+			if recentSlowCount >= 7 then recovery = math.max(recovery, 0.75) end
+			pauseUntil = math.max(pauseUntil, now + recovery)
+			currentSpeed = 0
+			CoinEngine.LastCommandVelocity = Vector3.zero
+			-- If the current coin is still behind solid geometry after a severe/repeated hitch,
+			-- blacklist it briefly so the next target scan can choose another route.
+			local hitchRoot = GetRoot()
+			local hitchTarget = CoinEngine.CurrentTarget
+			local blockedTarget = false
+			if hitchRoot and hitchTarget and hitchTarget.Parent then
+				local ok, blocked = pcall(function()
+					return not HasClearCoinRoute(hitchRoot.Position, hitchTarget)
+				end)
+				blockedTarget = ok and blocked == true
+			end
+			if blockedTarget then
+				CoinEngine.Blacklist[hitchTarget] = now + 2.0
+				SetCurrent(nil, now)
+			end
+			ResetPath()
+			CoinEngine.TargetTrack = nil
+			LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f slowBurst=%d solid=%d target-reset=1 blocked-target=%d",
+				hitchDt * 1000, recovery, recentSlowCount, solidOverlapActive and 1 or 0, blockedTarget and 1 or 0))
+			return
 		end
-		if blockedTarget then
-			CoinEngine.Blacklist[hitchTarget] = now + 2.0
-			SetCurrent(nil, now)
-		end
-		ResetPath()
-		CoinEngine.TargetTrack = nil
-		LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f slowBurst=%d solid=%d target-reset=1 blocked-target=%d",
-			hitchDt * 1000, recovery, recentSlowCount, solidOverlapActive and 1 or 0, blockedTarget and 1 or 0))
-		return
 	end
 
 	local root, hum = GetRoot(), GetHumanoid()
@@ -8977,11 +8975,15 @@ local function ControllerStep(dt)
 			local dc = CoinTravelScore(root.Position, cur.Position)
 			local dn = CoinTravelScore(root.Position, cand.Position)
 			local shouldSwitch = dn < dc * CoinEngine.SwitchRatio
-			local currentRouteBlocked = not HasClearCoinRoute(root.Position, cur)
-			local candidateRouteClear = HasClearCoinRoute(root.Position, cand)
-			if currentRouteBlocked and candidateRouteClear then
-				shouldSwitch = true
-				LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1")
+			-- Do not switch on a single blocked-ray sample while the current target is still
+			-- getting closer. Clearance-based reroutes are evaluated when real progress stalls.
+			local routeNoProgress = (now - (lastProgress or now)) >= 0.14
+			if routeNoProgress and not shouldSwitch then
+				local currentRouteBlocked = not HasClearCoinRoute(root.Position, cur)
+				if currentRouteBlocked and HasClearCoinRoute(root.Position, cand) then
+					shouldSwitch = true
+					LogEvent("route-clearance-switch blocked-current=1 clear-candidate=1 stalled=1")
+				end
 			end
 			if CoinEngine.ThreatResponse.Active then
 				local threat = CoinEngine.ThreatResponse
