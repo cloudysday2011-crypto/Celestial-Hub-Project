@@ -6016,17 +6016,18 @@ local CoinEngine = {
 		SelfRoleScanInterval = 0.25,
 	},
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 38.4,       -- se conserva el techo de seguridad validado para evitar saltos de posicion
+	BaseMaxSpeed = 80,         -- techo solicitado; el guardado por desplazamiento/frame conserva la estabilidad
 	MaxVerticalVelocity = 8,  -- limita ascensos/descensos bruscos
 	MaxAcceleration = 48,     -- frenado mas conservador al aproximarse a una moneda
 	LastCommandVelocity = Vector3.zero,
 	AdaptiveStability = true, -- adapta direccion y cambios de velocidad
-	LastSafetyCap = 38.4,     -- limite efectivo maximo del Auto-Farm
+	LastSafetyCap = 80,        -- techo configurable; el limite efectivo depende del perfil y del dt
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
 	SpeedSafetyHoldUntil = 0,
-	SpeedSafetyHoldCap = 38.4,
-	CommandAcceleration = 90, -- acelera la respuesta sin quitar el limite dinamico de aceleracion
-	RiskCommandAccelerationFloor = 40,
+	SpeedSafetyHoldCap = 80,
+	CommandAcceleration = 150, -- rampa de comando mas responsiva con limite de cambio por segundo
+	RiskCommandAccelerationFloor = 80,
+	MaxCommandStepPerFrame = 1.5, -- limite de recorrido por actualizacion; el techo se calcula desde dt real
 	NearTargetAccelerationMultiplier = 1.35,
 	RampTime = 0.55,           -- rampa mas responsiva; la aceleracion sigue integrada por tiempo real
 	MinCollectInterval = 0.04,
@@ -6035,7 +6036,7 @@ local CoinEngine = {
 	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
 	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 38.4, -- +20% sobre el limite conservador anterior; los guardas de frame lento siguen activos
+	SafeMaxSpeed = 80, -- coincide con el maximo del slider; guardas dinamicos protegen los frames lentos
 	SafeRampTime = 0.48,      -- conserva rampa de Safe Mode, reduciendo la pausa al arrancar
 	SafeMinCollectInterval = 0.05,
 	SafeMaxDistance = 300,
@@ -6164,8 +6165,8 @@ local function StopFlight()
 	flightOn = false
 	solidOverlapActive = false
 	CoinEngine.SpeedSafetyHoldUntil = 0
-	CoinEngine.SpeedSafetyHoldCap = 38.4
-	CoinEngine.LastSafetyCap = 38.4
+	CoinEngine.SpeedSafetyHoldCap = 80
+	CoinEngine.LastSafetyCap = 80
 	CoinEngine.LastSafetyReason = "normal"
 	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
@@ -8722,7 +8723,7 @@ local function ControllerStep(dt)
 		UpdateAutoNoclip(root, nil, now)
 		local destination = GetMurderEscapeDestination(root, threat.Murderer, now)
 		local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-		local safetyCap = Param(CoinEngine.SafeMaxSpeed, 38.4)
+		local safetyCap = Param(CoinEngine.SafeMaxSpeed, 80)
 		local escapeCap = safetyCap
 		if sampleDt >= 0.060 then
 			escapeCap = math.min(escapeCap, 16)
@@ -8917,17 +8918,13 @@ local function ControllerStep(dt)
 	end
 	local slowFramesInWindow = #recentSlowFrameTimes
 
-	-- Frame-time/FPS metrics are retained for diagnosis, but must not lower the requested speed.
-	-- Time-based acceleration and the collision/ping guards below remain active; this avoids
-	-- silently slowing the farm solely because the device renders fewer frames per second.
-	local safetyCap = Param(CoinEngine.SafeMaxSpeed, 38.4)
-	-- En intervalos lentos, reducir tambien la velocidad objetivo evita grandes desplazamientos por frame.
-	local frameSpeedCap = safetyCap
-	if sampleDt >= 0.060 then
-		frameSpeedCap = math.min(frameSpeedCap, 16)
-	elseif sampleDt >= 0.040 then
-		frameSpeedCap = math.min(frameSpeedCap, 22)
-	end
+	-- Frame-time/FPS metrics are retained for diagnosis. En vez de imponer topes fijos
+	-- de 16/22, el limite se deriva del tiempo real entre actualizaciones: el comando no
+	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 80
+	-- con frames estables y conserva una reduccion proporcional si el cliente se ralentiza.
+	local safetyCap = Param(CoinEngine.SafeMaxSpeed, 80)
+	local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
+	local frameSpeedCap = math.min(safetyCap, maxStep / math.max(sampleDt, 1 / 240))
 	CoinEngine.SpeedSafetyHoldUntil = 0
 	CoinEngine.SpeedSafetyHoldCap = frameSpeedCap
 	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
@@ -8953,7 +8950,7 @@ local function ControllerStep(dt)
 	-- Unicamente durante el cierre rapido, permitir una subida moderada del limite en frames estables;
 	-- los guardas de latencia/tirones siguen prevaleciendo para no crear saltos grandes.
 	if CoinEngine.ThreatResponse.EmergencyEscape and sampleDt < 0.040 and pingCap == 80 and not solidStall then
-		frameSpeedCap = math.min(safetyCap * 1.10, 42.2)
+		frameSpeedCap = math.min(safetyCap * 1.10, maxStep / math.max(sampleDt, 1 / 240))
 		safetyReason = safetyReason == "normal" and "rapid-close-envelope" or (safetyReason .. "+rapid-close-envelope")
 	end
 	if solidStall and speed > 12 then
@@ -8990,7 +8987,7 @@ local function ControllerStep(dt)
 	end
 	if speed > frameSpeedCap then
 		speed = frameSpeedCap
-		local capReason = sampleDt >= 0.060 and "slow-frame-critical" or (sampleDt >= 0.040 and "slow-frame" or "stable-cap")
+		local capReason = sampleDt >= 0.060 and "step-budget-slow-frame" or (sampleDt >= 0.040 and "step-budget-frame" or "stable-cap")
 		safetyReason = safetyReason == "normal" and capReason or (safetyReason .. "+" .. capReason)
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
