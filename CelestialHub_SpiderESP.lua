@@ -1,5 +1,5 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
--- V3.37 AutoFarm Extreme V3: progress-aware airborne recovery and bounded x1.45 emergency speed; NoClip internals preserved.
+-- V3.38 AutoFarm Extreme V3: centralized movement priority, predictive Murder approach, coherent escape speed; NoClip internals preserved.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
@@ -6234,6 +6234,15 @@ local CoinEngine = {
 		RapidCloseFromDistance = 38, -- detecta el cruce rápido desde la zona exterior
 		RapidCloseTriggerDistance = 30,
 		RapidCloseWindow = 0.85,
+		-- Prediction is sampled on a stable time interval instead of noisy per-frame deltas.
+		PredictivePrepareDistance = 50,
+		PredictivePrepareClosingSpeed = 6,
+		PredictivePrepareTTC = 2.2,
+		PredictiveEscapeClosingSpeed = 10,
+		PredictiveEscapeTTC = 0.80,
+		ClosingSampleInterval = 0.08,
+		ClosingSpeedSamples = 0,
+		LastMeasuredMurderer = nil,
 		LastMeasuredDistance = math.huge,
 		LastMeasuredAt = 0,
 		LastClosingSpeed = 0,
@@ -6246,6 +6255,11 @@ local CoinEngine = {
 		NextLineOfSightCheckAt = 0,
 		LineOfSightCheckInterval = 0.10,
 		EscapeDestination = nil,
+		EscapeDestinationComputedAt = 0,
+		EscapePreparedAt = 0,
+		EscapePreparedOriginPosition = nil,
+		EscapePreparedMurderPosition = nil,
+		EscapePreparedFor = nil,
 		EscapePathBlocked = false, -- true si no se encontro ningun corredor fisicamente transitable
 		NextEscapeRouteCheckAt = 0,
 		CheckedEscapeDestination = nil,
@@ -8946,12 +8960,27 @@ CoinEngine.escapeRayParams.RespectCanCollide = true
 local escapeAngles = {0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150}
 local function GetMurderEscapeDestination(root, murderer, now)
 	local threat = CoinEngine.ThreatResponse
-	if not root or not murderer or not GetRoot(murderer) then return nil end
+	if not root or not murderer then return nil end
+	local murderRoot = GetRoot(murderer)
+	if not murderRoot then return nil end
 	if threat.EscapeDestination and now < (threat.NextEscapeDestinationAt or 0) then
-		return threat.EscapeDestination
+		local cachedDestination = threat.EscapeDestination
+		local cachedGap = (cachedDestination - root.Position).Magnitude
+		local currentSeparation = (root.Position - murderRoot.Position).Magnitude
+		local cachedSeparation = (cachedDestination - murderRoot.Position).Magnitude
+		local cacheUseful = cachedGap > 6.0 and cachedSeparation >= currentSeparation + 2.0
+		if cacheUseful and not threat.EscapePathBlocked then
+			return cachedDestination
+		end
+		-- If all tested lanes were blocked, retry no more than about 7 times/sec;
+		-- otherwise re-plan shortly after reaching or invalidating a destination.
+		local minimumHold = threat.EscapePathBlocked and 0.14 or 0.07
+		if now - (tonumber(threat.EscapeDestinationComputedAt) or 0) < minimumHold then
+			return cachedDestination
+		end
+		threat.NextEscapeDestinationAt = 0
 	end
 
-	local murderRoot = GetRoot(murderer)
 	local fromPos = root.Position
 	local away = Vector3.new(fromPos.X - murderRoot.Position.X, 0, fromPos.Z - murderRoot.Position.Z)
 	if away.Magnitude < 0.05 then
@@ -9003,6 +9032,7 @@ local function GetMurderEscapeDestination(root, murderer, now)
 		bestDestination = Vector3.new(fallback.X, fromPos.Y, fallback.Z)
 	end
 	threat.EscapeDestination = bestDestination
+	threat.EscapeDestinationComputedAt = now
 	threat.CheckedEscapeDestination = nil
 	threat.EscapeRouteBlockedNow = false
 	threat.NextEscapeRouteCheckAt = 0
@@ -9138,9 +9168,13 @@ local function UpdateThreatResponse(root, now)
 		threat.CoinThreatSnapshot = nil
 		if threat.CoinDangerState then table.clear(threat.CoinDangerState) end
 		threat.LastDistance = math.huge
+		threat.LastMeasuredMurderer = nil
 		threat.LastMeasuredDistance = math.huge
 		threat.LastMeasuredAt = now
 		threat.LastClosingSpeed = 0
+		threat.ClosingSpeedSamples = 0
+		threat.EscapeDestinationComputedAt = 0
+		threat.EscapePreparedFor = nil
 		threat.LastSeenAt = now
 		threat.LastDistanceAboveSafeAt = now
 		threat.LocalMurdererSafe = true
@@ -9158,29 +9192,141 @@ local function UpdateThreatResponse(root, now)
 	local murderRoot = murderer and GetRoot(murderer)
 	local distance = murderRoot and (root.Position - murderRoot.Position).Magnitude or math.huge
 
-	-- Sample distance each controller update. A threshold crossing is based on successive
-	-- timed measurements, not only on whether the last sample was outside the safe zone.
+	-- Sample closing speed on a real-time interval. Per-frame deltas are noisy and made
+	-- prediction unstable; changing Murderer identity resets the sample window.
 	local previousDistance = tonumber(threat.LastMeasuredDistance) or math.huge
 	local previousDistanceAt = tonumber(threat.LastMeasuredAt) or 0
 	local distanceSampleDt = previousDistanceAt > 0 and (now - previousDistanceAt) or math.huge
-	local rapidCriticalCross = murderer ~= nil and murderRoot ~= nil
-		and previousDistance >= (threat.RapidCloseFromDistance or 38)
-		and distance < (threat.CriticalEscapeDistance or 30)
-		and distanceSampleDt > 0 and distanceSampleDt <= (threat.RapidCloseWindow or 0.85)
+	local rapidCriticalCross = false
 	if murderer and murderRoot and distance < math.huge then
-		threat.LastClosingSpeed = previousDistance < math.huge and distanceSampleDt > 0 and distanceSampleDt < 2
-			and math.max(0, (previousDistance - distance) / distanceSampleDt) or 0
-		threat.LastMeasuredDistance = distance
-		threat.LastMeasuredAt = now
+		if threat.LastMeasuredMurderer ~= murderer then
+			threat.LastMeasuredMurderer = murderer
+			threat.LastMeasuredDistance = distance
+			threat.LastMeasuredAt = now
+			threat.LastClosingSpeed = 0
+			threat.ClosingSpeedSamples = 0
+			previousDistance, distanceSampleDt = distance, math.huge
+		else
+			previousDistance = tonumber(threat.LastMeasuredDistance) or math.huge
+			previousDistanceAt = tonumber(threat.LastMeasuredAt) or 0
+			distanceSampleDt = previousDistanceAt > 0 and (now - previousDistanceAt) or math.huge
+			rapidCriticalCross = previousDistance >= (threat.RapidCloseFromDistance or 38)
+				and distance < (threat.CriticalEscapeDistance or 30)
+				and distanceSampleDt > 0 and distanceSampleDt <= (threat.RapidCloseWindow or 0.85)
+			if distanceSampleDt >= (tonumber(threat.ClosingSampleInterval) or 0.08) then
+				if distanceSampleDt <= 0.65 and previousDistance < math.huge then
+					local instantaneousClosing = (previousDistance - distance) / distanceSampleDt
+					if instantaneousClosing > 0 then
+						instantaneousClosing = math.clamp(instantaneousClosing, 0, 80)
+						threat.LastClosingSpeed = (tonumber(threat.LastClosingSpeed) or 0) * 0.35 + instantaneousClosing * 0.65
+						if instantaneousClosing >= (tonumber(threat.PredictivePrepareClosingSpeed) or 6) then
+							threat.ClosingSpeedSamples = math.min(4, (tonumber(threat.ClosingSpeedSamples) or 0) + 1)
+						elseif instantaneousClosing < 3 then
+							threat.ClosingSpeedSamples = 0
+						end
+					else
+						-- Separation is stable/increasing: decay the prediction quickly instead of
+						-- carrying a stale closing-speed estimate into a false escape trigger.
+						threat.LastClosingSpeed = (tonumber(threat.LastClosingSpeed) or 0) * 0.20
+						threat.ClosingSpeedSamples = 0
+					end
+				else
+					threat.LastClosingSpeed = 0
+					threat.ClosingSpeedSamples = 0
+				end
+				threat.LastMeasuredDistance = distance
+				threat.LastMeasuredAt = now
+			end
+		end
 	else
+		threat.LastMeasuredMurderer = nil
 		threat.LastMeasuredDistance = math.huge
 		threat.LastMeasuredAt = now
 		threat.LastClosingSpeed = 0
+		threat.ClosingSpeedSamples = 0
+		threat.EscapeDestination = nil
+		threat.EscapeDestinationComputedAt = 0
+		threat.EscapePreparedFor = nil
+	end
+
+	-- LOS is shared by prediction and the hard proximity response; this cached ray is not
+	-- repeated later in the same controller step.
+	local clearShotLane = false
+	if murderer and murderRoot then
+		if now >= (threat.NextLineOfSightCheckAt or 0) or threat.LineOfSightPlayer ~= murderer then
+			threat.NextLineOfSightCheckAt = now + (threat.LineOfSightCheckInterval or 0.10)
+			threat.LineOfSightPlayer = murderer
+			threat.LastLineOfSightClear = HasClearMurderLineOfSight(murderer, root)
+		end
+		clearShotLane = threat.LastLineOfSightClear == true
+	else
+		threat.LastLineOfSightClear = false
+		threat.LineOfSightPlayer = nil
+	end
+	if murderer and murderRoot and distance >= threat.SafeDistance then
+		threat.LastDistanceAboveSafeAt = now
+	end
+
+	local closingSpeed = math.max(0, tonumber(threat.LastClosingSpeed) or 0)
+	local timeToCritical = closingSpeed > 0 and math.max(0, distance - (tonumber(threat.CriticalEscapeDistance) or 30)) / closingSpeed or math.huge
+	local predictivePrepare = murderer ~= nil and murderRoot ~= nil
+		and distance <= (tonumber(threat.PredictivePrepareDistance) or 50)
+		and closingSpeed >= (tonumber(threat.PredictivePrepareClosingSpeed) or 6)
+		and (tonumber(threat.ClosingSpeedSamples) or 0) >= 1
+		and ((distance - (tonumber(threat.CriticalEscapeDistance) or 30)) / math.max(closingSpeed, 1)) <= (tonumber(threat.PredictivePrepareTTC) or 2.2)
+	local predictiveEmergency = murderer ~= nil and murderRoot ~= nil
+		and distance <= (tonumber(threat.PredictivePrepareDistance) or 50)
+		and closingSpeed >= (tonumber(threat.PredictiveEscapeClosingSpeed) or 10)
+		and (tonumber(threat.ClosingSpeedSamples) or 0) >= 2
+		and timeToCritical <= (tonumber(threat.PredictiveEscapeTTC) or 0.80)
+		and (clearShotLane or distance <= (tonumber(threat.SafeDistance) or 35))
+
+	-- Prepare a usable escape destination while a reliable approach trend is developing.
+	-- This is planning only: farming keeps moving until the threat becomes urgent.
+	if predictivePrepare and not threat.EmergencyEscape then
+		if threat.EscapePreparedFor ~= murderer then
+			threat.EscapeDestination = nil
+			threat.EscapeDestinationComputedAt = 0
+			threat.NextEscapeDestinationAt = 0
+			threat.EscapePathBlocked = false
+			threat.EscapePreparedOriginPosition = nil
+			threat.EscapePreparedMurderPosition = nil
+			threat.EscapePreparedFor = murderer
+		end
+		threat.Murderer = murderer
+		local preparedDestination = threat.EscapeDestination
+		local preparedOrigin = threat.EscapePreparedOriginPosition
+		local preparedMurderPos = threat.EscapePreparedMurderPosition
+		local rootShift = preparedOrigin and (root.Position - preparedOrigin).Magnitude or math.huge
+		local murdererShift = preparedMurderPos and (murderRoot.Position - preparedMurderPos).Magnitude or math.huge
+		local preparedGap = preparedDestination and (preparedDestination - root.Position).Magnitude or 0
+		local preparedSeparation = preparedDestination and (preparedDestination - murderRoot.Position).Magnitude or 0
+		local routeStillUseful = preparedDestination ~= nil and IsSafeCoinPosition(preparedDestination)
+			and preparedGap > 6.0 and preparedSeparation >= distance + 2.0
+		local preparedAge = now - (tonumber(threat.EscapePreparedAt) or 0)
+		local needsPrepare = preparedDestination == nil or not routeStillUseful
+		if threat.EscapePathBlocked then
+			-- Failed broad route probes are not repeated every 0.28 s while nothing moved.
+			needsPrepare = needsPrepare and (rootShift >= 8.0 or murdererShift >= 8.0 or (distance <= 40 and preparedAge >= 0.55))
+		else
+			needsPrepare = needsPrepare or rootShift >= 8.0 or murdererShift >= 8.0
+		end
+		if needsPrepare then
+			threat.NextEscapeDestinationAt = 0
+			local prepared = GetMurderEscapeDestination(root, murderer, now)
+			threat.EscapePreparedAt = now
+			threat.EscapePreparedOriginPosition = root.Position
+			threat.EscapePreparedMurderPosition = murderRoot.Position
+			if prepared then
+				LogEvent(string.format("murder-escape-prepared dist=%.1f closing=%.1f ttc=%.2f blocked=%d",
+					distance, closingSpeed, timeToCritical, threat.EscapePathBlocked and 1 or 0))
+			end
+		end
 	end
 
 	-- Hysteresis: do not toggle farming/escape on tiny distance fluctuations around 35 studs.
 	-- Release only after the Murderer stays beyond the safe boundary for a short continuous hold.
-	if murderer and murderRoot and distance > threat.SafeDistance then
+	if murderer and murderRoot and distance > threat.SafeDistance and not predictivePrepare and not predictiveEmergency then
 		threat.LastDistanceAboveSafeAt = now
 		threat.LastDistance = distance
 		threat.LastSeenAt = now
@@ -9213,41 +9359,37 @@ local function UpdateThreatResponse(root, now)
 	-- This path is deliberately evaluated before inventory/LOS heuristics can defer the response.
 	local criticalProximity = murderer ~= nil and murderRoot ~= nil
 		and distance < (threat.CriticalEscapeDistance or 30)
-	if (criticalProximity or rapidCriticalCross) and not threat.EmergencyEscape then
+	if (criticalProximity or rapidCriticalCross or predictiveEmergency) and not threat.EmergencyEscape then
+		-- The prepared escape destination is reusable only if it is still safe and increases
+		-- separation from the current Murderer position; otherwise the escape branch plans anew.
+		local preparedDestination = threat.EscapeDestination
+		local keepPrepared = preparedDestination ~= nil and not threat.EscapePathBlocked
+			and threat.EscapePreparedFor == murderer and IsSafeCoinPosition(preparedDestination)
+			and (preparedDestination - root.Position).Magnitude > 6.0
+			and (preparedDestination - murderRoot.Position).Magnitude >= distance + 2.0
 		threat.EmergencyEscape = true
 		threat.EmergencyEscapeStartedAt = now
 		threat.Active = true
 		threat.Murderer = murderer
 		threat.LastSeenAt = now
 		threat.LastDistance = distance
-		threat.EscapeDestination = nil
-		threat.EscapePathBlocked = false
+		if not keepPrepared then
+			threat.EscapeDestination = nil
+			threat.EscapePathBlocked = false
+			threat.EscapeDestinationComputedAt = 0
+			threat.NextEscapeDestinationAt = 0
+		else
+			-- Give the single movement controller a short reuse window for the precomputed route.
+			threat.NextEscapeDestinationAt = math.max(tonumber(threat.NextEscapeDestinationAt) or 0, now + 0.10)
+		end
 		threat.CheckedEscapeDestination = nil
 		threat.EscapeRouteBlockedNow = false
 		threat.NextEscapeRouteCheckAt = 0
-		threat.NextEscapeDestinationAt = 0
-		LogEvent(string.format("murder-critical-escape dist=%.1f closing=%.1f rapid-cross=%d threshold=%.1f",
-			distance, tonumber(threat.LastClosingSpeed) or 0, rapidCriticalCross and 1 or 0,
-			threat.CriticalEscapeDistance or 30))
+		LogEvent(string.format("murder-escape-priority reason=%s dist=%.1f closing=%.1f ttc=%.2f prepared=%d rapid-cross=%d",
+			predictiveEmergency and "predictive-close" or (criticalProximity and "critical-distance" or "rapid-cross"),
+			distance, tonumber(threat.LastClosingSpeed) or 0, timeToCritical, keepPrepared and 1 or 0,
+			rapidCriticalCross and 1 or 0))
 		return "escape-entered", distance
-	end
-
-	-- A clear throw lane inside 30 studs is enough to trigger the emergency escape;
-	-- no animation-id assumption is needed. LOS is checked at most ten times per second.
-	local clearShotLane = false
-	if murderer and murderRoot then
-		if now >= (threat.NextLineOfSightCheckAt or 0) or threat.LineOfSightPlayer ~= murderer then
-			threat.NextLineOfSightCheckAt = now + (threat.LineOfSightCheckInterval or 0.10)
-			threat.LineOfSightPlayer = murderer
-			threat.LastLineOfSightClear = HasClearMurderLineOfSight(murderer, root)
-		end
-		clearShotLane = threat.LastLineOfSightClear == true
-	else
-		threat.LastLineOfSightClear = false
-		threat.LineOfSightPlayer = nil
-	end
-	if distance >= threat.SafeDistance then
-		threat.LastDistanceAboveSafeAt = now
 	end
 
 	local directThrowThreat = murderer ~= nil and murderRoot ~= nil
@@ -10125,8 +10267,7 @@ end
 -- En una coin-route/exit-solid prolongada, el impulso se solicita antes del hard-limit existente;
 -- UpdateAutoNoclip y NoclipStep conservan el control de sus propias reglas y límites.
 CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
-	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive
-		or (CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.EmergencyEscape) then
+	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive then
 		CoinEngine.EmergencyRecoveryActive = false
 		CoinEngine.EmergencyRecoveryStartedAt = nil
 		CoinEngine.EmergencyRecoveryReason = nil
@@ -10168,8 +10309,9 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 
 	local airborne = CoinEngine.AirborneSince ~= nil and CoinEngine.AirRecoveryLastSupported ~= true
 	local mode = CoinEngine.AutoNoclipMode
+	local emergencyEscapeActive = CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.EmergencyEscape == true
 	local adaptiveCrossing = not State.NoClipActive and (CoinEngine.NoclipWanted or noclipOn)
-		and (mode == "coin-route" or mode == "exit-solid")
+		and (mode == "coin-route" or mode == "exit-solid" or (emergencyEscapeActive and mode == "escape-route"))
 	local solidContext = not State.NoClipActive and solidOverlapActive and CoinEngine.solidOverlapSince ~= nil
 	local wallContext = adaptiveCrossing or solidContext
 	local context = airborne or wallContext
@@ -10187,6 +10329,8 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			CoinEngine.EmergencyRecoverySpeedApplied = false
 			LogEvent(string.format("autofarm-emergency-boost end reason=%s duration=%.2f progress=1", tostring(oldReason), duration))
 		end
+		CoinEngine.CurrentEmergencySpeedMultiplier = CoinEngine.EmergencyRecoveryActive
+			and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0
 		return CoinEngine.EmergencyRecoveryActive == true
 	end
 
@@ -10199,8 +10343,9 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 		and math.max(0, now - CoinEngine.EmergencyRecoveryNoProgressSince) or 0
 	local wallStartedAt = noclipOn and CoinEngine.NoclipPhysicalStartedAt or CoinEngine.AutoNoclipStartedAt
 	local wallAge = wallContext and wallStartedAt and math.max(0, now - wallStartedAt) or 0
-	local wallEmergency = wallContext and (stalledFor >= 0.35
-		or (adaptiveCrossing and wallAge >= (tonumber(CoinEngine.EmergencyRecoveryWallTriggerAge) or 0.85)))
+	-- Age alone is not a stall: a crossing with measured forward progress must not be
+	-- interrupted merely because it has lasted 0.85 seconds. Only confirmed no-progress triggers x1.45.
+	local wallEmergency = wallContext and stalledFor >= 0.35
 	local airEmergency = airborne and stalledFor >= 0.45
 	local shouldBoost = wallEmergency or airEmergency
 	local reason = wallEmergency and "wall-traversal-stall" or (airEmergency and "airborne-no-progress" or nil)
@@ -10234,6 +10379,8 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			end
 		end
 	end
+	CoinEngine.CurrentEmergencySpeedMultiplier = CoinEngine.EmergencyRecoveryActive
+		and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0
 	return CoinEngine.EmergencyRecoveryActive == true
 end
 
@@ -10256,6 +10403,18 @@ local function AirRecoveryIgnore(coin)
 end
 
 local function UpdateAirborneRecoveryState(root, now)
+	if CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape then
+		-- Escape is the sole movement intent during an urgent threat. Keep AirborneSince for
+		-- supervision, but don't run a competing landing planner in parallel with the escape route.
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		return false
+	end
 	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive then
 		CoinEngine.AirborneSince = nil
 		CoinEngine.AirRecoveryActive = false
@@ -11328,9 +11487,33 @@ local function ControllerStep(dt)
 		local movementDestination = collisionRestoreHold and root.Position
 			or (escapeLocalNoclipMove and (EnsureNoclipExitDestination(root, destination, now) or root.Position)) or destination
 		local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
-		local safetyCap = Param(CoinEngine.SafeMaxSpeed, 80)
-		-- Preserve the original escape-controller envelope independently of the coin-farm slider.
-		local maxStep = math.min(1.5, math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5))
+		-- Store transient escape-speed intermediates on CoinEngine instead of growing ControllerStep's
+		-- local register set; this script has an intentionally large existing controller.
+		CoinEngine.EscapeUsesAdaptiveNoclip = CoinEngine.NoclipWanted or noclipOn or State.NoClipActive
+		CoinEngine.ConfiguredEscapeSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
+		CoinEngine.EscapeSpeedMultiplier = 1.0
+		-- Match normal AutoFarm: passive bonuses stay off during adaptive NoClip, but a confirmed
+		-- emergency recovery still contributes x1.45. The existing NoClip envelope below keeps
+		-- its original 80-speed and 1.5-per-update ceilings, so this does not alter NoClip policy.
+		if not (CoinEngine.NoclipWanted or noclipOn or State.NoClipActive) then
+			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10
+		end
+		if CoinEngine.EmergencyRecoveryActive then
+			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45
+		end
+		CoinEngine.EscapeSliderEnvelope = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
+		local safetyCap = math.min(CoinEngine.ConfiguredEscapeSpeed, CoinEngine.EscapeSliderEnvelope) * CoinEngine.EscapeSpeedMultiplier
+		if SafeOn() then
+			safetyCap = math.min(safetyCap, CoinEngine.EscapeSliderEnvelope) -- Safe Mode keeps its explicit existing ceiling.
+		elseif not CoinEngine.EscapeUsesAdaptiveNoclip then
+			safetyCap = math.min(safetyCap, (tonumber(CoinEngine.BaseMaxSpeed) or 100) * CoinEngine.EscapeSpeedMultiplier)
+		end
+		-- Keep the adaptive NoClip movement envelope untouched. Without NoClip, use the same
+		-- per-frame command budget as the ordinary AutoFarm so the 100 slider is not silently capped at 80.
+		local maxStep = CoinEngine.EscapeUsesAdaptiveNoclip
+			and math.min(1.5, math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5))
+			or math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 2.2)
+		if CoinEngine.EscapeUsesAdaptiveNoclip then safetyCap = math.min(safetyCap, 80) end
 		local escapeCap = math.min(safetyCap, maxStep / math.max(sampleDt, 1 / 240))
 		local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
 		if pingForSafety >= 260 then escapeCap = math.min(escapeCap, 62)
@@ -11338,6 +11521,11 @@ local function ControllerStep(dt)
 		elseif pingForSafety >= 160 then escapeCap = math.min(escapeCap, 74) end
 		local commandDt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 		local escapeRamp = math.min(Param(CoinEngine.RampTime, CoinEngine.SafeRampTime), 0.30) -- rampa de respuesta de huida; sin boost de encadenamiento
+		if (tonumber(threat.LastDistance) or math.huge) <= 20 then
+			escapeRamp = math.min(escapeRamp, 0.18)
+		elseif (tonumber(threat.LastDistance) or math.huge) <= 25 then
+			escapeRamp = math.min(escapeRamp, 0.22)
+		end
 		currentSpeed = math.min(escapeCap, currentSpeed + escapeCap * commandDt / math.max(escapeRamp, 0.10))
 		CoinEngine.LastSafetyCap = escapeCap
 		CoinEngine.LastSafetyReason = string.format("murder-escape-frame-budget-dist%.0f", threat.LastDistance or 0)
@@ -11366,9 +11554,10 @@ local function ControllerStep(dt)
 		end
 		if now >= (threat.NextEscapeLogAt or 0) then
 			threat.NextEscapeLogAt = now + 0.50
-			LogEvent(string.format("murder-escape-active dist=%.1f cap=%.1f los=%d noclip=%d dest=%d",
-				threat.LastDistance or -1, escapeCap, threat.LastLineOfSightClear and 1 or 0,
-				CoinEngine.NoclipWanted and 1 or 0, destination and 1 or 0))
+			LogEvent(string.format("murder-escape-active dist=%.1f cap=%.1f slider=%.1f recover=%.2f los=%d noclip=%d dest=%d",
+				threat.LastDistance or -1, escapeCap, tonumber(State.TweenSpeed) or -1,
+				CoinEngine.EmergencyRecoveryActive and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0,
+				threat.LastLineOfSightClear and 1 or 0, CoinEngine.NoclipWanted and 1 or 0, destination and 1 or 0))
 		end
 		return
 	end
