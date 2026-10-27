@@ -1,4 +1,5 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
+-- V3.34 AutoFarm Extreme V2: existing spatial-index fast path, reduced duplicate validation, and Tween Speed max 100.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
@@ -6262,18 +6263,18 @@ local CoinEngine = {
 		SelfRoleScanInterval = 0.25,
 	},
 	-- ===== PROTECCIONES BASE (siempre activas, con o sin Safe Mode) =====
-	BaseMaxSpeed = 80,         -- techo solicitado; el guardado por desplazamiento/frame conserva la estabilidad
+	BaseMaxSpeed = 100,        -- máximo configurable del AutoFarm; los límites adaptativos siguen protegiendo frames lentos
 	MaxVerticalVelocity = 8,  -- limita ascensos/descensos bruscos
 	MaxAcceleration = 48,     -- frenado mas conservador al aproximarse a una moneda
 	LastCommandVelocity = Vector3.zero,
 	AdaptiveStability = true, -- adapta direccion y cambios de velocidad
-	LastSafetyCap = 80,        -- techo configurable; el limite efectivo depende del perfil y del dt
+	LastSafetyCap = 100,       -- techo inicial configurable; el limite efectivo depende del perfil y del dt
 	LastSafetyReason = "normal", -- razon activa para el diagnostico
 	SpeedSafetyHoldUntil = 0,
-	SpeedSafetyHoldCap = 80,
+	SpeedSafetyHoldCap = 100,
 	CommandAcceleration = 150, -- aceleracion normal; el +25% se aplica solo durante el encadenamiento
 	RiskCommandAccelerationFloor = 80, -- suelo normal adaptativo; el +25% se aplica solo durante el encadenamiento
-	MaxCommandStepPerFrame = 1.5, -- limite de recorrido por actualizacion; el techo se calcula desde dt real
+	MaxCommandStepPerFrame = 1.8, -- permite 100 a 60 FPS; frames lentos conservan un techo proporcional al dt real
 	NearTargetAccelerationMultiplier = 1.35,
 	RampTime = 0.55,           -- rampa normal; el ajuste de encadenamiento se aplica localmente
 	MinCollectInterval = 0.04, -- debounce normal; no sustituye el tiempo fisico de recoleccion
@@ -6282,7 +6283,7 @@ local CoinEngine = {
 	PreferredVerticalGap = 22,  -- primero busca monedas del nivel actual
 	MaxVerticalGap = 60,         -- respaldo para recoger otros pisos cuando no quedan cercanas
 	-- ===== EXTRA con Safe Mode (estabilidad, NO lentitud: misma velocidad que el slider) =====
-	SafeMaxSpeed = 80, -- coincide con el maximo del slider; guardas dinamicos protegen los frames lentos
+	SafeMaxSpeed = 80, -- conservado para la ruta de escape y como fallback; el AutoFarm normal usa BaseMaxSpeed=100
 	SafeRampTime = 0.48,      -- rampa normal de Safe Mode; el ajuste de encadenamiento se aplica localmente
 	SafeMinCollectInterval = 0.05, -- debounce normal de Safe Mode
 	SafeMaxDistance = 300,
@@ -6451,8 +6452,8 @@ local function StopFlight()
 	flightOn = false
 	solidOverlapActive = false
 	CoinEngine.SpeedSafetyHoldUntil = 0
-	CoinEngine.SpeedSafetyHoldCap = 80
-	CoinEngine.LastSafetyCap = 80
+	CoinEngine.SpeedSafetyHoldCap = 100
+	CoinEngine.LastSafetyCap = 100
 	CoinEngine.LastSafetyReason = "normal"
 	CoinEngine.LastCommandVelocity = Vector3.zero
 	_G.Celestial.FarmFlying = false      -- el Anti-Fling lo trata igual que "Fly" mientras esta activo
@@ -6607,7 +6608,7 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 	local targetVelocity = horizontal + Vector3.new(0, y, 0)
 
 	-- Slew-limit the command vector to prevent one-frame jumps. The configured slider max
-	-- remains 80; only the narrow Murderer-response path may request a temporary higher speed.
+	-- remains 100; only the narrow Murderer-response path may request a temporary higher speed.
 	if CoinEngine.AdaptiveStability then
 		-- Integrate the command limit using real elapsed time (up to 100 ms). The former 1/30 s
 		-- ceiling made acceleration accumulate too slowly at 15-25 FPS.
@@ -7249,7 +7250,7 @@ local function HiResPush(now, dt, csMs)
 	row.otiMs = (_G.Celestial.OTI and _G.Celestial.OTI.LastCostMs) or 0
 	row.sinceCollect = now - lastCollectAt
 	row.coins = coinsCollectedTotal
-	row.speedCap = tonumber(CoinEngine.LastSafetyCap) or 80
+	row.speedCap = tonumber(CoinEngine.LastSafetyCap) or 100
 	row.capWhy = tostring(CoinEngine.LastSafetyReason or "normal")
 	row.solidGuard = solidOverlapActive and 1 or 0
 	row.state, row.platform, row.noclip = hiState, hiPlatform, noclipOn and 1 or 0
@@ -7352,7 +7353,7 @@ local function BuildClientIncidentContext(reason)
 	rows[#rows + 1] = string.format(
 		"local-state farm=%s round=%s slider=%.1f cap=%.1f capWhy=%s cmd=%.2f phys=%.2f pingStats=%.0fms pingPlayer=%s frameDt=%.1fms fpsEstimate=%.1f noclipFlag=%s solidGuard=%s inSolidCheck=%s",
 		tostring(State and State.FarmEnabled), tostring(roundActive), tonumber(State and State.TweenSpeed) or -1,
-		tonumber(CoinEngine.LastSafetyCap) or 80, CleanIncidentText(CoinEngine.LastSafetyReason or "normal", 64),
+		tonumber(CoinEngine.LastSafetyCap) or 100, CleanIncidentText(CoinEngine.LastSafetyReason or "normal", 64),
 		(CoinEngine.LastCommandVelocity and CoinEngine.LastCommandVelocity.Magnitude) or 0, vel.Magnitude,
 		tonumber(cachedPingMs) or -1, localPing, (tonumber(CoinEngine.lastFrameDt) or 0) * 1000,
 		(tonumber(CoinEngine.lastFrameDt) or 0) > 0 and (1 / CoinEngine.lastFrameDt) or -1,
@@ -7458,7 +7459,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.28 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.34 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7592,7 +7593,7 @@ local function LogStep(now, dt, force)
 		batchIndex, #CoinEngine.Batches, batchCollected, tostring(limitReached),
 		tostring(batchPausing), math.max(0, pauseUntil - now),
 		tostring(State.OTIActive), tostring(State.AntiFlingActive), now - lastCollectAt, CoinEngine.ReadGameCoins(now), tonumber(State.TweenSpeed) or -1,
-		tonumber(CoinEngine.LastSafetyCap) or 80, tostring(CoinEngine.LastSafetyReason or "normal"), adaptiveRiskScore, adaptiveSteerAlpha, adaptiveFPS, adaptivePhysicalSpeed, table.concat(pendingEvents, ","))
+		tonumber(CoinEngine.LastSafetyCap) or 100, tostring(CoinEngine.LastSafetyReason or "normal"), adaptiveRiskScore, adaptiveSteerAlpha, adaptiveFPS, adaptivePhysicalSpeed, table.concat(pendingEvents, ","))
 	table.clear(pendingEvents)
 	logBuf[#logBuf + 1] = line
 	if #logBuf > 160 then table.remove(logBuf, 1) end
@@ -7645,7 +7646,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.28 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.34 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -8584,6 +8585,67 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 			local lookPlanar = Vector3.new(look.X, 0, look.Z)
 			if lookPlanar.Magnitude > 0.05 then immediateForward = lookPlanar.Unit end
 		end
+
+		-- Fast path over the already-maintained spatial grid. The 27 adjacent cells cover
+		-- the immediate radius even when the player/coin straddles a cell boundary. A full
+		-- CoinCache scan is still used whenever no suitable, clear immediate target is found.
+		local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
+		local cx, cy, cz = math.floor(fromPos.X / cellSize), math.floor(fromPos.Y / cellSize), math.floor(fromPos.Z / cellSize)
+		local localBest, localBestScore = nil, math.huge
+		local immediateDistanceLimit = math.min(immediateRadius, 4.0)
+		local immediateDistanceLimitSq = immediateDistanceLimit * immediateDistanceLimit
+		for ix = cx - 1, cx + 1 do
+			for iy = cy - 1, cy + 1 do
+				for iz = cz - 1, cz + 1 do
+					local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+					if bucket then
+						for coin in pairs(bucket) do
+							if coin ~= exclude and CoinEngine.CoinCache[coin] then
+								if not coin.Parent or not IsValidCoin(coin) then
+									UnregisterCoin(coin)
+								else
+									local bl = CoinEngine.Blacklist[coin]
+									if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
+									local pos = coin.Position
+									local dx, dy, dz = pos.X - fromPos.X, pos.Y - fromPos.Y, pos.Z - fromPos.Z
+									local distanceSq = dx * dx + dy * dy + dz * dz
+									local verticalGap = math.abs(dy)
+									if not bl and distanceSq <= immediateDistanceLimitSq and verticalGap <= immediateVerticalGap
+										and not IsCoinTemporarilyExcluded(coin, now) then
+										local distance = math.sqrt(distanceSq)
+										local horizontalDelta = Vector3.new(dx, 0, dz)
+										local forwardDot = 0
+										if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
+											forwardDot = immediateForward:Dot(horizontalDelta.Unit)
+										end
+										if (forwardDot >= 0.82 and horizontalDelta.Magnitude > 0.35) or distance <= 2.25 then
+											local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
+											quickScore -= GetCoinChainBonus(coin)
+											if quickScore < localBestScore then
+												localBest, localBestScore = coin, quickScore
+											end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		if localBest then
+			immediateFastPathAttempted = true
+			immediateBest = localBest
+			immediateBestScore = localBestScore
+			immediateCheckedCoin = localBest
+			immediateGrounded = IsGrounded(localBest)
+			if immediateGrounded then
+				immediateRouteCheckConsumed = true
+				if HasClearCoinRoute(fromPos, localBest) then return localBest end
+			else
+				CoinEngine.Blacklist[localBest] = now + 2.5
+			end
+		end
 	end
 	for coin in pairs(CoinEngine.CoinCache) do
 		if coin ~= exclude then
@@ -8592,13 +8654,15 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 			else
 				local bl = CoinEngine.Blacklist[coin]
 				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-				local delta = coin.Position - fromPos
-				local verticalGap = math.abs(delta.Y)
-				local distance = delta.Magnitude
+				local pos = coin.Position
+				local dx, dy, dz = pos.X - fromPos.X, pos.Y - fromPos.Y, pos.Z - fromPos.Z
+				local verticalGap = math.abs(dy)
+				local distanceSquared = dx * dx + dy * dy + dz * dz
 				if not bl and not IsCoinTemporarilyExcluded(coin, now)
-					and verticalGap <= maxGap and distance <= maxDistance then
+					and verticalGap <= maxGap and distanceSquared <= maxDistance * maxDistance then
+					local distance = math.sqrt(distanceSquared)
 					candidates[#candidates + 1] = {coin = coin}
-					local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+					local horizontalDelta = Vector3.new(dx, 0, dz)
 					local forwardDot = 0
 					if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
 						forwardDot = immediateForward:Dot(horizontalDelta.Unit)
@@ -10611,7 +10675,7 @@ local function DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
 	local acceleration = math.max(1, tonumber(CoinEngine.MaxAcceleration) or 40)
 	-- An empty/no-safe-coin branch can have reset currentSpeed to zero. Recovery gets a temporary
 	-- local cap (not a change to the cruise slider) so it can still reach a verified landing/exit.
-	local configuredSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80)
+	local configuredSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
 	local recoveryCap = currentSpeed > 1 and currentSpeed or math.min(configuredSpeed, 24)
 	local speed = math.min(recoveryCap, math.sqrt(2 * acceleration * math.max(0, gap - 0.75)))
 	if gap > 2.5 then speed = math.max(speed, math.min(recoveryCap, tonumber(CoinEngine.FlightMinSpeed) or 6)) end
@@ -10862,9 +10926,8 @@ local function ControllerStep(dt)
 			or (escapeLocalNoclipMove and (EnsureNoclipExitDestination(root, destination, now) or root.Position)) or destination
 		local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
 		local safetyCap = Param(CoinEngine.SafeMaxSpeed, 80)
-		-- Match the ordinary controller's elapsed-time displacement budget. Stable 60 FPS can
-		-- use the full 80 cap; slower frames are scaled proportionally instead of fixed 16/22 caps.
-		local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
+		-- Preserve the original escape-controller envelope independently of the coin-farm slider.
+		local maxStep = math.min(1.5, math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5))
 		local escapeCap = math.min(safetyCap, maxStep / math.max(sampleDt, 1 / 240))
 		local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
 		if pingForSafety >= 260 then escapeCap = math.min(escapeCap, 62)
@@ -11064,7 +11127,7 @@ local function ControllerStep(dt)
 	end
 
 	local safe = SafeOn()
-	local sliderSpeed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 80), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
+	local sliderSpeed = math.min(math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100), Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed))
 	local speed = sliderSpeed
 	local safetyReason = "normal"
 	local sampleDt = math.max(0, tonumber(rawDt) or tonumber(dt) or (1 / 60))
@@ -11089,16 +11152,22 @@ local function ControllerStep(dt)
 
 	-- Frame-time/FPS metrics are retained for diagnosis. En vez de imponer topes fijos
 	-- de 16/22, el limite se deriva del tiempo real entre actualizaciones: el comando no
-	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 80
+	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 100
 	-- con frames estables y conserva una reduccion proporcional si el cliente se ralentiza.
-	local safetyCap = Param(CoinEngine.SafeMaxSpeed, 80)
+	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
 	local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
+	-- Keep adaptive NoClip on its previous 80-speed / 1.5-step safety envelope. The expanded
+	-- slider range applies to ordinary coin movement, not to temporary NoClip navigation.
+	if CoinEngine.NoclipWanted or noclipOn then
+		safetyCap = math.min(safetyCap, 80)
+		maxStep = math.min(maxStep, 1.5)
+	end
 	local frameSpeedCap = math.min(safetyCap, maxStep / math.max(sampleDt, 1 / 240))
 	CoinEngine.SpeedSafetyHoldUntil = 0
 	CoinEngine.SpeedSafetyHoldCap = frameSpeedCap
 	-- La latencia solo reduce el limite cuando es sostenidamente alta; 160 ms aislados no deben
 	-- mantener el farm en 64 aunque el ping medio de las dos capturas ronda 117-133 ms.
-	local pingCap, pingWhy = 80, nil
+	local pingCap, pingWhy = 100, nil
 	-- Usa el ping suavizado si ya está inicializado: una lectura alta aislada no cambia de perfil.
 	local pingForSafety = adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs
 	if pingForSafety >= 260 then
@@ -11108,7 +11177,7 @@ local function ControllerStep(dt)
 	elseif pingForSafety >= 160 then
 		pingCap, pingWhy = 74, "ping-elevated"
 	end
-	if pingCap < 80 then
+	if pingCap < 100 then
 		speed = math.min(speed, pingCap)
 		if safetyReason == "normal" then safetyReason = pingWhy else safetyReason = safetyReason .. "+" .. pingWhy end
 	end
@@ -11118,7 +11187,7 @@ local function ControllerStep(dt)
 		and (now - CoinEngine.solidOverlapSince) >= 0.35 and (now - lastProgress) >= 0.35
 	-- Unicamente durante el cierre rapido, permitir una subida moderada del limite en frames estables;
 	-- los guardas de latencia/tirones siguen prevaleciendo para no crear saltos grandes.
-	if CoinEngine.ThreatResponse.EmergencyEscape and sampleDt < 0.040 and pingCap == 80 and not solidStall then
+	if CoinEngine.ThreatResponse.EmergencyEscape and sampleDt < 0.040 and pingCap == 100 and not solidStall then
 		frameSpeedCap = math.min(safetyCap * 1.10, maxStep / math.max(sampleDt, 1 / 240))
 		safetyReason = safetyReason == "normal" and "rapid-close-envelope" or (safetyReason .. "+rapid-close-envelope")
 	end
@@ -11200,8 +11269,9 @@ local function ControllerStep(dt)
 	-- Si queda demasiado lejos/arriba despues de seleccionarla, se descarta en vez de perseguirla.
 	local targetDelta = target.Position - root.Position
 	local targetMaxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
-	if not IsAvailable(target, now)
-		or targetDelta.Magnitude > Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+	-- IsAvailable was already checked in the selector branch above; avoid repeating its
+	-- attributes/transparency/position checks in the same non-yielding controller pass.
+	if targetDelta.Magnitude > Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 		or math.abs(targetDelta.Y) > targetMaxGap then
 		LogEvent(string.format("stale-coin-target-invalid dist=%.1f dy=%.1f", targetDelta.Magnitude, targetDelta.Y))
 		CoinEngine.Blacklist[target] = now + 2.5
@@ -11356,14 +11426,15 @@ local function ControllerStep(dt)
 							and IsThreatSafeCoin(coin)
 					end
 					local chainCoin = preparedNextCoin
-					if not CanChainTo(chainCoin) then
+					local chainNext = CanChainTo(chainCoin)
+					if not chainNext then
 						if CoinEngine.ThreatResponse.Active then
 							chainCoin = PickThreatCoin(root.Position, target, now)
 						else
 							chainCoin = PickNearest(root.Position, target, now)
 						end
+						chainNext = CanChainTo(chainCoin)
 					end
-					local chainNext = CanChainTo(chainCoin)
 					if POST_COLLECT_PAUSE_ENABLED then
 						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
 					end
@@ -14757,7 +14828,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		AddCategoryHeader(secFarm, "Coin Farmer (MM2)")
 		AddSpacer(secFarm, 2)
 		AddToggleToSection(secFarm, "Auto Farm Coins", State.FarmEnabled, function(v) State.FarmEnabled = v end, Color3.fromRGB(255, 215, 0))
-		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (80 max; adaptive steering does not lower the selected limit).", 10, 80, State.TweenSpeed, function(v)
+		AddSliderToSection(secFarm, "Tween Speed", "Flight speed towards coins (100 max; adaptive safety and the existing NoClip envelope may reduce effective speed when needed).", 10, 100, State.TweenSpeed, function(v)
 			local oldValue = State.TweenSpeed
 			State.TweenSpeed = v
 			local engine = _G.Celestial and _G.Celestial.CoinEngine
