@@ -1,5 +1,5 @@
 -- StabilityLog18: danger-aware coin exclusion, threat-aware routing, and stable priority escape.
--- V3.35 AutoFarm Extreme V3: compact-cluster passives, adaptive obstacle checks, and continuous coin chaining.
+-- V3.37 AutoFarm Extreme V3: progress-aware airborne recovery and bounded x1.45 emergency speed; NoClip internals preserved.
 -- Preserves StabilityLog14 threat routing, server-hop/rejoin handling, and the existing UI startup flow.
 -- Includes StabilityLog13 server-hop/rejoin handling from the current baseline.
 -- V3.28 surgical: faster obstacle cost preflight, cached local perception, coordinated 2s airborne recovery and 3s NoClip exit supervision.
@@ -6366,6 +6366,25 @@ local CoinEngine = {
 	AirRecoveryReason = nil,
 	AirRecoveryNextProbeAt = 0,
 	AirRecoveryLastSupported = false,
+	AirRecoveryNoDestinationSince = nil,
+	AirRecoveryRetryAt = 0,
+	AirborneStallRecoveryDelay = 0.78,
+	-- Emergency recovery observes real movement, not frame counts or target changes.
+	EmergencyRecoveryActive = false,
+	EmergencyRecoveryMultiplier = 1.45,
+	EmergencyRecoveryStartedAt = nil,
+	EmergencyRecoveryReason = nil,
+	EmergencyRecoveryNoProgressSince = nil,
+	EmergencyRecoveryReleaseSince = nil,
+	EmergencyRecoveryLastSampleAt = 0,
+	EmergencyRecoveryLastPosition = nil,
+	EmergencyRecoveryLastCommandDirection = Vector3.zero,
+	EmergencyRecoveryLastCommandSpeed = 0,
+	EmergencyRecoverySampleInterval = 0.12,
+	EmergencyRecoveryProgressThreshold = 0.28,
+	EmergencyRecoveryWallTriggerAge = 0.85,
+	EmergencyRecoverySpeedApplied = false,
+	LastBaseEffectiveSpeed = 0,
 	NoclipPhysicalStartedAt = nil,
 	AutoNoclipHardLimit = 3.0,
 	AutoNoclipExitLeadTime = 0.70,
@@ -6487,6 +6506,19 @@ local function StopFlight()
 	CoinEngine.AirRecoveryDestinationStart = nil
 	CoinEngine.AirRecoveryReason = nil
 	CoinEngine.AirRecoveryNextProbeAt = 0
+	CoinEngine.AirRecoveryNoDestinationSince = nil
+	CoinEngine.AirRecoveryRetryAt = 0
+	CoinEngine.EmergencyRecoveryActive = false
+	CoinEngine.EmergencyRecoveryStartedAt = nil
+	CoinEngine.EmergencyRecoveryReason = nil
+	CoinEngine.EmergencyRecoveryNoProgressSince = nil
+	CoinEngine.EmergencyRecoveryReleaseSince = nil
+	CoinEngine.EmergencyRecoveryLastSampleAt = 0
+	CoinEngine.EmergencyRecoveryLastPosition = nil
+	CoinEngine.EmergencyRecoveryLastCommandDirection = Vector3.zero
+	CoinEngine.EmergencyRecoveryLastCommandSpeed = 0
+	CoinEngine.EmergencyRecoverySpeedApplied = false
+	CoinEngine.CurrentEmergencySpeedMultiplier = 1.0
 end
 
 local function EnsureFlight(root, hum)
@@ -7484,7 +7516,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.35 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.37 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7671,7 +7703,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.35 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.37 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -10088,10 +10120,126 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	return destination, false
 end
 
+-- Supervisor compartido del controlador existente. El reloj no se reinicia al cambiar de moneda:
+-- únicamente el progreso físico alineado con la orden actual puede limpiar el estancamiento.
+-- En una coin-route/exit-solid prolongada, el impulso se solicita antes del hard-limit existente;
+-- UpdateAutoNoclip y NoclipStep conservan el control de sus propias reglas y límites.
+CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
+	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive
+		or (CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.EmergencyEscape) then
+		CoinEngine.EmergencyRecoveryActive = false
+		CoinEngine.EmergencyRecoveryStartedAt = nil
+		CoinEngine.EmergencyRecoveryReason = nil
+		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+		CoinEngine.EmergencyRecoveryReleaseSince = nil
+		CoinEngine.EmergencyRecoveryLastSampleAt = 0
+		CoinEngine.EmergencyRecoveryLastPosition = root and root.Position or nil
+		CoinEngine.EmergencyRecoveryLastCommandDirection = Vector3.zero
+		CoinEngine.EmergencyRecoveryLastCommandSpeed = 0
+		CoinEngine.EmergencyRecoverySpeedApplied = false
+		CoinEngine.CurrentEmergencySpeedMultiplier = 1.0
+		return false
+	end
+
+	local interval = math.max(0.08, tonumber(CoinEngine.EmergencyRecoverySampleInterval) or 0.12)
+	local lastAt = tonumber(CoinEngine.EmergencyRecoveryLastSampleAt) or 0
+	if lastAt > 0 and now - lastAt < interval then return CoinEngine.EmergencyRecoveryActive == true end
+	local previousPosition = CoinEngine.EmergencyRecoveryLastPosition
+	local previousDirection = CoinEngine.EmergencyRecoveryLastCommandDirection or Vector3.zero
+	local previousCommandSpeed = tonumber(CoinEngine.EmergencyRecoveryLastCommandSpeed) or 0
+	local elapsed = lastAt > 0 and math.max(0, now - lastAt) or 0
+	local position = root.Position
+	local currentCommand = CoinEngine.LastCommandVelocity or Vector3.zero
+	local commandMagnitude = currentCommand.Magnitude
+	local madeProgress = false
+	if previousPosition and elapsed >= 0.08 and previousDirection.Magnitude > 0.01 then
+		local displacement = position - previousPosition
+		local forwardDisplacement = displacement:Dot(previousDirection.Unit)
+		local threshold = math.max(tonumber(CoinEngine.EmergencyRecoveryProgressThreshold) or 0.28,
+			math.min(0.70, previousCommandSpeed * elapsed * 0.12))
+		-- Sideways jitter or movement against the prior command is not useful progress.
+		madeProgress = forwardDisplacement >= threshold
+	end
+
+	CoinEngine.EmergencyRecoveryLastSampleAt = now
+	CoinEngine.EmergencyRecoveryLastPosition = position
+	CoinEngine.EmergencyRecoveryLastCommandDirection = commandMagnitude > 0.01 and currentCommand.Unit or Vector3.zero
+	CoinEngine.EmergencyRecoveryLastCommandSpeed = commandMagnitude
+
+	local airborne = CoinEngine.AirborneSince ~= nil and CoinEngine.AirRecoveryLastSupported ~= true
+	local mode = CoinEngine.AutoNoclipMode
+	local adaptiveCrossing = not State.NoClipActive and (CoinEngine.NoclipWanted or noclipOn)
+		and (mode == "coin-route" or mode == "exit-solid")
+	local solidContext = not State.NoClipActive and solidOverlapActive and CoinEngine.solidOverlapSince ~= nil
+	local wallContext = adaptiveCrossing or solidContext
+	local context = airborne or wallContext
+
+	if not context then
+		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+		CoinEngine.EmergencyRecoveryReleaseSince = CoinEngine.EmergencyRecoveryActive and (CoinEngine.EmergencyRecoveryReleaseSince or now) or nil
+		if CoinEngine.EmergencyRecoveryActive and now - (CoinEngine.EmergencyRecoveryReleaseSince or now) >= 0.24 then
+			local oldReason = CoinEngine.EmergencyRecoveryReason or "recovered"
+			local duration = math.max(0, now - (CoinEngine.EmergencyRecoveryStartedAt or now))
+			CoinEngine.EmergencyRecoveryActive = false
+			CoinEngine.EmergencyRecoveryStartedAt = nil
+			CoinEngine.EmergencyRecoveryReason = nil
+			CoinEngine.EmergencyRecoveryReleaseSince = nil
+			CoinEngine.EmergencyRecoverySpeedApplied = false
+			LogEvent(string.format("autofarm-emergency-boost end reason=%s duration=%.2f progress=1", tostring(oldReason), duration))
+		end
+		return CoinEngine.EmergencyRecoveryActive == true
+	end
+
+	if madeProgress then
+		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+	else
+		CoinEngine.EmergencyRecoveryNoProgressSince = CoinEngine.EmergencyRecoveryNoProgressSince or now
+	end
+	local stalledFor = CoinEngine.EmergencyRecoveryNoProgressSince
+		and math.max(0, now - CoinEngine.EmergencyRecoveryNoProgressSince) or 0
+	local wallStartedAt = noclipOn and CoinEngine.NoclipPhysicalStartedAt or CoinEngine.AutoNoclipStartedAt
+	local wallAge = wallContext and wallStartedAt and math.max(0, now - wallStartedAt) or 0
+	local wallEmergency = wallContext and (stalledFor >= 0.35
+		or (adaptiveCrossing and wallAge >= (tonumber(CoinEngine.EmergencyRecoveryWallTriggerAge) or 0.85)))
+	local airEmergency = airborne and stalledFor >= 0.45
+	local shouldBoost = wallEmergency or airEmergency
+	local reason = wallEmergency and "wall-traversal-stall" or (airEmergency and "airborne-no-progress" or nil)
+
+	if shouldBoost then
+		if not CoinEngine.EmergencyRecoveryActive then
+			CoinEngine.EmergencyRecoveryActive = true
+			CoinEngine.EmergencyRecoveryStartedAt = now
+			CoinEngine.EmergencyRecoveryReason = reason
+			CoinEngine.EmergencyRecoveryReleaseSince = nil
+			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f limit=3.00",
+				tostring(reason), tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45, stalledFor, wallAge,
+				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0))
+		elseif reason == "wall-traversal-stall" then
+			CoinEngine.EmergencyRecoveryReason = reason
+		end
+		CoinEngine.EmergencyRecoveryReleaseSince = nil
+	else
+		-- Keep the boost stable briefly so a single good sample does not toggle it frame-to-frame.
+		if CoinEngine.EmergencyRecoveryActive then
+			CoinEngine.EmergencyRecoveryReleaseSince = CoinEngine.EmergencyRecoveryReleaseSince or now
+			if now - CoinEngine.EmergencyRecoveryReleaseSince >= 0.24 then
+				local oldReason = CoinEngine.EmergencyRecoveryReason or "recovered"
+				local duration = math.max(0, now - (CoinEngine.EmergencyRecoveryStartedAt or now))
+				CoinEngine.EmergencyRecoveryActive = false
+				CoinEngine.EmergencyRecoveryStartedAt = nil
+				CoinEngine.EmergencyRecoveryReason = nil
+				CoinEngine.EmergencyRecoveryReleaseSince = nil
+				CoinEngine.EmergencyRecoverySpeedApplied = false
+				LogEvent(string.format("autofarm-emergency-boost end reason=%s duration=%.2f progress=%d", tostring(oldReason), duration, madeProgress and 1 or 0))
+			end
+		end
+	end
+	return CoinEngine.EmergencyRecoveryActive == true
+end
+
 -- Recuperación aérea integrada en el mismo Heartbeat del AutoFarm (no crea otro controlador).
--- Un rayo de soporte corto evita clasificar como "en el aire" el vuelo horizontal a altura normal
--- sobre un piso. Al superar 2 s sin superficie cercana se elige primero una moneda debajo y después
--- la superficie colisionable más cercana; no se fuerza un CFrame ni se desciende a ciegas.
+-- El reloj de recuperación se basa ahora en falta de progreso real, no solo en estar en el aire.
+-- Un rayo de soporte corto evita clasificar como "en el aire" el vuelo horizontal a altura normal.
       CoinEngine.airSupportParams = RaycastParams.new()
 CoinEngine.airSupportParams.FilterType = Enum.RaycastFilterType.Exclude
 CoinEngine.airSupportParams.RespectCanCollide = true
@@ -10116,6 +10264,13 @@ local function UpdateAirborneRecoveryState(root, now)
 		CoinEngine.AirRecoveryDestinationTarget = nil
 		CoinEngine.AirRecoveryDestinationStart = nil
 		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		CoinEngine.EmergencyRecoveryActive = false
+		CoinEngine.EmergencyRecoveryStartedAt = nil
+		CoinEngine.EmergencyRecoveryReason = nil
+		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+		CoinEngine.EmergencyRecoveryReleaseSince = nil
+		CoinEngine.EmergencyRecoverySpeedApplied = false
 		return false
 	end
 	if now < (CoinEngine.AirRecoveryNextProbeAt or 0) then
@@ -10144,19 +10299,53 @@ local function UpdateAirborneRecoveryState(root, now)
 		CoinEngine.AirRecoveryDestinationTarget = nil
 		CoinEngine.AirRecoveryDestinationStart = nil
 		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		CoinEngine.AirRecoveryRetryAt = 0
+		CoinEngine.EmergencyRecoveryNoProgressSince = nil
 		return false
 	end
 	CoinEngine.AirborneSince = CoinEngine.AirborneSince or now
 	local airborneFor = now - CoinEngine.AirborneSince
-	if airborneFor >= (tonumber(CoinEngine.AirborneRecoveryLimit) or 2.0) and not CoinEngine.AirRecoveryActive then
+
+	-- Si no existe superficie segura tras varios intentos y todavía quedan monedas, no mantener
+	-- al personaje congelado indefinidamente: liberar la recuperación una vez para que el mismo
+	-- selector/controlador pruebe una ruta validada. Se reintentará si sigue sin haber progreso.
+	if CoinEngine.AirRecoveryActive and CoinEngine.AirRecoveryNoDestinationSince
+		and CoinEngine.CoinCount > 0
+		and now - CoinEngine.AirRecoveryNoDestinationSince >= 0.45 then
+		local failedTarget = CoinEngine.CurrentTarget
+		if failedTarget and failedTarget.Parent and CoinEngine.CoinCache[failedTarget] then
+			-- A failed recovery after confirmed no-progress should not immediately pick the same route again.
+			CoinEngine.Blacklist[failedTarget] = now + math.max(1.5, tonumber(CoinEngine.StuckBlacklist) or 3.0)
+			SetCurrent(nil, now)
+		end
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryRetryAt = now + 0.45
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		LogEvent(string.format("air-recovery-no-safe-landing-release airborne=%.2f action=resume-alternate-validated-route retryIn=0.45 blocked=%s", airborneFor,
+			failedTarget and tostring(failedTarget.Name) or "none"))
+		return false
+	end
+
+	local noProgressSince = CoinEngine.EmergencyRecoveryNoProgressSince
+	local noProgressFor = noProgressSince and math.max(0, now - noProgressSince) or 0
+	local recoveryDelay = math.max(0.45, tonumber(CoinEngine.AirborneStallRecoveryDelay) or 0.78)
+	if noProgressSince and noProgressFor >= recoveryDelay and now >= (tonumber(CoinEngine.AirRecoveryRetryAt) or 0)
+		and not CoinEngine.AirRecoveryActive then
 		CoinEngine.AirRecoveryActive = true
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
 		CoinEngine.AirRecoveryDestinationTarget = nil
 		CoinEngine.AirRecoveryDestinationStart = root.Position
-		CoinEngine.AirRecoveryReason = "airborne-limit"
-		LogEvent(string.format("air-recovery-start airborne=%.2f target=%s", airborneFor,
-			CoinEngine.CurrentTarget and tostring(CoinEngine.CurrentTarget.Name) or "none"))
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		CoinEngine.AirRecoveryReason = "airborne-no-progress"
+		LogEvent(string.format("air-recovery-start airborne=%.2f noProgress=%.2f target=%s",
+			airborneFor, noProgressFor, CoinEngine.CurrentTarget and tostring(CoinEngine.CurrentTarget.Name) or "none"))
 	end
 	return CoinEngine.AirRecoveryActive == true
 end
@@ -10171,7 +10360,17 @@ local function GetAirRecoveryDestination(root, target, now)
 	if cached and cachedAge <= 0.35 and cachedStartMoved <= 8.0
 		and (cacheTargetMatches or CoinEngine.AirRecoveryDestinationTarget == nil)
 		and (cached - root.Position).Magnitude > 1.25 then
+		CoinEngine.AirRecoveryNoDestinationSince = nil
 		return cached, CoinEngine.AirRecoveryReason or "cached-surface"
+	end
+	-- Cache negative landing results briefly as well. Invalidate early if the character has
+	-- moved materially since the failed probe, so a changed position can reveal a safe surface.
+	-- This prevents expensive vertical raycasts every Heartbeat without freezing stale results.
+	local negativeStart = CoinEngine.AirRecoveryDestinationStart
+	local negativeStartMoved = negativeStart and (root.Position - negativeStart).Magnitude or 0
+	if not cached and CoinEngine.AirRecoveryReason == "no-safe-landing-found"
+		and cachedAge < 0.18 and negativeStartMoved <= 2.5 then
+		return nil, "no-safe-landing-found"
 	end
 
 	-- Caso prioritario: moneda por debajo y sin bloqueo real del volumen del personaje.
@@ -10184,6 +10383,7 @@ local function GetAirRecoveryDestination(root, target, now)
 			local clear = HasClearCharacterPath(root.Position, coinAim, BuildCoinRouteIgnore(target), root, CoinEngine.routeRayParams)
 			if clear and IsSafeCoinPosition(coinAim) then
 				CoinEngine.AirRecoveryDestination = coinAim
+				CoinEngine.AirRecoveryNoDestinationSince = nil
 				CoinEngine.AirRecoveryDestinationAt = now
 				CoinEngine.AirRecoveryDestinationTarget = target
 				CoinEngine.AirRecoveryDestinationStart = root.Position
@@ -10209,6 +10409,7 @@ local function GetAirRecoveryDestination(root, target, now)
 		if clear then clear = HasClearCharacterPath(root.Position, landing, ignore, root, CoinEngine.routeRayParams) end
 		if clear then
 			CoinEngine.AirRecoveryDestination = landing
+			CoinEngine.AirRecoveryNoDestinationSince = nil
 			CoinEngine.AirRecoveryDestinationAt = now
 			CoinEngine.AirRecoveryDestinationTarget = nil
 			CoinEngine.AirRecoveryDestinationStart = root.Position
@@ -10219,6 +10420,7 @@ local function GetAirRecoveryDestination(root, target, now)
 	end
 	-- Si no hay superficie demostrablemente viable, no inventar una posición ni atravesar suelo a ciegas.
 	CoinEngine.AirRecoveryDestination = nil
+	CoinEngine.AirRecoveryNoDestinationSince = CoinEngine.AirRecoveryNoDestinationSince or now
 	CoinEngine.AirRecoveryDestinationAt = now
 	CoinEngine.AirRecoveryDestinationTarget = nil
 	CoinEngine.AirRecoveryDestinationStart = root.Position
@@ -10782,6 +10984,15 @@ function CoinEngine.CleanupRoundCaches()
 	CoinEngine.ChainGroupLastRevision = -1
 	CoinEngine.ChainGroupNextCheckAt = 0
 	CoinEngine.SpeedBonusMultiplier = 1
+	CoinEngine.EmergencyRecoveryActive = false
+	CoinEngine.EmergencyRecoveryStartedAt = nil
+	CoinEngine.EmergencyRecoveryReason = nil
+	CoinEngine.EmergencyRecoveryNoProgressSince = nil
+	CoinEngine.EmergencyRecoveryReleaseSince = nil
+	CoinEngine.EmergencyRecoverySpeedApplied = false
+	CoinEngine.CurrentEmergencySpeedMultiplier = 1.0
+	CoinEngine.AirRecoveryNoDestinationSince = nil
+	CoinEngine.AirRecoveryRetryAt = 0
 	CoinEngine.ObstacleRouteRefreshInterval = 0.10
 	CoinEngine.ObstacleRouteCacheTTL = 0.10
 	CoinEngine.NoclipRerouteAfterExit = false
@@ -10858,6 +11069,16 @@ local function DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
 	-- local cap (not a change to the cruise slider) so it can still reach a verified landing/exit.
 	local configuredSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
 	local recoveryCap = currentSpeed > 1 and currentSpeed or math.min(configuredSpeed, 24)
+	if CoinEngine.EmergencyRecoveryActive then
+		if not CoinEngine.EmergencyRecoverySpeedApplied then
+			recoveryCap = recoveryCap * (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45)
+		end
+	else
+		-- Prevent a previously boosted currentSpeed from lingering after recovery has ended.
+		local baseCeiling = tonumber(CoinEngine.LastBaseEffectiveSpeed) or 0
+		if baseCeiling > 0 then recoveryCap = math.min(recoveryCap, baseCeiling) end
+	end
+	if CoinEngine.NoclipWanted or noclipOn then recoveryCap = math.min(recoveryCap, 80) end
 	local speed = math.min(recoveryCap, math.sqrt(2 * acceleration * math.max(0, gap - 0.75)))
 	if gap > 2.5 then speed = math.max(speed, math.min(recoveryCap, tonumber(CoinEngine.FlightMinSpeed) or 6)) end
 	ApplyStableFlightVelocity(delta.Unit, speed, dt)
@@ -11042,6 +11263,7 @@ local function ControllerStep(dt)
 	-- Track air time before pause/position-reconciliation early returns. Emergency escape still owns
 	-- the movement branch below, but landing recovery is already armed for when escape ends.
 	UpdateAirborneRecoveryState(root, now)
+	if CoinEngine.UpdateEmergencyRecoveryState then CoinEngine.UpdateEmergencyRecoveryState(root, now) end
 	-- Emergency escape invalidates any earlier round/hitch hold: threat priority must not
 	-- wait for a stale farm pause to expire before issuing the evasive route.
 	if CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active then
@@ -11318,7 +11540,10 @@ local function ControllerStep(dt)
 		or (tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10))
 		* ((CoinEngine.ChainGroupActive and not CoinEngine.ThreatResponse.Active
 			and not (CoinEngine.NoclipWanted or noclipOn)) and (tonumber(CoinEngine.ChainGroupMultiplier) or 1.15) or 1)
-	local speed = CoinEngine.ConfiguredSliderSpeed * CoinEngine.SpeedBonusMultiplier
+	CoinEngine.LastBaseEffectiveSpeed = sliderSpeed * CoinEngine.SpeedBonusMultiplier
+	CoinEngine.CurrentEmergencySpeedMultiplier = CoinEngine.EmergencyRecoveryActive
+		and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0
+	local speed = CoinEngine.LastBaseEffectiveSpeed * CoinEngine.CurrentEmergencySpeedMultiplier
 	if math.abs((tonumber(CoinEngine.LastLoggedSpeedBonusMultiplier) or 0) - CoinEngine.SpeedBonusMultiplier) > 0.001 then
 		LogEvent(string.format("autofarm-passive-speed configured=%.1f cappedBase=%.1f multiplier=%.3f requested=%.1f group=%d members=%d noclipEnvelope=%d",
 			CoinEngine.ConfiguredSliderSpeed, sliderSpeed, CoinEngine.SpeedBonusMultiplier, speed,
@@ -11351,7 +11576,7 @@ local function ControllerStep(dt)
 	-- de 16/22, el limite se deriva del tiempo real entre actualizaciones: el comando no
 	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 100
 	-- con frames estables y conserva una reduccion proporcional si el cliente se ralentiza.
-	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed) * (tonumber(CoinEngine.SpeedBonusMultiplier) or 1)
+	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed) * (SafeOn() and 1 or ((tonumber(CoinEngine.SpeedBonusMultiplier) or 1) * CoinEngine.CurrentEmergencySpeedMultiplier))
 	local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
 	-- Keep adaptive NoClip on its previous 80-speed / 1.5-step safety envelope. The expanded
 	-- slider range applies to ordinary coin movement, not to temporary NoClip navigation.
@@ -11425,10 +11650,13 @@ local function ControllerStep(dt)
 		local capReason = sampleDt >= 0.060 and "step-budget-slow-frame" or (sampleDt >= 0.040 and "step-budget-frame" or "stable-cap")
 		safetyReason = safetyReason == "normal" and capReason or (safetyReason .. "+" .. capReason)
 	end
+	if CoinEngine.CurrentEmergencySpeedMultiplier > 1 then
+		safetyReason = safetyReason == "normal" and "emergency-recovery-x1.45" or (safetyReason .. "+emergency-recovery-x1.45")
+	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
-		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms slowFrames=%d pingEma=%.0f solid=%d",
+		LogEvent(string.format("speed-envelope slider=%.1f cap=%.1f reason=%s dt=%.1fms dtEma=%.1fms slowFrames=%d pingEma=%.0f solid=%d emergency=%.2f",
 			sliderSpeed, speed, safetyReason, sampleDt * 1000, frameDtEma * 1000, slowFramesInWindow,
-			adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs, solidOverlapActive and 1 or 0))
+			adaptiveEmaInitialized and adaptivePingEmaMs or cachedPingMs, solidOverlapActive and 1 or 0, CoinEngine.CurrentEmergencySpeedMultiplier))
 		CoinEngine.LastSafetyReason = safetyReason
 	end
 	CoinEngine.LastSafetyCap = speed
@@ -11448,6 +11676,7 @@ local function ControllerStep(dt)
 		ramp = math.min(ramp, 0.30) -- respuesta de huida independiente; nunca depende del boost de monedas
 	end
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual; el limite efectivo no cambia
+	CoinEngine.EmergencyRecoverySpeedApplied = CoinEngine.CurrentEmergencySpeedMultiplier > 1
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
 	if now >= nextAdaptiveProfileLogAt then
