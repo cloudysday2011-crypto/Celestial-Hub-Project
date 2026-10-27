@@ -2022,6 +2022,44 @@ local function AbsoluteClearESP()
 	end
 end
 
+-- ESP role-state guard: a player standing inside a recognized lobby zone is not assigned
+-- a round role, even if an old Tool or Ghost detector latch still reports one.
+local CHESPLobbyZoneNames = {"Lobby", "Lobby3D", "LobbyArea", "MainLobby", "LobbyMap", "LobbySpawn", "WaitingRoom"}
+local CHESPLobbyZoneCache = {updatedAt = 0, zones = {}}
+local function CH_IsPlayerInLobbyZone(plr)
+	plr = plr or LocalPlayer
+	local character = plr and plr.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	local now = os.clock()
+	if now >= (CHESPLobbyZoneCache.updatedAt or 0) then
+		local zones = {}
+		for _, zoneName in ipairs(CHESPLobbyZoneNames) do
+			local zone = Workspace:FindFirstChild(zoneName, true)
+			if zone then zones[#zones + 1] = zone end
+		end
+		CHESPLobbyZoneCache.zones = zones
+		CHESPLobbyZoneCache.updatedAt = now + 0.75
+	end
+	for _, zone in ipairs(CHESPLobbyZoneCache.zones) do
+		if zone and zone.Parent then
+			if character == zone or character:IsDescendantOf(zone) then return true end
+			local ok, cf, size = pcall(function()
+				if zone:IsA("BasePart") then return zone.CFrame, zone.Size end
+				if zone:IsA("Model") then return zone:GetBoundingBox() end
+				return nil, nil
+			end)
+			if ok and cf and size then
+				local localPos = cf:PointToObjectSpace(root.Position)
+				if math.abs(localPos.X) <= size.X * 0.5 + 8
+					and math.abs(localPos.Y) <= size.Y * 0.5 + 12
+					and math.abs(localPos.Z) <= size.Z * 0.5 + 8 then return true end
+			end
+		end
+	end
+	return false
+end
+
 local function GetPlayerTeam(plr)
 	if _G.Celestial.GameMode == "MM2" then
 		if plr.Name == State.MurdererName then return "MURDERER" end
@@ -4396,6 +4434,14 @@ local function IsPowerCurrentlyActive(plr, powerName)
 
 	if powerName == "Ghost" then
 		local detector = _G.Celestial.PowerDetector
+		if CH_IsPlayerInLobbyZone(LocalPlayer) then
+			detector.GhostActive = false
+			detector.GhostVisualActive = false
+			detector.GhostMissingActive = false
+			detector.GhostActivationAt = 0
+			if detector.GhostESPPlayer == plr then detector.GhostESPPlayer = nil end
+			return false
+		end
 		local character = plr.Character
 		local humanoid = GetHumanoid(plr)
 		local characterInWorkspace = character and character.Parent == Workspace
@@ -5712,7 +5758,7 @@ _G.Celestial.ConnectionRoleScanner =
 				CheckDuelsMatchState()
 				RefreshDuelsTeamAssignments()
 			end
-			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive then
+			if _G.Celestial.GameMode == "MM2" and not infectionBarnActive and not CH_IsPlayerInLobbyZone(LocalPlayer) then
 				local foundMurder = ""
 				local currentGunHolder = nil
 				for _, plr in ipairs(activePlayers) do
@@ -5773,6 +5819,16 @@ _G.Celestial.ConnectionRoleScanner =
 				State.MurdererName = ""
 				State.SheriffName = ""
 				State.HeroName = ""
+				if CH_IsPlayerInLobbyZone(LocalPlayer) then
+					local detector = _G.Celestial.PowerDetector
+					if detector then
+						detector.GhostActive = false
+						detector.GhostVisualActive = false
+						detector.GhostMissingActive = false
+						detector.GhostActivationAt = 0
+						detector.GhostESPPlayer = nil
+					end
+				end
 			end
 			for _, plr in ipairs(activePlayers) do
 				if plr ~= LocalPlayer then
@@ -5928,6 +5984,20 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
+	if CH_IsPlayerInLobbyZone(LocalPlayer) then
+		if detector then
+			detector.GhostActive = false
+			detector.GhostVisualActive = false
+			detector.GhostMissingActive = false
+			detector.GhostActivationAt = 0
+			detector.GhostESPPlayer = nil
+		end
+		if _G.Celestial.GhostESPProxy then
+			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
+			_G.Celestial.GhostESPProxy = nil
+		end
+		return
+	end
 	local murderer = nil
 	if State.MurdererName ~= "" then murderer = Players:FindFirstChild(State.MurdererName) end
 	if not murderer and detector and detector.CurrentPower == "Ghost"
@@ -6563,9 +6633,59 @@ end
 -- GESTOR DE MONEDAS (cache incremental)
 -- ---------------------------------------------------------------
 
+-- A 3D bucket index lets the selector test nearby opportunities without scanning the full
+-- coin cache first. The existing cache remains authoritative and is still used as fallback.
+local COIN_SPATIAL_CELL_SIZE = 16
+local coinSpatialBuckets = {}
+local coinSpatialKeyByCoin = setmetatable({}, {__mode = "k"})
+local function CoinSpatialKey(position)
+	return string.format("%d:%d:%d", math.floor(position.X / COIN_SPATIAL_CELL_SIZE),
+		math.floor(position.Y / COIN_SPATIAL_CELL_SIZE), math.floor(position.Z / COIN_SPATIAL_CELL_SIZE))
+end
+local function RemoveCoinFromSpatialIndex(coin)
+	local key = coinSpatialKeyByCoin[coin]
+	if not key then return end
+	local bucket = coinSpatialBuckets[key]
+	if bucket then
+		bucket[coin] = nil
+		if next(bucket) == nil then coinSpatialBuckets[key] = nil end
+	end
+	coinSpatialKeyByCoin[coin] = nil
+end
+local function UpdateCoinSpatialIndex(coin)
+	if not coin or not coin.Parent then RemoveCoinFromSpatialIndex(coin); return end
+	local ok, position = pcall(function() return coin.Position end)
+	if not ok or not position then return end
+	local key = CoinSpatialKey(position)
+	local oldKey = coinSpatialKeyByCoin[coin]
+	if oldKey == key then return end
+	RemoveCoinFromSpatialIndex(coin)
+	local bucket = coinSpatialBuckets[key]
+	if not bucket then bucket = {}; coinSpatialBuckets[key] = bucket end
+	bucket[coin] = true
+	coinSpatialKeyByCoin[coin] = key
+end
+local function GetNearbySpatialCoins(position, radius, verticalGap)
+	local result = {}
+	local cell = COIN_SPATIAL_CELL_SIZE
+	local minX, maxX = math.floor((position.X - radius) / cell), math.floor((position.X + radius) / cell)
+	local minY, maxY = math.floor((position.Y - verticalGap) / cell), math.floor((position.Y + verticalGap) / cell)
+	local minZ, maxZ = math.floor((position.Z - radius) / cell), math.floor((position.Z + radius) / cell)
+	for x = minX, maxX do
+		for y = minY, maxY do
+			for z = minZ, maxZ do
+				local bucket = coinSpatialBuckets[string.format("%d:%d:%d", x, y, z)]
+				if bucket then for coin in pairs(bucket) do result[#result + 1] = coin end end
+			end
+		end
+	end
+	return result
+end
+
 local function RegisterCoin(coin)
 	if CoinEngine.CoinCache[coin] or not IsValidCoin(coin) then return end
 	CoinEngine.CoinCache[coin] = true
+	UpdateCoinSpatialIndex(coin)
 	CoinEngine.RouteCheckCache[coin] = nil
 	CoinEngine.CoinCount += 1
 	noTargetUntil = 0   -- despierta al controlador si estaba esperando monedas
@@ -6573,6 +6693,7 @@ local function RegisterCoin(coin)
 end
 
 local function UnregisterCoin(coin)
+	RemoveCoinFromSpatialIndex(coin)
 	if CoinEngine.CoinCache[coin] then
 		CoinEngine.CoinCache[coin] = nil
 		CoinEngine.CoinCount -= 1
@@ -6711,6 +6832,8 @@ local function Deactivate()
 	if CoinEngine.RemovingConnection then CoinEngine.RemovingConnection:Disconnect(); CoinEngine.RemovingConnection = nil end
 	_G.Celestial.CoinDescendantConnection = nil
 	table.clear(CoinEngine.CoinCache)
+	table.clear(coinSpatialBuckets)
+	table.clear(coinSpatialKeyByCoin)
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
@@ -8314,6 +8437,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	local candidates = {}
 	local immediateBest, immediateBestScore = nil, math.huge
 	local immediateCheckedCoin, immediateGrounded = nil, false
+	local immediateEvaluationDone = false
 	local immediateRadius = math.min(maxDistance, 18.0)
 	local immediateVerticalGap = math.min(maxGap, Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap))
 	local immediateForward = Vector3.zero
@@ -8329,7 +8453,44 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 			if lookPlanar.Magnitude > 0.05 then immediateForward = lookPlanar.Unit end
 		end
 	end
+	if maxRouteChecks > 0 then
+		local nearbyCoins = GetNearbySpatialCoins(fromPos, immediateRadius, immediateVerticalGap)
+		for _, coin in ipairs(nearbyCoins) do
+			if coin ~= exclude and CoinEngine.CoinCache[coin] and coin.Parent
+				and IsInRecognizedCoinSource(coin) and IsValidCoin(coin) then
+				UpdateCoinSpatialIndex(coin)
+				local bl = CoinEngine.Blacklist[coin]
+				if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
+				local delta = coin.Position - fromPos
+				local verticalGap = math.abs(delta.Y)
+				local distance = delta.Magnitude
+				if not bl and IsSafeCoinPosition(coin.Position) and not IsCoinTemporarilyExcluded(coin, now)
+					and verticalGap <= immediateVerticalGap and distance <= immediateRadius then
+					local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+					local forwardDot = 0
+					if immediateForward.Magnitude > 0.05 and horizontalDelta.Magnitude > 0.05 then
+						forwardDot = immediateForward:Dot(horizontalDelta.Unit)
+					end
+					if forwardDot >= 0.15 or distance <= 8.0 or horizontalDelta.Magnitude <= 4.5 then
+						local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
+						if quickScore < immediateBestScore then immediateBestScore, immediateBest = quickScore, coin end
+					end
+				end
+			end
+		end
+		if immediateBest then
+			immediateCheckedCoin = immediateBest
+			immediateGrounded = IsGrounded(immediateBest)
+			immediateEvaluationDone = true
+			if immediateGrounded then
+				if HasClearCoinRoute(fromPos, immediateBest) then return immediateBest end
+			else
+				CoinEngine.Blacklist[immediateBest] = now + 2.5
+			end
+		end
+	end
 	for coin in pairs(CoinEngine.CoinCache) do
+		UpdateCoinSpatialIndex(coin)
 		if coin ~= exclude then
 			if not coin.Parent or not IsInRecognizedCoinSource(coin) or not IsValidCoin(coin) then
 				UnregisterCoin(coin)
@@ -8365,7 +8526,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	-- Como el barrido del volumen es la prueba decisiva, un candidato inmediato solo recibe
 	-- una validacion de suelo y una de ruta. Si no pasa, se conserva como dato evaluado y el
 	-- selector habitual continua sin repetir esas mismas comprobaciones para la misma moneda.
-	if immediateBest and maxRouteChecks > 0 then
+	if immediateBest and maxRouteChecks > 0 and not immediateEvaluationDone then
 		immediateCheckedCoin = immediateBest
 		immediateGrounded = IsGrounded(immediateBest)
 		if immediateGrounded then
