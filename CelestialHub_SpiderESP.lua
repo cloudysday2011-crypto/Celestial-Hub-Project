@@ -5780,6 +5780,18 @@ _G.Celestial.ConnectionRoleScanner =
 			end
 			local mm2LobbyPhase = _G.Celestial.GameMode == "MM2" and not infectionBarnActive
 				and _G.Celestial.IsMM2LobbyPhaseConfirmed()
+			-- Una señal de Lobby no debe anular evidencia directa de roles de la ronda activa.
+			-- Si el detector de Lobby da un falso positivo, conserva el escaneo normal cuando
+			-- algún jugador vivo todavía tiene la herramienta de Murder o Sheriff/Hero.
+			if mm2LobbyPhase then
+				for _, plr in ipairs(activePlayers) do
+					local hasKnife, hasGun = CheckPlayerInventory(plr)
+					if hasKnife or hasGun then
+						mm2LobbyPhase = false
+						break
+					end
+				end
+			end
 			if mm2LobbyPhase then
 				State.MurdererName = ""
 				State.SheriffName = ""
