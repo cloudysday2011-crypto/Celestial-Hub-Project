@@ -6187,6 +6187,20 @@ local CoinEngine = {
 	Active = false,            -- conexiones de eventos abiertas
 	CoinCache = {},            -- [coin] = true (monedas validas conocidas)
 	CoinCount = 0,
+	CoinCacheRevision = 0,     -- cambia solo cuando una moneda entra/sale de la cache
+	NextTargetCacheRevision = -1,
+	NextTargetPreparedAt = 0,
+	NextTargetOriginPosition = nil,
+	CoinNeighborCount = setmetatable({}, {__mode = "k"}), -- densidad local, actualizada por eventos
+	CoinPositionSnapshot = setmetatable({}, {__mode = "k"}),
+	CoinSpatialCells = {},
+	CoinSpatialCellByCoin = setmetatable({}, {__mode = "k"}),
+	ChainNeighborRadius = 18,
+	ChainNeighborWeight = 1.25,
+	ChainNeighborBonusCap = 4,
+	LastChainTransitionMs = -1, -- touch-request -> objetivo siguiente; no es confirmacion del servidor
+	MaxChainTransitionMs = 0,
+	ChainTransitionCount = 0,
 	Blacklist = {},            -- [coin] = os.clock() hasta el que se ignora
 	Attempts = {},             -- [coin] = intentos de recogida
 	CurrentTarget = nil,
@@ -6697,19 +6711,115 @@ end
 -- GESTOR DE MONEDAS (cache incremental)
 -- ---------------------------------------------------------------
 
+local function GetCoinPositionSnapshot(coin)
+	local pos = CoinEngine.CoinPositionSnapshot[coin]
+	if pos and IsFiniteVec(pos) then return pos end
+	local ok, current = pcall(function() return coin.Position end)
+	if ok and IsFiniteVec(current) then return current end
+	return nil
+end
+
+-- La densidad se mantiene en los eventos de alta/baja, no con un barrido adicional por frame.
+-- Favorece monedas que dejan cerca más opciones para la siguiente transición, sin planificadores paralelos.
+local function CoinSpatialCellKey(x, y, z)
+	return tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z)
+end
+
+local function UpdateCoinNeighborhood(coin, adding)
+	local pos = GetCoinPositionSnapshot(coin)
+	local radius = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
+	if adding then
+		if not pos then return end
+		local cx, cy, cz = math.floor(pos.X / radius), math.floor(pos.Y / radius), math.floor(pos.Z / radius)
+		local neighbors = 0
+		-- Solo se consultan las 27 celdas contiguas, no toda la CoinCache al registrar una moneda.
+		for ix = cx - 1, cx + 1 do
+			for iy = cy - 1, cy + 1 do
+				for iz = cz - 1, cz + 1 do
+					local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+					if bucket then
+						for other in pairs(bucket) do
+							local otherPos = GetCoinPositionSnapshot(other)
+							if otherPos and (otherPos - pos).Magnitude <= radius then
+								neighbors += 1
+								CoinEngine.CoinNeighborCount[other] = (CoinEngine.CoinNeighborCount[other] or 0) + 1
+							end
+						end
+					end
+				end
+			end
+		end
+		CoinEngine.CoinPositionSnapshot[coin] = pos
+		local key = CoinSpatialCellKey(cx, cy, cz)
+		local bucket = CoinEngine.CoinSpatialCells[key]
+		if not bucket then bucket = {}; CoinEngine.CoinSpatialCells[key] = bucket end
+		bucket[coin] = true
+		CoinEngine.CoinSpatialCellByCoin[coin] = {x = cx, y = cy, z = cz, key = key}
+		CoinEngine.CoinNeighborCount[coin] = neighbors
+	else
+		local cellInfo = CoinEngine.CoinSpatialCellByCoin[coin]
+		if pos then
+			local cx = cellInfo and cellInfo.x or math.floor(pos.X / radius)
+			local cy = cellInfo and cellInfo.y or math.floor(pos.Y / radius)
+			local cz = cellInfo and cellInfo.z or math.floor(pos.Z / radius)
+			for ix = cx - 1, cx + 1 do
+				for iy = cy - 1, cy + 1 do
+					for iz = cz - 1, cz + 1 do
+						local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+						if bucket then
+							for other in pairs(bucket) do
+								if other ~= coin then
+									local otherPos = GetCoinPositionSnapshot(other)
+									if otherPos and (otherPos - pos).Magnitude <= radius then
+										CoinEngine.CoinNeighborCount[other] = math.max(0, (CoinEngine.CoinNeighborCount[other] or 0) - 1)
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		if cellInfo then
+			local bucket = CoinEngine.CoinSpatialCells[cellInfo.key]
+			if bucket then
+				bucket[coin] = nil
+				if next(bucket) == nil then CoinEngine.CoinSpatialCells[cellInfo.key] = nil end
+			end
+		end
+		CoinEngine.CoinSpatialCellByCoin[coin] = nil
+		CoinEngine.CoinNeighborCount[coin] = nil
+		CoinEngine.CoinPositionSnapshot[coin] = nil
+	end
+end
+
+local function GetCoinChainBonus(coin)
+	local count = math.max(0, tonumber(CoinEngine.CoinNeighborCount[coin]) or 0)
+	return math.min(count, tonumber(CoinEngine.ChainNeighborBonusCap) or 4)
+		* (tonumber(CoinEngine.ChainNeighborWeight) or 1.25)
+end
+
 local function RegisterCoin(coin)
 	if CoinEngine.CoinCache[coin] or not IsValidCoin(coin) then return end
 	CoinEngine.CoinCache[coin] = true
+	UpdateCoinNeighborhood(coin, true)
 	CoinEngine.RouteCheckCache[coin] = nil
 	CoinEngine.CoinCount += 1
+	CoinEngine.CoinCacheRevision += 1
+	CoinEngine.NextTargetCacheRevision = -1
 	noTargetUntil = 0   -- despierta al controlador si estaba esperando monedas
 	nextPrepareAt = 0
 end
 
 local function UnregisterCoin(coin)
 	if CoinEngine.CoinCache[coin] then
+		UpdateCoinNeighborhood(coin, false)
 		CoinEngine.CoinCache[coin] = nil
 		CoinEngine.CoinCount -= 1
+		CoinEngine.CoinCacheRevision += 1
+		CoinEngine.NextTargetCacheRevision = -1
+		nextPrepareAt = 0
+		if not CoinEngine.CurrentTarget then noTargetUntil = 0 end
 	end
 	CoinEngine.Blacklist[coin] = nil
 	CoinEngine.Attempts[coin] = nil
@@ -6815,6 +6925,9 @@ local function ResetPath()
 	chainAccelerationActive = false
 	CoinEngine.CurrentTarget = nil
 	CoinEngine.NextTarget = nil
+	CoinEngine.NextTargetCacheRevision = -1
+	CoinEngine.NextTargetPreparedAt = 0
+	CoinEngine.NextTargetOriginPosition = nil
 	bestDist = math.huge
 	noTargetUntil = 0
 	currentSpeed = 0
@@ -6845,6 +6958,14 @@ local function Deactivate()
 	if CoinEngine.RemovingConnection then CoinEngine.RemovingConnection:Disconnect(); CoinEngine.RemovingConnection = nil end
 	_G.Celestial.CoinDescendantConnection = nil
 	table.clear(CoinEngine.CoinCache)
+	table.clear(CoinEngine.CoinNeighborCount)
+	table.clear(CoinEngine.CoinPositionSnapshot)
+	table.clear(CoinEngine.CoinSpatialCells)
+	table.clear(CoinEngine.CoinSpatialCellByCoin)
+	CoinEngine.CoinCacheRevision += 1
+	CoinEngine.NextTargetCacheRevision = -1
+	CoinEngine.NextTargetPreparedAt = 0
+	CoinEngine.NextTargetOriginPosition = nil
 	table.clear(CoinEngine.Blacklist)
 	table.clear(CoinEngine.Attempts)
 	table.clear(CoinEngine.GroundOk)
@@ -8500,6 +8621,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 					if maxRouteChecks > 0 and distance <= immediateRadius and verticalGap <= immediateVerticalGap then
 						if forwardDot >= 0.15 or distance <= 8.0 or horizontalDelta.Magnitude <= 4.5 then
 							local quickScore = distance + verticalGap * 0.15 - math.max(0, forwardDot) * 5.5
+							quickScore -= GetCoinChainBonus(coin)
 							if quickScore < immediateBestScore then
 								immediateBestScore = quickScore
 								immediateBest = coin
@@ -8530,6 +8652,7 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 	-- directamente accesible. En el camino exitoso se omiten tanto este trabajo como table.sort.
 	for _, candidate in ipairs(candidates) do
 		candidate.score = ThreatAwareCoinScore(fromPos, candidate.coin.Position, now)
+			- GetCoinChainBonus(candidate.coin)
 	end
 	table.sort(candidates, function(a, b) return a.score < b.score end)
 
@@ -8839,6 +8962,7 @@ local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit)
 					if not blacklistedUntil and not IsCoinTemporarilyExcluded(coin, now)
 						and verticalGap <= verticalLimit and distance <= maxDistance then
 						local score, safetyGap = ScoreThreatCandidate(coin.Position)
+						score -= GetCoinChainBonus(coin)
 						candidates[#candidates + 1] = {coin = coin, score = score, safetyGap = safetyGap}
 					end
 				end
@@ -9140,25 +9264,66 @@ local function ResetRouteNavigation(target, now)
 	routeNavigation.blockedHit = nil
 end
 
-local function PrepareNext(now)
+local function PrepareNext(now, force)
 	local cur = CoinEngine.CurrentTarget
-	if not cur or not cur.Parent then CoinEngine.NextTarget = nil; return end
+	if not cur or not cur.Parent then
+		CoinEngine.NextTarget = nil
+		CoinEngine.NextTargetCacheRevision = CoinEngine.CoinCacheRevision or 0
+		CoinEngine.NextTargetPreparedAt = now
+		CoinEngine.NextTargetOriginPosition = nil
+		return
+	end
+
+	local threatActive = CoinEngine.ThreatResponse.Active == true
+	local revision = CoinEngine.CoinCacheRevision or 0
+	local preparedAt = tonumber(CoinEngine.NextTargetPreparedAt) or 0
+	local age = math.max(0, now - preparedAt)
+	local origin = CoinEngine.NextTargetOriginPosition
+	local originChanged = not origin or (cur.Position - origin).Magnitude >= 1.5
+	local currentNext = CoinEngine.NextTarget
+	local nextStillValid = currentNext and IsAvailable(currentNext, now) or false
+	local stableWindow = threatActive and 0.12 or 0.75
+	if not force and currentNext and nextStillValid
+		and CoinEngine.NextTargetCacheRevision == revision and not originChanged and age < stableWindow then
+		-- La cache no cambio y el candidato sigue valido: no repuntuar todas las monedas.
+		nextPrepareAt = now + math.max(0.02, stableWindow - age)
+		return
+	end
+
 	local nxt
-	if CoinEngine.ThreatResponse.Active then
+	if threatActive then
 		nxt = PickThreatCoin(cur.Position, cur, now, 0)
 	else
 		nxt = PickNearest(cur.Position, cur, now, 0)
 	end
 	CoinEngine.NextTarget = nxt
-	-- Prefetch puntua y valida suelo, pero no paga barridos de ruta: la ruta se comprueba
-	-- cuando la moneda pasa a ser el objetivo activo. Reduce trabajo duplicado entre Heartbeats.
-	nextPrepareAt = now + (nxt and 0.30 or 0.12)
+	CoinEngine.NextTargetCacheRevision = CoinEngine.CoinCacheRevision or revision
+	CoinEngine.NextTargetPreparedAt = now
+	CoinEngine.NextTargetOriginPosition = cur.Position
+	-- Los eventos de la cache despiertan este selector al instante. Sin candidato, se limita
+	-- el sondeo repetitivo; con amenaza activa, refresca mas a menudo porque la seguridad cambia.
+	local retryDelay = threatActive and 0.12 or 0.40
+	if not nxt and not threatActive then
+		local earliestBlacklistExpiry = math.huge
+		for coin, untilAt in pairs(CoinEngine.Blacklist) do
+			if CoinEngine.CoinCache[coin] and untilAt > now then
+				earliestBlacklistExpiry = math.min(earliestBlacklistExpiry, untilAt)
+			end
+		end
+		if earliestBlacklistExpiry < math.huge then
+			retryDelay = math.max(0.08, earliestBlacklistExpiry - now)
+		end
+	end
+	nextPrepareAt = now + (nxt and (threatActive and 0.12 or 0.30) or retryDelay)
 end
 
 local function SetCurrent(coin, now)
 	local targetChanged = coin ~= CoinEngine.CurrentTarget
 	CoinEngine.CurrentTarget = coin
 	CoinEngine.NextTarget = nil
+	CoinEngine.NextTargetCacheRevision = -1
+	CoinEngine.NextTargetPreparedAt = 0
+	CoinEngine.NextTargetOriginPosition = nil
 	ResetRouteNavigation(coin, now)
 	if targetChanged then
 		targetLockUntil = coin and ((now or os.clock()) + (tonumber(CoinEngine.TargetDecisionHold) or 0.85)) or (now or os.clock())
@@ -9197,9 +9362,21 @@ local function AdvanceTarget(root, now)
 	else
 		CoinEngine.CurrentTarget = nil
 		CoinEngine.NextTarget = nil
-		-- No introducir un cooldown artificial: si aparece/se valida una moneda, se reintenta
-		-- desde la cache en el siguiente Heartbeat; CoinCount==0 ya evita escaneos vacios.
-		noTargetUntil = now
+		-- Sin objetivo, espera al proximo evento de cache o al vencimiento pertinente; evita
+		-- repetir la misma busqueda en cada frame. RegisterCoin despierta el selector al instante.
+		local retryDelay = CoinEngine.ThreatResponse.Active and 0.10 or 0.20
+		if not CoinEngine.ThreatResponse.Active then
+			local earliestBlacklistExpiry = math.huge
+			for coin, untilAt in pairs(CoinEngine.Blacklist) do
+				if CoinEngine.CoinCache[coin] and untilAt > now then
+					earliestBlacklistExpiry = math.min(earliestBlacklistExpiry, untilAt)
+				end
+			end
+			if earliestBlacklistExpiry < math.huge then
+				retryDelay = math.max(0.08, earliestBlacklistExpiry - now)
+			end
+		end
+		noTargetUntil = now + retryDelay
 	end
 end
 
@@ -10359,6 +10536,9 @@ function CoinEngine.CleanupRoundCaches()
 		CoinEngine.ThreatResponse.SafeReleaseSince = nil
 	end
 	CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
+	CoinEngine.NextTargetCacheRevision = -1
+	CoinEngine.NextTargetPreparedAt = 0
+	CoinEngine.NextTargetOriginPosition = nil
 	CoinEngine.NoclipRerouteAfterExit = false
 	CoinEngine.NoclipRerouteReason = nil
 	CoinEngine.NoclipRerouteTarget = nil
@@ -10782,6 +10962,9 @@ local function ControllerStep(dt)
 	if now >= nextPrepareAt then PrepareNext(now) end
 	if CoinEngine.NextTarget and not IsAvailable(CoinEngine.NextTarget, now) then
 		CoinEngine.NextTarget = nil
+		CoinEngine.NextTargetCacheRevision = -1
+		CoinEngine.NextTargetPreparedAt = 0
+		CoinEngine.NextTargetOriginPosition = nil
 		nextPrepareAt = now
 	end
 
@@ -11158,6 +11341,7 @@ local function ControllerStep(dt)
 				lastCollectAt = now
 				arriveTarget = nil
 				local preparedNextCoin = CoinEngine.NextTarget
+				local preparedNextAt = tonumber(CoinEngine.NextTargetPreparedAt) or 0
 				if CollectCoin(root, target, now) then
 					coinsCollectedTotal += 1
 					LogEvent(collectInfo)
@@ -11185,6 +11369,12 @@ local function ControllerStep(dt)
 					end
 					if chainNext then
 						SetCurrent(chainCoin, now)
+						local transitionMs = math.max(0, (os.clock() - (lastCollectAt or now)) * 1000)
+						CoinEngine.LastChainTransitionMs = transitionMs
+						CoinEngine.MaxChainTransitionMs = math.max(tonumber(CoinEngine.MaxChainTransitionMs) or 0, transitionMs)
+						CoinEngine.ChainTransitionCount = (CoinEngine.ChainTransitionCount or 0) + 1
+						local preparedAgeMs = (preparedNextCoin == chainCoin and preparedNextAt > 0)
+							and math.max(0, (os.clock() - preparedNextAt) * 1000) or -1
 						chainAccelerationActive = not CoinEngine.ThreatResponse.Active
 						-- No reducir la velocidad de crucero a FlightMinSpeed; esa limitacion reiniciaba cada tramo.
 						currentSpeed = math.max(currentSpeed, math.min(speed, CoinEngine.FlightMinSpeed))
@@ -11214,7 +11404,9 @@ local function ControllerStep(dt)
 							if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 							velApplied = true
 						end
-						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f", CHAIN_ACCELERATION_MULTIPLIER))
+						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f touch-to-target-ms=%.2f prefetched-age-ms=%.2f density=%d",
+							CHAIN_ACCELERATION_MULTIPLIER, transitionMs, preparedAgeMs,
+							tonumber(CoinEngine.CoinNeighborCount[chainCoin]) or 0))
 					else
 						chainAccelerationActive = false
 						currentSpeed = 0
