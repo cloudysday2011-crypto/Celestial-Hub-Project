@@ -6338,10 +6338,17 @@ end
 
 local function CoinNameMatches(obj)
 	if not obj then return false end
-	local name = string.lower(obj.Name)
-	if name == "coin" or name:find("coin") or name:find("cash") or name == "collectable" or name == "collectible" then
-		return name ~= "coincontainer"
-	end
+	local name = string.lower(obj.Name or "")
+	if name == "coincontainer" then return false end
+	-- Nombres conocidos de monedas recolectables; no aceptar cualquier pieza
+	-- decorativa solo porque su nombre contenga "coin" o "cash".
+	local exactNames = {
+		coin = true, coin_server = true, coin_client = true, coin_pickup = true,
+		cash = true, cash_server = true, collectable = true, collectible = true,
+	}
+	if exactNames[name] then return true end
+	if name:match("^coin[_%-]%w+$") then return true end
+	if name:match("^cash[_%-]%w+$") then return true end
 	return false
 end
 
@@ -7749,7 +7756,21 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit)
 				local verticalGap = math.abs(delta.Y)
 				local distance = delta.Magnitude
 				if not bl and IsSafeCoinPosition(coin.Position) and verticalGap <= maxGap and distance <= maxDistance then
-					candidates[#candidates + 1] = {coin = coin, score = CoinTravelScore(fromPos, coin.Position)}
+					-- Priorizar la fuente oficial de monedas; la distancia sigue decidiendo
+					-- entre candidatos de confianza similar.
+					local confidence = 0
+					local officialContainer = FindCoinContainer()
+					if officialContainer and coin:IsDescendantOf(officialContainer) then
+						confidence = 18
+					else
+						local n = string.lower(coin.Name)
+						if n == "coin" or n == "coin_server" or n == "coin_client"
+							or n == "cash" or n == "collectable" or n == "collectible" then
+							confidence = 8
+						end
+					end
+					local score = CoinTravelScore(fromPos, coin.Position) - confidence
+					candidates[#candidates + 1] = {coin = coin, score = score, distance = distance}
 				end
 			end
 		end
@@ -8267,9 +8288,12 @@ local function AdvanceTarget(root, now)
 	if c then
 		SetCurrent(c, now)
 	else
+		-- La caché puede quedar vacía durante un reparentado de un frame.
+		-- Retrasar brevemente el estado idle permite que DescendantAdded/Rescan repueble objetivos.
 		CoinEngine.CurrentTarget = nil
 		CoinEngine.NextTarget = nil
-		noTargetUntil = now + 0.15
+		noTargetUntil = now + 0.025
+		nextPrepareAt = now + 0.025
 	end
 end
 
@@ -8930,6 +8954,7 @@ local function ControllerStep(dt)
 	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
 		ramp = math.min(ramp, 0.30) -- acelera la respuesta sin anular la rampa ni el limite de velocidad
 	end
+	-- La rampa progresiva original se conserva entre objetivos validos.
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual hasta el limite efectivo
 	-- Registro periódico del perfil real: ping, FPS, velocidad pedida/física y suavidad de giro.
 	-- Estos valores se usan para estabilizar la dirección, nunca para bajar speed.
