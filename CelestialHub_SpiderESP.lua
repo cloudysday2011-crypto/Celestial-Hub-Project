@@ -6088,7 +6088,7 @@ local CoinEngine = {
 	PingAdaptiveStart = 150,   -- reservado para compatibilidad; no recorta la velocidad en V3.14
 	PingAdaptiveMin = 20,      -- reservado para compatibilidad; no se utiliza como limite adaptativo
 	NoclipWanted = false,      -- Solicitud temporal por atasco confirmado o salida de geometría
-	AutoNoclipMode = nil,      -- "coin-route" o "exit-solid"
+	AutoNoclipMode = nil,      -- "exit-solid" o "escape-route"; rutas de monedas bloqueadas se redirigen
 	AutoNoclipTarget = nil,
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
@@ -6218,8 +6218,8 @@ local function EnsureFlight(root, hum)
 	if not hum.PlatformStand then hum.PlatformStand = true end
 	flightOn = true
 	_G.Celestial.FarmFlying = true
-	-- NoclipWanted lo administra UpdateAutoNoclip: solo se activa por una ruta obstruida
-	-- confirmada o una emergencia de escape, y se desactiva tras salir del obstaculo.
+	-- NoclipWanted lo administra UpdateAutoNoclip: se reserva para salir de geometria ya ocupada
+	-- o una emergencia de escape con todas las rutas bloqueadas; una ruta de moneda inviable se redirige.
 end
 
 -- Estabilidad adaptativa V3.14, ajustada para ser independiente de los FPS.
@@ -6845,6 +6845,9 @@ local function HiResPush(now, dt, csMs)
 	row.capWhy = tostring(CoinEngine.LastSafetyReason or "normal")
 	row.solidGuard = solidOverlapActive and 1 or 0
 	row.state, row.platform, row.noclip = hiState, hiPlatform, noclipOn and 1 or 0
+	row.noclipWanted = CoinEngine.NoclipWanted and 1 or 0
+	row.noclipMode = tostring(CoinEngine.AutoNoclipMode or "none"):gsub("[%c%s]", "_"):sub(1, 24)
+	row.noclipTargetMatch = (CoinEngine.AutoNoclipTarget ~= nil and CoinEngine.AutoNoclipTarget == CoinEngine.CurrentTarget) and 1 or 0
 	row.tag = hiTag and (" <" .. hiTag .. ">") or ""
 	if _G.Celestial.OTI then _G.Celestial.OTI.LastCostMs = 0 end   -- el coste de OTI solo aparece en la muestra donde corrio
 	hiResCount = math.min(hiResCount + 1, HIRES_N)
@@ -6858,11 +6861,11 @@ local function HiResDump()
 		local row = hiRes[(start - 1 + i) % HIRES_N + 1]
 		if row then
 			out[#out + 1] = string.format(
-				"t=%.3f seg=%d dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d%s",
+				"t=%.3f seg=%d dt=%.1fms pos=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f) phys=%.1f cmd=%.1f cmdY=%.1f cmdGap=%.1f vyGap=%.1f toCoin=%.1f tv=%.1f ping=%.0f cs=%.1fms ls=%.1fms cb=%.1fms lw=%.1fms oti=%.1fms sc=%.2fs coins=%d speedCap=%.1f capWhy=%s solidGuard=%d state=%s platform=%d noclip=%d noclipWanted=%d noclipMode=%s noclipTargetMatch=%d%s",
 				row.t, row.seg, row.dtMs, row.px, row.py, row.pz, row.vx, row.vy, row.vz, row.phys,
 				row.cmd, row.cmdY, row.cmdGap, row.vyGap, row.toCoin, row.tv, row.ping, row.csMs, row.lsMs,
 				row.cbMs, row.lwMs, row.otiMs, row.sinceCollect, row.coins, row.speedCap, row.capWhy,
-				row.solidGuard, row.state, row.platform, row.noclip, row.tag)
+				row.solidGuard, row.state, row.platform, row.noclip, row.noclipWanted, row.noclipMode, row.noclipTargetMatch, row.tag)
 		end
 	end
 	return table.concat(out, "\n")
@@ -7047,7 +7050,7 @@ end
 local function FlushLog(reason, forceOverwrite)
 	if logFinalized and not forceOverwrite then return end
 	if type(writefile) ~= "function" then return end
-	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
+	local payload = "reason: " .. tostring(reason) .. "\nlog-schema: 5 | script-version=3.23 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate\n" .. table.concat(logBuf, "\n")
 	if forceOverwrite then   -- final dump includes high-resolution movement and client-visible context
 		local okDump, dump = pcall(HiResDump)
 		if okDump and dump ~= "" then
@@ -7234,7 +7237,7 @@ local function PersistFarmDiagnosticEvent(tag, character)
 		if noDeathEvidence and resetKind == "GAME_RESET_LIKELY_DURING_AUTOFARM" then
 			local resetParts = {
 				"CH-RESET-INCIDENT: " .. resetKind,
-				"log-schema: 5 | script-version=3.22 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
+				"log-schema: 5 | script-version=3.23 | metrics=slider,cmd,phys,vy,cmdY,cmdGap,vyGap,ping,fps,dt,solid,noclip,risk,steer,coins,gc,toCoin,step,sampleSpd,state,pos,speedCap,capWhy,solidGuard,clientSignals,clientOutput,serverTimeEstimate",
 				"classification=" .. resetKind,
 				"trigger=" .. tostring(tag):gsub("[%c]", " "):sub(1, 260),
 				"--- DIAGNOSTIC EVENT TIMELINE ---",
@@ -8910,6 +8913,37 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	local stalledFor = math.max(0, now - (lastProgress or now))
 	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22
 
+	local function RerouteBlockedCoin(blockedTarget, reason)
+		if blockedTarget and blockedTarget.Parent then
+			CoinEngine.Blacklist[blockedTarget] = now + math.max(1.5, tonumber(CoinEngine.StuckBlacklist) or 3.0)
+		end
+		CoinEngine.AutoNoclipMode = nil
+		CoinEngine.AutoNoclipTarget = nil
+		CoinEngine.NoclipWanted = false
+		CoinEngine.AutoNoclipNextCheckAt = now + 0.04
+		SetCurrent(nil, now)
+		local replacement
+		if threat.Active and not threat.EmergencyEscape then
+			replacement = PickThreatCoin(root.Position, blockedTarget, now)
+		else
+			replacement = PickNearest(root.Position, blockedTarget, now)
+		end
+		if replacement and replacement ~= blockedTarget then
+			SetCurrent(replacement, now) -- conserva la velocidad existente para una transición continua
+		else
+			-- Sin objetivo alternativo, no arrastrar velocidad/boost antiguos a una moneda futura.
+			chainAccelerationActive = false
+			currentSpeed = 0
+			lastFlightV = 0
+			CoinEngine.LastCommandVelocity = Vector3.zero
+		end
+		LogEvent(string.format("route-no-safe-detour action=reroute reason=%s blocked=%s next=%s",
+			tostring(reason):gsub("[%c%s]", "_"):sub(1, 36),
+			blockedTarget and tostring(blockedTarget.Name) or "none",
+			replacement and tostring(replacement.Name) or "none"))
+		return CoinEngine.CurrentTarget
+	end
+
 	-- Escape has movement priority. The escape planner tests the complete character
 	-- volume along multiple directions. Only if every lane is obstructed is a temporary
 	-- escape-route crossing allowed; proximity alone never leaves collisions disabled.
@@ -9033,59 +9067,20 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	end
 
 	if CoinEngine.AutoNoclipMode == "coin-route" then
-		if not target or not target.Parent or target ~= CoinEngine.AutoNoclipTarget then
-			if IsInsideSolidForNoclip(root.Position, now) then
-				CoinEngine.AutoNoclipMode = "exit-solid"
-				CoinEngine.AutoNoclipStartedAt = now
-				CoinEngine.NoclipWanted = true
-			else
-				CoinEngine.AutoNoclipMode = nil
-				CoinEngine.AutoNoclipTarget = nil
-				CoinEngine.NoclipWanted = false
-			end
-			CoinEngine.AutoNoclipNextCheckAt = now + 0.05
-			LogEvent("auto-noclip stop reason=target-changed;restore-or-exit-solid")
+		-- Defensive cleanup for a legacy/stale mode: do not continue crossing an obstacle solely
+		-- because a local detour failed. NoClip is only retained to leave geometry already occupied.
+		if IsInsideSolid(root.Position) then
+			CoinEngine.AutoNoclipMode = "exit-solid"
+			CoinEngine.AutoNoclipStartedAt = now
+			CoinEngine.NoclipWanted = true
 			return target
 		end
-
-		if now >= (CoinEngine.AutoNoclipNextCheckAt or 0) then
-			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
-			local routeClear = HasClearCoinRoute(root.Position, target)
-			local inside = IsInsideSolidForNoclip(root.Position, now)
-			if routeClear and not inside then
-				CoinEngine.AutoNoclipMode = nil
-				CoinEngine.AutoNoclipTarget = nil
-				CoinEngine.NoclipWanted = false
-				ResetRouteNavigation(target, now)
-				LogEvent("auto-noclip stop reason=route-clear-and-progress-space")
-			elseif inside then
-				-- Once the character-volume query confirms entry into the obstruction, switch to
-				-- the bounded exit phase and keep every avatar part non-colliding until its body clears.
-				if CoinEngine.AutoNoclipMode ~= "exit-solid" then
-					CoinEngine.AutoNoclipMode = "exit-solid"
-					CoinEngine.AutoNoclipStartedAt = now
-					LogEvent("auto-noclip phase=exit-solid reason=body-entered-obstruction")
-				end
-				CoinEngine.NoclipWanted = true
-			elseif now - CoinEngine.AutoNoclipStartedAt >= CoinEngine.AutoNoclipMaxCrossTime then
-				CoinEngine.Blacklist[target] = now + 2.0
-				SetCurrent(nil, now)
-				CoinEngine.AutoNoclipMode = nil
-				CoinEngine.AutoNoclipTarget = nil
-				CoinEngine.NoclipWanted = false
-				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-				LogEvent(string.format("auto-noclip abort reason=cross-timeout elapsed=%.2f inside=%d", now - CoinEngine.AutoNoclipStartedAt, inside and 1 or 0))
-				return nil
-			else
-				CoinEngine.NoclipWanted = true
-			end
-		end
-		return target
+		return RerouteBlockedCoin(target, "legacy-coin-route")
 	end
 
-	-- If preflight found a blocked direct path and could not validate either local detour,
-	-- start the bounded adaptive crossing now. This avoids the old sequence of detour cooldown
-	-- + global stall timeout + another route sample (which could approach two seconds).
+	-- A blocked direct ray plus a failed local detour is not enough evidence to cross a wall.
+	-- Reroute to another coin first. The temporary exit mode is reserved for a body already
+	-- confirmed inside collidable geometry, where restoring collisions immediately could trap it.
 	if routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
 		and IsValidCoin(target) and routeNavigation.directPathBlocked then
 		local routeClearNow = HasClearCoinRoute(root.Position, target)
@@ -9095,17 +9090,19 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			routeNavigation.blockedHit = nil
 			routeNavigation.failedUntil = 0
 		else
+			local bodyInside = IsInsideSolid(root.Position) -- fresh query; do not trust the 75 ms cache here
 			routeNavigation.noDetourPending = false
-			routeNavigation.points = {}
-			routeNavigation.index = 1
-			CoinEngine.AutoNoclipMode = IsInsideSolidForNoclip(root.Position, now) and "exit-solid" or "coin-route"
-			CoinEngine.AutoNoclipTarget = target
-			CoinEngine.AutoNoclipStartedAt = now
-			CoinEngine.NoclipWanted = true
-			CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
-			LogEvent(string.format("auto-noclip start reason=preflight-blocked-no-valid-detour dist=%.1f target=%s",
-				(target.Position - root.Position).Magnitude, target.Name))
-			return target
+			if bodyInside then
+				CoinEngine.AutoNoclipMode = "exit-solid"
+				CoinEngine.AutoNoclipTarget = target
+				CoinEngine.AutoNoclipStartedAt = now
+				CoinEngine.NoclipWanted = true
+				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
+				LogEvent(string.format("auto-noclip start reason=confirmed-body-inside-solid dist=%.1f target=%s",
+					(target.Position - root.Position).Magnitude, target.Name))
+				return target
+			end
+			return RerouteBlockedCoin(target, "preflight-no-valid-detour")
 		end
 	end
 
@@ -9128,19 +9125,20 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 		end
 		if progressAge >= stuckConfirm and confirmedMotionStall then
 			local routeBlocked = not HasClearCoinRoute(root.Position, target)
-			local inside = IsInsideSolidForNoclip(root.Position, now)
-			if routeBlocked or inside then
-				CoinEngine.AutoNoclipMode = inside and "exit-solid" or "coin-route"
+			local inside = IsInsideSolid(root.Position) -- fresh confirmation before touching collision state
+			if inside then
+				CoinEngine.AutoNoclipMode = "exit-solid"
 				CoinEngine.AutoNoclipTarget = target
 				CoinEngine.AutoNoclipStartedAt = now
 				CoinEngine.NoclipWanted = true
-				-- The crossing owns the steering until it ends; discard any stale detour waypoint.
 				ResetRouteNavigation(target, now)
 				routeNavigation.failedUntil = now + 0.20
-				LogEvent(string.format("auto-noclip start reason=confirmed-stall blocked=%d inside=%d stalled=%.2f dist=%.1f target=%s",
-					routeBlocked and 1 or 0, inside and 1 or 0, progressAge,
+				LogEvent(string.format("auto-noclip start reason=confirmed-stall-inside-solid blocked=%d stalled=%.2f dist=%.1f target=%s",
+					routeBlocked and 1 or 0, progressAge,
 					(target.Position - root.Position).Magnitude, target.Name))
 				return target
+			elseif routeBlocked then
+				return RerouteBlockedCoin(target, "confirmed-stall-blocked-route")
 			end
 		end
 	end
@@ -15663,7 +15661,7 @@ local function SummarizeFarmLog(raw, kind)
 	local hiresDuration = (data.hiresTimeMax > data.hiresTimeMin and data.hiresTimeMin < math.huge)
 		and (data.hiresTimeMax - data.hiresTimeMin) or nil
 	local out = {
-		"CH " .. kind .. " SUMMARY | analizador=3.22-client-context",
+		"CH " .. kind .. " SUMMARY | analizador=3.23-client-context",
 		"Evento registrado: " .. reason,
 		"Esquema de log: " .. schema,
 		"Versión del script registrada: " .. scriptVersion,
