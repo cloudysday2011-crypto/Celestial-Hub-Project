@@ -1108,8 +1108,18 @@ do
 	end
 
 	if _G.Celestial.AntiAFKConnection then pcall(function() _G.Celestial.AntiAFKConnection:Disconnect() end); _G.Celestial.AntiAFKConnection = nil end
+	if type(_G.Celestial.AntiAFKInputConnections) == "table" then
+		for _, connection in ipairs(_G.Celestial.AntiAFKInputConnections) do
+			if connection then pcall(function() connection:Disconnect() end) end
+		end
+	end
+	_G.Celestial.AntiAFKInputConnections = nil
+	_G.Celestial.AntiAFKGeneration = (_G.Celestial.AntiAFKGeneration or 0) + 1
 	_G.Celestial.AutoServerHopGeneration = (_G.Celestial.AutoServerHopGeneration or 0) + 1
 	local autoHopBusy, antiAFKConnection = false, nil
+	local antiAFKInputConnections = {}
+	_G.Celestial.AntiAFKInputConnections = antiAFKInputConnections
+	local antiAFKLastInputAt = os.clock()
 	local stateFile = "CelestialAutoHopState.json"
 	-- This must point to the raw hosted copy of the modified CH source file.
 	local autoHopScriptUrl = "https://raw.githubusercontent.com/cloudysday2011-crypto/Celestial-Hub-Project/main/CelestialHub_SpiderESP.lua"
@@ -1300,22 +1310,87 @@ print("[Celestial Hub][Auto-load] CH source executed for " .. tostring(d.mode))
 
 	local function setAntiAFKEnabled(enabled)
 		State.AntiAFKEnabled = enabled == true
+		_G.Celestial.AntiAFKGeneration = (_G.Celestial.AntiAFKGeneration or 0) + 1
+		local generation = _G.Celestial.AntiAFKGeneration
 		if antiAFKConnection then pcall(function() antiAFKConnection:Disconnect() end); antiAFKConnection = nil end
 		if _G.Celestial.AntiAFKConnection then pcall(function() _G.Celestial.AntiAFKConnection:Disconnect() end); _G.Celestial.AntiAFKConnection = nil end
+		for _, activityConnection in ipairs(antiAFKInputConnections) do
+			if activityConnection then pcall(function() activityConnection:Disconnect() end) end
+		end
+		table.clear(antiAFKInputConnections)
 		if not State.AntiAFKEnabled then return true end
+
+		antiAFKLastInputAt = os.clock()
+		local function pulseActivity(periodic)
+			if not State.AntiAFKEnabled or generation ~= _G.Celestial.AntiAFKGeneration then return end
+			if periodic then
+				-- A movement tap is only allowed while the player is genuinely idle and no
+				-- movement controller owns the character. AutoFarm/flight/NoClip are never nudged.
+				if State.FarmEnabled or State.FlyActive or State.NoClipActive then return end
+				local focusedTextBox = UserInputService:GetFocusedTextBox()
+				if focusedTextBox or (os.clock() - antiAFKLastInputAt) < 170 then return end
+				local character = LocalPlayer.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				local root = character and character:FindFirstChild("HumanoidRootPart")
+				if not humanoid or humanoid.Health <= 0 or not root then return end
+				if humanoid.FloorMaterial == Enum.Material.Air
+					or humanoid.MoveDirection.Magnitude > 0.05
+					or root.AssemblyLinearVelocity.Magnitude > 1.25 then return end
+			end
+
+			local virtualUser, keyPressed = nil, false
+			local okPulse, errPulse = pcall(function()
+				virtualUser = game:GetService("VirtualUser")
+				virtualUser:CaptureController()
+				if periodic then
+					-- A very short forward tap is used only while grounded and stationary.
+					virtualUser:SetKeyDown("w")
+					keyPressed = true
+					task.wait(0.045)
+				else
+					-- Preserve the existing Idled fallback; it does not take over movement.
+					virtualUser:ClickButton2(Vector2.new(0, 0))
+				end
+			end)
+			if keyPressed and virtualUser then
+				pcall(function() virtualUser:SetKeyUp("w") end)
+			end
+			if not okPulse then warn("[Celestial Hub][Anti-AFK] Input method unavailable: " .. tostring(errPulse)) end
+		end
+
 		local okConnect, connection = pcall(function()
 			return LocalPlayer.Idled:Connect(function()
-				local okPulse, errPulse = pcall(function()
-					local virtualUser = game:GetService("VirtualUser")
-					virtualUser:CaptureController()
-					virtualUser:ClickButton2(Vector2.new(0, 0))
-				end)
-				if not okPulse then warn("[Celestial Hub][Anti-AFK] Input method unavailable: " .. tostring(errPulse)) end
+				pulseActivity(false)
 			end)
 		end)
-		if okConnect then antiAFKConnection = connection; _G.Celestial.AntiAFKConnection = connection; return true end
-		warn("[Celestial Hub][Anti-AFK] Could not connect Player.Idled: " .. tostring(connection))
-		return false
+		if not okConnect then
+			warn("[Celestial Hub][Anti-AFK] Could not connect Player.Idled: " .. tostring(connection))
+			return false
+		end
+		antiAFKConnection = connection
+		_G.Celestial.AntiAFKConnection = connection
+		local okInput, inputConnection = pcall(function()
+			return UserInputService.InputBegan:Connect(function()
+				antiAFKLastInputAt = os.clock()
+			end)
+		end)
+		if okInput then antiAFKInputConnections[#antiAFKInputConnections + 1] = inputConnection end
+		local okChanged, changedConnection = pcall(function()
+			return UserInputService.InputChanged:Connect(function()
+				antiAFKLastInputAt = os.clock()
+			end)
+		end)
+		if okChanged then antiAFKInputConnections[#antiAFKInputConnections + 1] = changedConnection end
+
+		-- Single periodic worker; generation checks make old workers inert after toggles/reloads.
+		task.spawn(function()
+			while State.AntiAFKEnabled and generation == _G.Celestial.AntiAFKGeneration do
+				task.wait(180)
+				if not State.AntiAFKEnabled or generation ~= _G.Celestial.AntiAFKGeneration then break end
+				pulseActivity(true)
+			end
+		end)
+		return true
 	end
 
 	local function setAutoServerHopEnabled(enabled)
@@ -8789,7 +8864,7 @@ local routeNavigation = {
 	verticalRouteBlocked = false, verticalSurfaceBlocked = false,
 	lastDetourPart = nil, lastDetourAt = 0, lastDetourStartPosition = nil, detourAttempts = 0,
 	lastDetourSide = 0, lastDetourOffset = 0, lastDetourCost = math.huge,
-	noDetourPending = false, blockedHit = nil,
+	noDetourPending = false, noDetourPreferNoclip = false, blockedHit = nil,
 	loopSamples = {}, loopRecoveryCount = 0, lastLoopAt = 0,
 }
 
@@ -8818,6 +8893,7 @@ local function ResetRouteNavigation(target, now)
 	routeNavigation.lastDetourOffset = 0
 	routeNavigation.lastDetourCost = math.huge
 	routeNavigation.noDetourPending = false
+	routeNavigation.noDetourPreferNoclip = false
 	routeNavigation.blockedHit = nil
 end
 
@@ -9032,6 +9108,32 @@ local function FindLocalRouteDetour(root, destination, coin, hit)
 
 	local sideExtent = math.max(math.abs(clusterMinSide), math.abs(clusterMaxSide))
 	local baseOffset = math.clamp(sideExtent + bodyRadius + 1.25, 3.0, 22.0)
+	-- Decision quirurgica por coste: antes de ejecutar hasta ocho variantes con tres barridos
+	-- cada una, estima el rodeo corto. Solo prefiere el NoClip ya existente cuando la desviacion
+	-- estimada es claramente desproporcionada, la moneda esta dentro del radio permitido y no se
+	-- trata del descenso vertical dedicado (que conserva sus reglas de seguridad).
+	local directCost = delta.Magnitude
+	local targetGap = (destination - fromPos).Magnitude
+	local verticalCoinApproach = delta.Y < -2.0 and horizontal.Magnitude <= 4.5
+	if CoinEngine.AutoNoclipCoinRouteEnabled ~= false and not verticalCoinApproach
+		and targetGap <= (tonumber(CoinEngine.AutoNoclipCoinMaxDistance) or 48) then
+		local sign = -1
+		local estimateSideStep = fromPos + direction * approachAlong + side * (baseOffset * sign)
+		local estimateSideT = math.clamp(approachAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
+		estimateSideStep = Vector3.new(estimateSideStep.X, fromPos.Y + delta.Y * estimateSideT, estimateSideStep.Z)
+		local estimateBypass = fromPos + direction * bypassAlong + side * (baseOffset * sign)
+		local estimateBypassT = math.clamp(bypassAlong / math.max(horizontal.Magnitude, 0.1), 0, 1)
+		estimateBypass = Vector3.new(estimateBypass.X, fromPos.Y + delta.Y * estimateBypassT, estimateBypass.Z)
+		local estimatedDetourCost = (estimateSideStep - fromPos).Magnitude
+			+ (estimateBypass - estimateSideStep).Magnitude + (destination - estimateBypass).Magnitude
+		local excessCost = estimatedDetourCost - directCost
+		if estimatedDetourCost >= directCost * 1.42 and excessCost >= math.max(6.0, directCost * 0.38) then
+			routeNavigation.noDetourPreferNoclip = true
+			LogEvent(string.format("route-detour-cost-prefer-noclip direct=%.1f estimate=%.1f excess=%.1f target=%s",
+				directCost, estimatedDetourCost, excessCost, coin and tostring(coin.Name) or "none"))
+			return nil
+		end
+	end
 	-- Nivel rapido: ambos lados con la holgura minima. Solo si ambos fallan se amplia una vez.
 	local offsets = {baseOffset, math.min(26, baseOffset + 4.5)}
 	local signOrder = {-1, 1}
@@ -9186,6 +9288,7 @@ local function GetFarmNavigationAim(root, target, destination, now)
 		routeNavigation.index = 1
 		routeNavigation.failedUntil = 0
 		routeNavigation.noDetourPending = false
+		routeNavigation.noDetourPreferNoclip = false
 		routeNavigation.blockedHit = nil
 		routeNavigation.lastDetourPart = nil
 		routeNavigation.lastDetourAt = 0
@@ -9253,6 +9356,7 @@ local function GetFarmNavigationAim(root, target, destination, now)
 	end
 	local detour, detourMeta = nil, nil
 	if not verticalApproach then
+		routeNavigation.noDetourPreferNoclip = false
 		local detourStartedAt = os.clock()
 		detour, detourMeta = FindLocalRouteDetour(root, destination, target, hit)
 		RecordNavigationTiming("detour", detourStartedAt, target)
@@ -9270,6 +9374,7 @@ local function GetFarmNavigationAim(root, target, destination, now)
 		routeNavigation.lastDetourOffset = detourMeta and detourMeta.offset or 0
 		routeNavigation.lastDetourCost = detourMeta and detourMeta.cost or math.huge
 		routeNavigation.noDetourPending = false
+		routeNavigation.noDetourPreferNoclip = false
 		routeNavigation.blockedHit = hit
 		routeNavigation.nextSegmentCheckAt = now + 0.14
 		LogEvent(string.format("route-detour-planned points=%d attempt=%d side=%d offset=%.1f cost=%.1f target=%s", #detour, routeNavigation.detourAttempts,
@@ -9584,6 +9689,8 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	-- se restaura colision en espacio libre o se pasa al recuperador de salida-solido.
 	if routeNavigation.noDetourPending and target and target.Parent and target == routeNavigation.target
 		and IsValidCoin(target) and routeNavigation.directPathBlocked then
+		local preferNoClipForCost = routeNavigation.noDetourPreferNoclip == true
+		routeNavigation.noDetourPreferNoclip = false
 		local routeClearNow = HasClearCoinRoute(root.Position, target)
 		if routeClearNow then
 			routeNavigation.noDetourPending = false
@@ -9594,7 +9701,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			local bodyInside = IsInsideSolid(root.Position) -- confirmacion fresca antes de cambiar colision
 			routeNavigation.noDetourPending = false
 			local targetGap = (target.Position - root.Position).Magnitude
-			if not bodyInside then
+			if not bodyInside and not preferNoClipForCost then
 				local alternative = FindClearAlternativeCoin(root, target, now)
 				if alternative then
 					CoinEngine.Blacklist[target] = now + 1.25
