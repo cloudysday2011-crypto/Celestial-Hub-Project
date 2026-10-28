@@ -6503,6 +6503,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
+-- CELESTIAL HUB v3.46: 10s airborne/floor-transition supervisor + lean event coin registration
 -- AUTO-FARM V3.10: seleccion de monedas con prioridad horizontal, suelo cercano y frenado anticipado\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
@@ -6714,7 +6715,7 @@ local CoinEngine = {
 	NoclipExitLastTryAt = 0,
 	NoclipExitAttempts = 0,
 	-- Supervisión coordinada de vuelo/NoClip: solo pertenece al controlador de navegación existente.
-	AirborneRecoveryLimit = 7.0, -- general airborne maneuver ceiling; validated 9s/20s vertical descents take precedence
+	AirborneRecoveryLimit = 10.0, -- general airborne / floor-transition ceiling; validated 9s/20s vertical descents take precedence
 	AirborneSupportDistance = 3.20,
 	AirborneProbeInterval = 0.08,
 	AirborneLookDownDistance = 100,
@@ -7147,9 +7148,9 @@ local function HasGhostOrCollectedMarker(obj)
 	return false
 end
 
-local function IsValidCoin(obj)
+local function IsValidCoin(obj, nameAlreadyMatched)
 	if not obj or not obj.Parent or not obj:IsA("BasePart") or not obj:IsDescendantOf(Workspace)
-		or not CoinNameMatches(obj) or HasGhostOrCollectedMarker(obj) then return false end
+		or (not nameAlreadyMatched and not CoinNameMatches(obj)) or HasGhostOrCollectedMarker(obj) then return false end
 	local s = obj.Size
 	if s.X > 10 or s.Y > 10 or s.Z > 10 then return false end
 	-- Monedas que el juego ya ocultó tras recogerlas no deben seguir siendo objetivos.
@@ -7320,9 +7321,9 @@ end
 
 -- No registrar monedas que aparezcan en objetos ajenos al mapa/ronda activa.
 -- DescendantAdded se escucha en Workspace por eficiencia, pero eso no convierte todo Workspace en una fuente valida.
-local function IsInRecognizedCoinSource(obj)
+local function IsInRecognizedCoinSource(obj, nameAlreadyMatched)
 	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then return false end
-	if not CoinNameMatches(obj) then return false end
+	if not nameAlreadyMatched and not CoinNameMatches(obj) then return false end
 	RefreshCoinSourceRoots()
 	local coinContainer = coinSourceRoots.container
 	if coinContainer and obj:IsDescendantOf(coinContainer) then return true end
@@ -7374,9 +7375,10 @@ end
 
 local function OnDescendantAdded(obj)
 	if not (obj:IsA("BasePart") and CoinNameMatches(obj)) then return end
-	-- Fast path: valid newly-parented coins are registered in the same event callback, with no
-	-- intentional scheduler wait. Defer once only if the instance is still being assembled.
-	if CoinEngine.Active and IsInRecognizedCoinSource(obj) and IsValidCoin(obj) then
+	-- Hot path: the coin-name predicate already passed above, so don't parse the same name again
+	-- in both source and validity filters. Register synchronously in this event when fully formed.
+	-- If the part is still being assembled, defer once and perform the complete validation again.
+	if CoinEngine.Active and IsInRecognizedCoinSource(obj, true) and IsValidCoin(obj, true) then
 		RegisterCoin(obj)
 		return
 	end
@@ -10918,9 +10920,11 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			CoinEngine.EmergencyRecoveryStartedAt = now
 			CoinEngine.EmergencyRecoveryReason = reason
 			CoinEngine.EmergencyRecoveryReleaseSince = nil
-			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=7.00 noclipHardLimit=3.00",
+			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=%.2f noclipHardLimit=%.2f",
 				tostring(reason), tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45, stalledFor, wallAge,
-				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0))
+				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0,
+				tonumber(CoinEngine.AirborneRecoveryLimit) or 10.0,
+				tonumber(CoinEngine.AutoNoclipHardLimit) or 3.0))
 		elseif reason == "wall-traversal-stall" then
 			CoinEngine.EmergencyRecoveryReason = reason
 		end
@@ -11146,12 +11150,12 @@ local function UpdateAirborneRecoveryState(root, now)
 		end
 	end
 
-	-- General airborne ceiling: 7 seconds applies only after the validated 9s/20s vertical-descent
-	-- handler above has declined the special case. This is a one-shot transition into the existing
-	-- recovery path, not a delay; measured no-progress still starts recovery much earlier.
-	-- AutoNoclipHardLimit remains 3.0 intentionally: it belongs to the protected adaptive NoClip
+	-- General airborne / floor-transition ceiling: 10 seconds applies only after the validated
+	-- 9s/20s direct vertical coin-descent handlers above decline the special case. This is a maximum,
+	-- not a wait: the independent no-progress watchdog starts recovery much earlier.
+	-- AutoNoclipHardLimit remains 3.0 intentionally; it belongs to the protected adaptive NoClip
 	-- crossing safety envelope and is not changed by this general airborne setting.
-	local generalAirborneLimit = math.clamp(tonumber(CoinEngine.AirborneRecoveryLimit) or 7.0, 3.0, 7.0)
+	local generalAirborneLimit = math.clamp(tonumber(CoinEngine.AirborneRecoveryLimit) or 10.0, 3.0, 10.0)
 	if airborneFor >= generalAirborneLimit and not CoinEngine.AirborneGeneralLimitTriggered then
 		CoinEngine.AirborneGeneralLimitTriggered = true
 		if not CoinEngine.AirRecoveryActive then
