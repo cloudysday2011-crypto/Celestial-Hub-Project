@@ -6750,6 +6750,9 @@ local CoinEngine = {
 	AirRecoveryLastSupported = false,
 	AirRecoveryNoDestinationSince = nil,
 	AirRecoveryRetryAt = 0,
+	-- A failed landing plan hands control back to farm navigation until actual progress or a new target.
+	AirRecoveryHandoffAwaitingProgress = false,
+	AirRecoveryHandoffTarget = nil,
 	AirborneStallRecoveryDelay = 0.78,
 	-- Emergency recovery observes real movement, not frame counts or target changes.
 	EmergencyRecoveryActive = false,
@@ -6900,6 +6903,8 @@ local function StopFlight()
 	CoinEngine.AirRecoveryNextProbeAt = 0
 	CoinEngine.AirRecoveryNoDestinationSince = nil
 	CoinEngine.AirRecoveryRetryAt = 0
+	CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+	CoinEngine.AirRecoveryHandoffTarget = nil
 	CoinEngine.EmergencyRecoveryActive = false
 	CoinEngine.EmergencyRecoveryStartedAt = nil
 	CoinEngine.EmergencyRecoveryReason = nil
@@ -10851,6 +10856,8 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 	local context = airborne or wallContext
 
 	if not context then
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
 		CoinEngine.EmergencyRecoveryNoProgressSince = nil
 		CoinEngine.EmergencyRecoveryReleaseSince = CoinEngine.EmergencyRecoveryActive and (CoinEngine.EmergencyRecoveryReleaseSince or now) or nil
 		if CoinEngine.EmergencyRecoveryActive and now - (CoinEngine.EmergencyRecoveryReleaseSince or now) >= 0.24 then
@@ -10870,8 +10877,20 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 
 	if madeProgress then
 		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+		if CoinEngine.AirRecoveryHandoffAwaitingProgress then
+			CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+			CoinEngine.AirRecoveryHandoffTarget = nil
+			LogEvent("air-recovery-handoff-confirmed real-forward-progress=1")
+		end
 	else
 		CoinEngine.EmergencyRecoveryNoProgressSince = CoinEngine.EmergencyRecoveryNoProgressSince or now
+		if CoinEngine.AirRecoveryHandoffAwaitingProgress and CoinEngine.CurrentTarget
+			and CoinEngine.CurrentTarget ~= CoinEngine.AirRecoveryHandoffTarget then
+			-- A different selected target is a new navigation strategy; the old landing recovery no longer owns it.
+			CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+			CoinEngine.AirRecoveryHandoffTarget = nil
+			LogEvent("air-recovery-handoff target-changed=1 old-recovery-released=1")
+		end
 	end
 	local stalledFor = CoinEngine.EmergencyRecoveryNoProgressSince
 		and math.max(0, now - CoinEngine.EmergencyRecoveryNoProgressSince) or 0
@@ -10969,6 +10988,8 @@ end
 
 local function UpdateAirborneRecoveryState(root, now)
 	if CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape then
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
 		-- Escape is the sole movement intent during an urgent threat. Keep AirborneSince for
 		-- supervision, but don't run a competing landing planner or vertical-coin exception.
 		if CoinEngine.VerticalCoinDescentActive then CoinEngine.ResetVerticalCoinDescent(now, "preempted-by-escape", false) end
@@ -10997,6 +11018,8 @@ local function UpdateAirborneRecoveryState(root, now)
 		CoinEngine.EmergencyRecoveryNoProgressSince = nil
 		CoinEngine.EmergencyRecoveryReleaseSince = nil
 		CoinEngine.EmergencyRecoverySpeedApplied = false
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
 		return false
 	end
 	if now < (CoinEngine.AirRecoveryNextProbeAt or 0) then
@@ -11038,6 +11061,8 @@ local function UpdateAirborneRecoveryState(root, now)
 		CoinEngine.AirRecoveryNoDestinationSince = nil
 		CoinEngine.AirRecoveryRetryAt = 0
 		CoinEngine.EmergencyRecoveryNoProgressSince = nil
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
 		return false
 	end
 	CoinEngine.AirborneSince = CoinEngine.AirborneSince or now
@@ -11138,8 +11163,15 @@ local function UpdateAirborneRecoveryState(root, now)
 	local noProgressSince = CoinEngine.EmergencyRecoveryNoProgressSince
 	local noProgressFor = noProgressSince and math.max(0, now - noProgressSince) or 0
 	local recoveryDelay = math.max(0.45, tonumber(CoinEngine.AirborneStallRecoveryDelay) or 0.78)
+	local handoffWaitingForProgress = CoinEngine.AirRecoveryHandoffAwaitingProgress == true
+	if handoffWaitingForProgress and CoinEngine.CurrentTarget
+		and CoinEngine.CurrentTarget ~= CoinEngine.AirRecoveryHandoffTarget then
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
+		handoffWaitingForProgress = false
+	end
 	if noProgressSince and noProgressFor >= recoveryDelay and now >= (tonumber(CoinEngine.AirRecoveryRetryAt) or 0)
-		and not CoinEngine.AirRecoveryActive then
+		and not CoinEngine.AirRecoveryActive and not handoffWaitingForProgress then
 		CoinEngine.AirRecoveryActive = true
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
@@ -11230,7 +11262,7 @@ local function GetAirRecoveryDestination(root, target, now)
 	CoinEngine.AirRecoveryReason = "no-safe-landing-found"
 	if now >= (CoinEngine.AirRecoveryNextNoSurfaceLogAt or 0) then
 		CoinEngine.AirRecoveryNextNoSurfaceLogAt = now + 0.50
-		LogEvent("air-recovery-no-safe-landing;hold-position-and-reprobe")
+		LogEvent("air-recovery-no-safe-landing;controller-handoff-or-reprobe")
 	end
 	return nil, "no-safe-landing-found"
 end
@@ -11347,6 +11379,8 @@ CoinEngine.UpdateVerticalCoinDescent = function(root, target, approachPos, now)
 		CoinEngine.AirRecoveryReason = nil
 		CoinEngine.AirRecoveryNoDestinationSince = nil
 		CoinEngine.AirRecoveryRetryAt = 0
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = false
+		CoinEngine.AirRecoveryHandoffTarget = nil
 		LogEvent("air-recovery-canceled reason=validated-vertical-coin-descent")
 	end
 	return true
@@ -11984,6 +12018,37 @@ local function DriveLocalRecoveryWithoutTarget(root, hum, now, dt)
 		aim = GetAirRecoveryDestination(root, nil, now)
 	else
 		aim = root.Position -- one collision-restoration frame; the physical NoClip step restores saved flags
+	end
+
+	-- If no landing endpoint can be validated while coins remain, do not keep returning a zero
+	-- command from recovery. Give the existing selector one chance now and let it resume next frame.
+	if airRecovery and not aim and (CoinEngine.CoinCount or 0) > 0 then
+		local failedReason = CoinEngine.AirRecoveryReason or "no-safe-landing-found"
+		CoinEngine.AirRecoveryActive = false
+		CoinEngine.AirRecoveryRetryAt = now + 0.55
+		CoinEngine.AirRecoveryDestination = nil
+		CoinEngine.AirRecoveryDestinationAt = 0
+		CoinEngine.AirRecoveryDestinationTarget = nil
+		CoinEngine.AirRecoveryDestinationStart = nil
+		CoinEngine.AirRecoveryReason = nil
+		CoinEngine.AirRecoveryNoDestinationSince = nil
+		CoinEngine.AirRecoveryHandoffAwaitingProgress = true
+		local warmed = CoinEngine.NextTarget
+		if warmed and IsAvailable(warmed, now) and IsThreatSafeCoin(warmed) then
+			SetCurrent(warmed, now)
+		else
+			AdvanceTarget(root, now)
+		end
+		CoinEngine.AirRecoveryHandoffTarget = CoinEngine.CurrentTarget
+		CoinEngine.EmergencyRecoveryLastSampleAt = 0
+		CoinEngine.EmergencyRecoveryLastPosition = root.Position
+		CoinEngine.EmergencyRecoveryLastCommandDirection = Vector3.zero
+		CoinEngine.EmergencyRecoveryLastCommandSpeed = 0
+		if CoinEngine.CurrentTarget then noTargetUntil = now end
+		LogEvent(string.format("air-recovery-handoff reason=%s action=resume-existing-target-selector target=%s retryIn=0.55",
+			tostring(failedReason):gsub("[%c%s]", "_"):sub(1, 40),
+			CoinEngine.CurrentTarget and tostring(CoinEngine.CurrentTarget.Name) or "none"))
+		return true
 	end
 
 	local delta = aim and (aim - root.Position) or Vector3.zero
@@ -12738,9 +12803,32 @@ local function ControllerStep(dt)
 		navigationDetour = false
 	elseif CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
 		local landingAim = GetAirRecoveryDestination(root, target, now)
-		moveAim = landingAim or rootPos
-		navigationDetour = true -- the landing recovery is the sole active movement decision until support is confirmed
-		airRecoveryMove = true
+		if landingAim then
+			moveAim = landingAim
+			navigationDetour = true -- a validated landing destination owns movement while it remains usable
+			airRecoveryMove = true
+		else
+			-- Root-cause fix: don't substitute root.Position when there is no validated landing point.
+			-- That forced zero velocity; hand control back to the normal coin route in this Heartbeat.
+			LogEvent(string.format("air-recovery-handoff reason=%s action=resume-existing-coin-route target=%s retryIn=0.55",
+				tostring(CoinEngine.AirRecoveryReason or "no-safe-landing-found"):gsub("[%c%s]", "_"):sub(1, 40), tostring(target.Name)))
+			CoinEngine.AirRecoveryActive = false
+			CoinEngine.AirRecoveryRetryAt = now + 0.55
+			CoinEngine.AirRecoveryDestination = nil
+			CoinEngine.AirRecoveryDestinationAt = 0
+			CoinEngine.AirRecoveryDestinationTarget = nil
+			CoinEngine.AirRecoveryDestinationStart = nil
+			CoinEngine.AirRecoveryReason = nil
+			CoinEngine.AirRecoveryNoDestinationSince = nil
+			CoinEngine.AirRecoveryHandoffAwaitingProgress = true
+			CoinEngine.AirRecoveryHandoffTarget = target
+			-- Preserve the no-progress timestamp; only measured forward displacement clears it.
+			CoinEngine.EmergencyRecoveryLastSampleAt = 0
+			CoinEngine.EmergencyRecoveryLastPosition = root.Position
+			CoinEngine.EmergencyRecoveryLastCommandDirection = Vector3.zero
+			CoinEngine.EmergencyRecoveryLastCommandSpeed = 0
+			moveAim, navigationDetour = GetFarmNavigationAim(root, target, approachPos, now)
+		end
 	elseif not CoinEngine.NoclipWanted and not (CoinEngine.ThreatResponse.EmergencyEscape and CoinEngine.ThreatResponse.Active) then
 		moveAim, navigationDetour = GetFarmNavigationAim(root, target, approachPos, now)
 	end
