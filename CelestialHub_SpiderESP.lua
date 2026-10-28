@@ -1,5 +1,5 @@
--- CELESTIAL HUB V9 (based on V8): cooperative threat-route planning sliced across scheduler resumes, cached decisions during movement, and single movement authority; adaptive NoClip internals preserved.
--- V3.49 localized recovery fix: no age-only cap for ordinary flight; 9s/20s descent watchdogs and a 10s wall-crossing ceiling remain separate.
+-- CELESTIAL HUB AUTOFARM EXTREME V10 (based on V9): shared QMA threat signals, cooperative coin rescans, adaptive mobile workload, validated vertical descent x2, and progress-based NoClip traversal.
+-- Preserves the existing adaptive NoClip core, single movement authority, and separate 9s/20s vertical-descent watchdogs.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
 -- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
@@ -6504,8 +6504,8 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- CELESTIAL HUB AUTOFARM EXTREME V9: lotes 10->10->20, prediccion de amenaza y cobertura contextual
--- Mantiene el registro incremental, un solo coordinador de movimiento y el NoClip adaptativo intacto.
+-- CELESTIAL HUB AUTOFARM EXTREME V10: QMA compartido, menor carga en escaneos, descenso vertical x2 y cruces guiados por progreso
+-- Mantiene el registro incremental, un solo coordinador de movimiento y el núcleo NoClip adaptativo intacto.
 -- AUTO-FARM V3.10: seleccion de monedas con prioridad horizontal, suelo cercano y frenado anticipado\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
 -- (objetivo actual + siguiente precalculado) + UN SOLO controlador de movimiento.
@@ -6572,6 +6572,15 @@ local CoinEngine = {
 	BatchLastBuildMs = 0,
 	BatchLastSelectedCount = 0,
 	BatchConfirmedCollectionCount = 0,
+	-- V10: cooperative coin scan state. A generation token prevents stale scan workers from publishing after a round change.
+	RescanToken = 0,
+	RescanPending = false,
+	RescanLastCostMs = 0,
+	RescanLastCompletedAt = 0,
+	-- Secondary workload adapts to measured Heartbeat hitches; emergency threat sampling is never throttled.
+	PerformanceLoadLevel = 0,
+	PerformanceLoadUntil = 0,
+	PerformanceLoadLastLogAt = 0,
 	ConfirmedCollectedCoins = setmetatable({}, {__mode = "k"}),
 	RoundGeneration = 1,
 	PendingCollectionConfirmations = setmetatable({}, {__mode = "k"}),
@@ -6633,6 +6642,14 @@ local CoinEngine = {
 		PredictiveEscapeTTC = 2.0,
 		ClosingSampleInterval = 0.08,
 		ClosingSpeedSamples = 0,
+		-- Shared QMA flight profile: an evidence-backed, revocable low-risk hint, never an immunity flag.
+		QMAFlightProfilePlayer = nil,
+		QMAFlightProfileSince = 0,
+		QMAFlightProfileLastSampleAt = 0,
+		QMAFlightProfileLastPosition = nil,
+		QMAFlightProfileTravel = 0,
+		QMAFlightProfileSamples = 0,
+		QMAFlightProfileLowRisk = false,
 		LastMeasuredMurderer = nil,
 		LastMeasuredDistance = math.huge,
 		LastMeasuredAt = 0,
@@ -6775,7 +6792,10 @@ local CoinEngine = {
 	NoclipRerouteReason = nil,
 	NoclipRerouteTarget = nil,
 	AutoNoclipCoinRouteEnabled = true, -- interruptor de seguridad: false vuelve al redireccionamiento sin cruces de ruta
-	AutoNoclipCoinMaxTime = 0.65, -- cruce adaptativo mas corto; revalida antes de prolongar el paso por geometria
+	AutoNoclipNoProgressTimeout = 1.10, -- solo cancela/replanifica por falta de progreso demostrado, nunca por edad de cruce
+	AutoNoclipProgressThreshold = 0.45, -- avance mínimo hacia el destino para renovar el watchdog adaptativo
+	AutoNoclipLastProgressAt = 0,
+	AutoNoclipBestTargetGap = math.huge,
 	AutoNoclipCoinMaxDistance = 48, -- reservar el cruce a bloqueos locales y evitar atravesar tramos largos
 	TargetDecisionHold = 0.85, -- estabilidad temporal del objetivo; amenazas/objetivo invalido siguen prevaleciendo
 	NoclipExitDestination = nil, -- punto local para salir del sólido; nunca apunta directo a la moneda
@@ -6815,6 +6835,10 @@ local CoinEngine = {
 	VerticalCoinDescentKeepHorizontalTolerance = 5.5,
 	VerticalCoinDescentMinDrop = 2.0,
 	VerticalCoinDescentValidateInterval = 0.12,
+	VerticalCoinDescentBoostHorizontalTolerance = 1.25,
+	VerticalCoinDescentDirectHorizontalTolerance = 0.35,
+	VerticalCoinDescentSpeedLimit = 200, -- hard upper bound; effective speed x2 remains subject to frame/ping/safety caps
+	VerticalCoinDescentAccelerationMultiplier = 2.0, -- temporary command-response multiplier, not a speed multiplier stack
 	AirRecoveryActive = false,
 	AirRecoveryDestination = nil,
 	AirRecoveryDestinationAt = 0,
@@ -6845,13 +6869,10 @@ local CoinEngine = {
 	EmergencyRecoveryWallTriggerAge = 0.85,
 	EmergencyRecoverySpeedApplied = false,
 	LastBaseEffectiveSpeed = 0,
-	NoclipPhysicalStartedAt = nil,
-	AutoNoclipHardLimit = 10.0, -- wall-crossing session ceiling only; ordinary flight has no age-only cutoff
-	AutoNoclipExitLeadTime = 0.70,
-	NoclipHardLimitLogged = false,
+	NoclipPhysicalStartedAt = nil, -- diagnostics only; never used as an elapsed-time crossing cutoff
 	AutoNoclipStartedAt = 0,
 	AutoNoclipNextCheckAt = 0,
-	AutoNoclipMaxCrossTime = 2.25,
+	-- No crossing-age limit: route recovery is triggered by measured lack of progress, not elapsed age.
 	AutoNoclipCheckInterval = 0.04, -- muestreo rápido: limita la latencia de recuperación a ~0.25 s
 	NoclipStuckConfirmTime = 0.14, -- confirmación corta, corroborada por ruta bloqueada y comando activo
 	NoclipExitSolidMaxTime = 1.10, -- nunca mantener la recuperación sin límite
@@ -7089,22 +7110,23 @@ local function GetAdaptiveSteeringAlpha(dt, requestedSpeed)
 	return alpha
 end
 
-local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
+local function ApplyStableFlightVelocity(direction, requestedSpeed, dt, verticalSpeedLimitOverride, accelerationMultiplierOverride)
 	if not flightVel or not direction then return end
 	local speed = math.max(0, tonumber(requestedSpeed) or 0)
 	local dirMag = direction.Magnitude
 	if dirMag < 1e-5 then return end
 	local dir = direction / dirMag
 	local previous = CoinEngine.LastCommandVelocity or Vector3.zero
+	local verticalLimit = math.max(0, tonumber(verticalSpeedLimitOverride) or tonumber(CoinEngine.MaxVerticalVelocity) or 8)
 	local alpha = CoinEngine.AdaptiveStability and GetAdaptiveSteeringAlpha(dt, speed) or 1
 
 	-- Se limita la orden vertical, pero el presupuesto horizontal se calcula por separado para
 	-- conservar la magnitud solicitada en vez de recortar la velocidad en giros/desniveles.
-	local desiredY = math.clamp(dir.Y * speed, -CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
-	local previousY = math.clamp(previous.Y, -CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+	local desiredY = math.clamp(dir.Y * speed, -verticalLimit, verticalLimit)
+	local previousY = math.clamp(previous.Y, -verticalLimit, verticalLimit)
 	local yAlpha = math.clamp(alpha + 0.12, 0.12, 1)
 	local y = math.clamp(previousY + (desiredY - previousY) * yAlpha,
-		-CoinEngine.MaxVerticalVelocity, CoinEngine.MaxVerticalVelocity)
+		-verticalLimit, verticalLimit)
 
 	local desiredHorizontal = Vector3.new(dir.X, 0, dir.Z)
 	local previousHorizontal = Vector3.new(previous.X, 0, previous.Z)
@@ -7143,6 +7165,8 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 		local floorAccel = tonumber(CoinEngine.RiskCommandAccelerationFloor) or 80
 		local risk = math.clamp(tonumber(adaptiveCommandRiskScore) or 0, 0, 1)
 		local commandAccel = math.max(floorAccel, baseAccel - (baseAccel - floorAccel) * risk)
+		local accelerationMultiplier = math.clamp(tonumber(accelerationMultiplierOverride) or 1, 1, 2.0)
+		commandAccel *= accelerationMultiplier
 		local activeTarget = CoinEngine.CurrentTarget
 		local root = GetRoot()
 		if activeTarget and root then
@@ -7163,9 +7187,9 @@ local function ApplyStableFlightVelocity(direction, requestedSpeed, dt)
 		local deltaVelocity = targetVelocity - previous
 		local allowedDelta = commandAccel * frameDt
 		if verticalOnly then
-			-- Eliminar el empuje lateral heredado es correccion de direccion, no aumento de velocidad.
-			-- Una desaceleracion lateral algo mas firme impide que el personaje orbite bajo una moneda.
-			allowedDelta = math.max(allowedDelta, 300 * frameDt)
+			-- Eliminar empuje lateral residual; una maniobra vertical validada puede responder más rápido.
+			local verticalCorrectionAccel = 300 * accelerationMultiplier
+			allowedDelta = math.max(allowedDelta, verticalCorrectionAccel * frameDt)
 		end
 		if deltaVelocity.Magnitude > allowedDelta and allowedDelta > 0 then
 			targetVelocity = previous + deltaVelocity.Unit * allowedDelta
@@ -7402,6 +7426,7 @@ local COIN_SOURCE_NAMES = {"Map", "Normal", "Round"}
 local coinSourceRoots = {container = nil, named = {}}
 local nextCoinSourceRefreshAt = 0
 CoinEngine.LastWorkspaceFallbackScanAt = -math.huge
+CoinEngine.LastWorkspaceFallbackScanGeneration = nil
 CoinEngine.WorkspaceFallbackScanInterval = 4.0
 local function RefreshCoinSourceRoots()
 	local now = os.clock()
@@ -7438,40 +7463,103 @@ local function IsInRecognizedCoinSource(obj, nameAlreadyMatched)
 end
 
 -- Escaneo completo SOLO al activar, al cambiar de contenedor/ronda, o si la cache esta vacia (con backoff).
-local function ScanContainer(container)
-	if not container then return 0 end
-	local found = 0
-	for _, obj in ipairs(container:GetDescendants()) do
-		if obj:IsA("BasePart") and IsValidCoin(obj) and not CoinEngine.CoinCache[obj] then
-			RegisterCoin(obj)
-			found += 1
+local function ScanContainer(container, token)
+	if not container then return 0, true end
+	local found, examined = 0, 0
+	-- Incremental depth-first walk: do not allocate a map-sized GetDescendants snapshot.
+	-- Event connections remain the primary live registry; this is only a chunked repair scan.
+	local stack = {container}
+	while #stack > 0 do
+		if token ~= CoinEngine.RescanToken or not CoinEngine.Active then return found, false end
+		local obj = table.remove(stack)
+		if obj ~= container then
+			examined += 1
+			if obj:IsA("BasePart") and CoinNameMatches(obj) and IsValidCoin(obj, true) and not CoinEngine.CoinCache[obj] then
+				RegisterCoin(obj)
+				found += 1
+			end
+		end
+		-- Enumerate one node's immediate children, then yield after a bounded number of visited nodes.
+		-- A broad/large map therefore cannot monopolize one movement Heartbeat with a full tree walk.
+		local children = obj:GetChildren()
+		for i = #children, 1, -1 do stack[#stack + 1] = children[i] end
+		local loadLevel = tonumber(CoinEngine.PerformanceLoadLevel) or 0
+		local chunkLimit = loadLevel >= 2 and 32 or (loadLevel == 1 and 64 or 96)
+		if examined >= chunkLimit then
+			examined = 0
+			task.wait()
 		end
 	end
-	return found
+	return found, true
 end
 
 local function RescanCoins()
-	local container = FindCoinContainer()
-	local found = 0
-	if container then found += ScanContainer(container) end
-	for _, name in ipairs({"Map", "Normal", "Round"}) do
-		local c = Workspace:FindFirstChild(name)
-		if c and c ~= container then found += ScanContainer(c) end
-	end
-	-- Fallback compatible con mapas que guardan monedas directamente en Workspace.
-	-- ScanContainer solo registra BaseParts cuyo nombre coincide con CoinNameMatches y pasa IsValidCoin.
-	local now = os.clock()
-	if found == 0 and CoinEngine.CoinCount == 0
-		and now - (CoinEngine.LastWorkspaceFallbackScanAt or -math.huge) >= (CoinEngine.WorkspaceFallbackScanInterval or 4.0) then
-		-- Full Workspace fallback is only a safety net. New coin instances are registered by
-		-- DescendantAdded immediately, so repeated whole-world scans while the cache is empty add cost without improving event response.
-		found = ScanContainer(Workspace)
-		CoinEngine.LastWorkspaceFallbackScanAt = now
-	end
-	lastContainer = container
-	if found > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.5) end
-	nextRescanAt = os.clock() + rescanBackoff
-	return found
+	if not CoinEngine.Active or CoinEngine.RescanPending then return 0 end
+	CoinEngine.RescanToken = (tonumber(CoinEngine.RescanToken) or 0) + 1
+	local token = CoinEngine.RescanToken
+	CoinEngine.RescanPending = true
+	-- Do not scan synchronously from the Heartbeat. DescendantAdded/Removing continues to keep
+	-- the shared registry live while this single cooperative safety scan fills gaps.
+	task.spawn(function()
+		local startedAt = os.clock()
+		local scanOK, found, complete, container = pcall(function()
+			local foundCount = 0
+			local finished = true
+			local currentContainer = FindCoinContainer()
+			if currentContainer then
+				local n, ok = ScanContainer(currentContainer, token)
+				foundCount += n
+				finished = ok
+			end
+			if finished then
+				for _, name in ipairs(COIN_SOURCE_NAMES) do
+					if token ~= CoinEngine.RescanToken or not CoinEngine.Active then finished = false; break end
+					local c = coinSourceRoots.named[name]
+					-- Avoid rescanning any named root already covered by the coin container.
+					if c and c ~= currentContainer and not (currentContainer and c:IsDescendantOf(currentContainer)) then
+						local n, ok = ScanContainer(c, token)
+						foundCount += n
+						if not ok then finished = false; break end
+					end
+				end
+			end
+			local now = os.clock()
+			-- A Workspace-wide safety scan is allowed once per round generation only. Newly spawned
+			-- coins are covered by DescendantAdded, so repeating a full-world search every few seconds
+			-- while a lobby is empty only adds load without improving event-driven detection.
+			if finished and foundCount == 0 and CoinEngine.CoinCount == 0
+				and CoinEngine.LastWorkspaceFallbackScanGeneration ~= CoinEngine.RoundGeneration
+				and now - (CoinEngine.LastWorkspaceFallbackScanAt or -math.huge) >= (CoinEngine.WorkspaceFallbackScanInterval or 4.0) then
+				CoinEngine.LastWorkspaceFallbackScanGeneration = CoinEngine.RoundGeneration
+				CoinEngine.LastWorkspaceFallbackScanAt = now
+				foundCount, finished = ScanContainer(Workspace, token)
+			end
+			return foundCount, finished, currentContainer
+		end)
+		local now = os.clock()
+		if token == CoinEngine.RescanToken then
+			-- Always release the pending flag even if a dynamic Instance changed during enumeration.
+			CoinEngine.RescanPending = false
+			if scanOK and complete and CoinEngine.Active then
+				lastContainer = container
+				if (tonumber(found) or 0) > 0 then rescanBackoff = 0.25 else rescanBackoff = math.min(rescanBackoff * 1.5, 1.5) end
+				nextRescanAt = os.clock() + rescanBackoff
+				CoinEngine.RescanLastCostMs = (os.clock() - startedAt) * 1000
+				CoinEngine.RescanLastCompletedAt = os.clock()
+				if CoinEngine.RescanLastCostMs >= 120 then
+					LogEvent(string.format("coin-rescan-complete found=%d ms=%.1f chunked=1 count=%d",
+						tonumber(found) or 0, CoinEngine.RescanLastCostMs, CoinEngine.CoinCount))
+				end
+				-- If the root changed while the worker yielded, schedule a new pass on the next housekeeping tick.
+				if FindCoinContainer() ~= container then nextRescanAt = os.clock() end
+			elseif not scanOK then
+				rescanBackoff = math.min(math.max(rescanBackoff, 0.25) * 1.5, 1.5)
+				nextRescanAt = now + rescanBackoff
+				LogEvent(string.format("coin-rescan-error retryIn=%.2f", rescanBackoff))
+			end
+		end
+	end)
+	return 0
 end
 
 local function OnDescendantAdded(obj)
@@ -7547,6 +7635,8 @@ end
 
 local function Deactivate()
 	CoinEngine.Active = false
+	CoinEngine.RescanToken = (tonumber(CoinEngine.RescanToken) or 0) + 1
+	CoinEngine.RescanPending = false
 	if CoinEngine.AddedConnection then CoinEngine.AddedConnection:Disconnect(); CoinEngine.AddedConnection = nil end
 	if CoinEngine.RemovingConnection then CoinEngine.RemovingConnection:Disconnect(); CoinEngine.RemovingConnection = nil end
 	_G.Celestial.CoinDescendantConnection = nil
@@ -10564,6 +10654,73 @@ local function UpdateThreatResponse(root, now)
 
 	local closingSpeed = math.max(0, tonumber(threat.LastClosingSpeed) or 0)
 	local timeToCritical = closingSpeed > 0 and math.max(0, distance - (tonumber(threat.CriticalEscapeDistance) or 30)) / closingSpeed or math.huge
+
+	-- Consume the existing QMA-AntiFling analysis/history; do not start a second flight detector.
+	-- A sustained flight pattern is only a revocable low-risk hint, not proof that the player is farming.
+	local qmaFlightLowRisk = false
+	local qmaAnalysis = AntiFlingQuantum and AntiFlingQuantum.ThreatStates and murderer and AntiFlingQuantum.ThreatStates[murderer]
+	local qmaHistory = AntiFlingQuantum and AntiFlingQuantum.PlayerHistory and murderer and AntiFlingQuantum.PlayerHistory[murderer]
+	local qmaSampleFresh = qmaHistory and (now - (tonumber(qmaHistory.LastObservedAt) or 0)) <= 0.75
+	local qmaFlyingNow = qmaAnalysis and qmaAnalysis.Valid == true
+		and (qmaAnalysis.Flying == true or qmaAnalysis.Hovering == true or (qmaHistory and qmaHistory.FlyingAnomaly == true))
+	if not murderer or threat.QMAFlightProfilePlayer ~= murderer then
+		threat.QMAFlightProfilePlayer = murderer
+		threat.QMAFlightProfileSince = 0
+		threat.QMAFlightProfileLastSampleAt = 0
+		threat.QMAFlightProfileLastPosition = nil
+		threat.QMAFlightProfileTravel = 0
+		threat.QMAFlightProfileSamples = 0
+		threat.QMAFlightProfileLowRisk = false
+	end
+	if murderer and murderRoot and qmaFlyingNow and qmaSampleFresh then
+		if (now - (tonumber(threat.QMAFlightProfileLastSampleAt) or 0)) >= 0.18 then
+			local previousProfilePos = threat.QMAFlightProfileLastPosition
+			if not previousProfilePos then
+				threat.QMAFlightProfileSince = now
+				threat.QMAFlightProfileSamples = 1
+			else
+				local shift = murderRoot.Position - previousProfilePos
+				local horizontalShift = Vector3.new(shift.X, 0, shift.Z).Magnitude
+				threat.QMAFlightProfileTravel = (tonumber(threat.QMAFlightProfileTravel) or 0) + horizontalShift
+				threat.QMAFlightProfileSamples = math.min(16, (tonumber(threat.QMAFlightProfileSamples) or 0) + 1)
+			end
+			threat.QMAFlightProfileLastPosition = murderRoot.Position
+			threat.QMAFlightProfileLastSampleAt = now
+		end
+		local profileAge = now - (tonumber(threat.QMAFlightProfileSince) or now)
+		local horizontalObserved = tonumber(qmaAnalysis.ObservedHorizontalSpeed) or tonumber(qmaHistory.ObservedHorizontalSpeed) or 0
+		local linearObserved = tonumber(qmaAnalysis.LinearSpeed) or 0
+		local angularObserved = tonumber(qmaAnalysis.AngularSpeed) or 0
+		local hostileQmaSignal = qmaAnalysis.State == "Critical"
+			or qmaAnalysis.SpeedCritical == true or qmaAnalysis.TeleportDetected == true or qmaAnalysis.Escalating == true
+			or qmaAnalysis.SustainedSpin == true or qmaAnalysis.Orbiting == true or qmaAnalysis.ExtremeSpinConfirmed == true
+			or (AntiFlingQuantum.DangerousPlayers and AntiFlingQuantum.DangerousPlayers[murderer] ~= nil)
+			or linearObserved >= 85 or angularObserved >= 450 or horizontalObserved >= 55
+		local flightPersisted = profileAge >= 1.0 and (tonumber(threat.QMAFlightProfileSamples) or 0) >= 5
+		local trajectoryEvidence = (tonumber(threat.QMAFlightProfileTravel) or 0) >= 12
+			or (qmaHistory.HoverStart and now - qmaHistory.HoverStart >= 1.0)
+		qmaFlightLowRisk = flightPersisted and trajectoryEvidence and not hostileQmaSignal
+			and (tonumber(qmaAnalysis.Confidence) or 0) <= 70
+		if threat.QMAFlightProfileLowRisk ~= qmaFlightLowRisk then
+			LogEvent(string.format("qma-murder-flight-profile state=%s confidence=%.0f age=%.2f travel=%.1f samples=%d",
+				qmaFlightLowRisk and "low-risk-hint" or "monitoring", tonumber(qmaAnalysis.Confidence) or 0, profileAge,
+				tonumber(threat.QMAFlightProfileTravel) or 0, tonumber(threat.QMAFlightProfileSamples) or 0))
+		end
+		threat.QMAFlightProfileLowRisk = qmaFlightLowRisk
+	else
+		-- Missing/stale/contradictory QMA data revokes the hint immediately; no permanent exemption.
+		threat.QMAFlightProfileLowRisk = false
+		if not qmaFlyingNow or not qmaSampleFresh then
+			threat.QMAFlightProfileSince = 0
+			threat.QMAFlightProfileTravel = 0
+			threat.QMAFlightProfileSamples = 0
+			threat.QMAFlightProfileLastPosition = nil
+		end
+	end
+	local qmaLowRiskProximityOnly = qmaFlightLowRisk and distance > (tonumber(threat.EnterDistance) or 15)
+		and distance > (tonumber(threat.CriticalEscapeDistance) or 30) - 15
+		and not clearShotLane and closingSpeed < 8
+
 	local predictivePrepare = murderer ~= nil and murderRoot ~= nil
 		and distance <= (tonumber(threat.PredictivePrepareDistance) or 50)
 		and closingSpeed >= (tonumber(threat.PredictivePrepareClosingSpeed) or 6)
@@ -10698,6 +10855,8 @@ local function UpdateThreatResponse(root, now)
 	-- valid continuation when it increases separation and does not cross the Murderer's approach lane.
 	local criticalProximity = murderer ~= nil and murderRoot ~= nil
 		and distance < (threat.CriticalEscapeDistance or 30)
+		and not (qmaLowRiskProximityOnly and distance > (tonumber(threat.EnterDistance) or 15)
+			and not clearShotLane and closingSpeed < 8)
 	local acuteThreat = criticalProximity or rapidCriticalCross or predictiveEmergency
 	if acuteThreat and not threat.EmergencyEscape then
 		if threat.SafeCoinRouteActive and threat.SafeCoinRouteMurderer == murderer
@@ -10937,6 +11096,11 @@ CoinEngine.UpdateChainGroupState = function(root, now)
 	local revision = tonumber(CoinEngine.CoinCacheRevision) or 0
 	local previousActive = CoinEngine.ChainGroupActive == true
 	local interval = math.max(0.10, tonumber(CoinEngine.ChainGroupCheckInterval) or 0.20)
+	-- Under sustained frame-time pressure defer only secondary group geometry; threat sampling is separate.
+	if not (CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.EmergencyEscape) then
+		local loadLevel = tonumber(CoinEngine.PerformanceLoadLevel) or 0
+		if loadLevel >= 2 then interval *= 2.0 elseif loadLevel == 1 then interval *= 1.35 end
+	end
 	local origin = CoinEngine.ChainGroupOrigin
 	local invalidContext = not root or not target or not target.Parent
 		or CoinEngine.ThreatResponse.Active or CoinEngine.NoclipWanted or noclipOn
@@ -12553,10 +12717,9 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			CoinEngine.EmergencyRecoveryStartedAt = now
 			CoinEngine.EmergencyRecoveryReason = reason
 			CoinEngine.EmergencyRecoveryReleaseSince = nil
-			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=none noclipWallLimit=%.2f",
+			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=none noclipAgeLimit=none",
 				tostring(reason), tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45, stalledFor, wallAge,
-				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0,
-				tonumber(CoinEngine.AutoNoclipHardLimit) or 10.0))
+				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0))
 		elseif reason == "wall-traversal-stall" then
 			CoinEngine.EmergencyRecoveryReason = reason
 		end
@@ -12786,8 +12949,7 @@ local function UpdateAirborneRecoveryState(root, now)
 
 	-- Ordinary flight has no elapsed-time cutoff. AirborneSince is diagnostic context only;
 	-- the existing progress watchdog below is the sole general-flight recovery trigger.
-	-- The separate AutoNoclipHardLimit is enforced only by UpdateAutoNoclip while an actual
-	-- wall-crossing session is active. Validated vertical coin descents retain their 9s/20s caps.
+	-- V10: No elapsed-time ceiling is imposed on NoClip crossings; progress and geometry govern recovery. Validated descents retain their 9s/20s caps.
 	CoinEngine.AirborneGeneralLimitTriggered = false
 	CoinEngine.AirborneGeneralRetryAt = 0
 
@@ -13043,10 +13205,8 @@ CoinEngine.UpdateVerticalCoinDescent = function(root, target, approachPos, now)
 end
 
 -- Temporary crossing may begin immediately after preflight proves that direct travel is
--- blocked and no short, geometrically validated detour is available. If its time/progress budget
--- expires while overlapping a solid, exit safely first, then blacklist/reroute the same coin rather
--- than repeatedly re-entering NoClip against the same obstruction. Unexpected stalls use the
--- independent short progress-confirmation path below.
+-- blocked and no short, geometrically validated detour is available. Crossing age never cancels it;
+-- the progress watchdog below requests an exit/replan only when measured progress stops.
 local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	local threat = CoinEngine.ThreatResponse
 	if State.NoClipActive then
@@ -13069,9 +13229,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22
 	local noclipSessionAge = noclipOn and CoinEngine.NoclipPhysicalStartedAt
 		and math.max(0, now - CoinEngine.NoclipPhysicalStartedAt) or 0
-	local noclipHardLimit = tonumber(CoinEngine.AutoNoclipHardLimit) or 10.0
-	local exitLeadTime = math.clamp(tonumber(CoinEngine.AutoNoclipExitLeadTime) or 0.70, 0.25, 1.0)
-
+	-- V10: no crossing-age threshold is consulted here.
 	local function RerouteBlockedCoin(blockedTarget, reason)
 		CoinEngine.NoclipRerouteAfterExit = false
 		CoinEngine.NoclipRerouteReason = nil
@@ -13107,35 +13265,8 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 		return CoinEngine.CurrentTarget
 	end
 
-	-- Si ya pasó el margen de cruce, tomar la decisión de salida antes de alcanzar los 3 s.
-	-- El reloj pertenece a la sesión física y no se reinicia al cambiar de coin-route a exit-solid.
-	if noclipOn and not State.NoClipActive and noclipSessionAge >= (noclipHardLimit - exitLeadTime)
-		and CoinEngine.AutoNoclipMode ~= "exit-solid"
-		and not (threat.Active and threat.EmergencyEscape) then
-		local insideNow = IsInsideSolid(root.Position)
-		if insideNow then
-			local oldMode = CoinEngine.AutoNoclipMode
-			local oldTarget = target or CoinEngine.AutoNoclipTarget or CoinEngine.CurrentTarget
-			CoinEngine.NoclipRerouteAfterExit = oldMode == "coin-route" and oldTarget ~= nil
-			CoinEngine.NoclipRerouteReason = CoinEngine.NoclipRerouteAfterExit and "noclip-ten-second-exit" or nil
-			CoinEngine.NoclipRerouteTarget = CoinEngine.NoclipRerouteAfterExit and oldTarget or nil
-			CoinEngine.AutoNoclipMode = "exit-solid"
-			CoinEngine.AutoNoclipTarget = oldTarget
-			CoinEngine.AutoNoclipStartedAt = now
-			CoinEngine.NoclipExitDestination = nil
-			CoinEngine.NoclipWanted = true
-			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
-			LogEvent(string.format("auto-noclip hard-limit-exit elapsed=%.2f limit=%.2f prior=%s",
-				noclipSessionAge, noclipHardLimit, tostring(oldMode or "none")))
-		else
-			CoinEngine.AutoNoclipMode = nil
-			CoinEngine.AutoNoclipTarget = nil
-			CoinEngine.AutoNoclipStartPosition = nil
-			CoinEngine.NoclipWanted = false
-			LogEvent(string.format("auto-noclip hard-limit-stop elapsed=%.2f reason=outside-solid", noclipSessionAge))
-		end
-	end
-
+	-- V10: elapsed wall time alone never disables NoClip or forces an exit. The adaptive
+	-- exit-solid state below restores collisions only after a fresh overlap check confirms clear volume.
 	-- Un aterrizaje forzado no puede quedar en conflicto con coin-route: si está dentro de un
 	-- sólido, solo el mismo controlador continúa la salida local; si ya está fuera, detiene NoClip.
 	if CoinEngine.AirRecoveryActive and CoinEngine.AutoNoclipMode == "coin-route"
@@ -13186,7 +13317,8 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			escapeRouteBlocked = threat.EscapeRouteBlockedNow == true
 		end
 		if CoinEngine.AutoNoclipMode == "escape-route" then
-			local recoveryAge = now - (CoinEngine.AutoNoclipStartedAt or now)
+			-- Small startup window only to search for a local endpoint; it is not a crossing-age limit.
+			local localEndpointSearchAge = now - (CoinEngine.AutoNoclipStartedAt or now)
 			local localAim = CoinEngine.NoclipExitDestination
 			local localAimGap = localAim and (localAim - root.Position).Magnitude or math.huge
 			-- The cached broad-phase overlap is useful while moving, but near the endpoint make a
@@ -13206,7 +13338,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				CoinEngine.NoclipExitDestination = nil
 				CoinEngine.AutoNoclipNextCheckAt = now + 0.08
 				LogEvent("auto-noclip stop reason=escape-local-segment-complete")
-			elseif not localAim and recoveryAge > 0.18 then
+			elseif not localAim and localEndpointSearchAge > 0.18 then
 				-- No nearby free endpoint was verified; abandon this NoClip attempt and let the escape planner reassess.
 				CoinEngine.AutoNoclipMode = nil
 				CoinEngine.AutoNoclipTarget = nil
@@ -13220,12 +13352,22 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				CoinEngine.NoclipExitDestination = nil
 				CoinEngine.AutoNoclipNextCheckAt = now + 0.05
 				LogEvent("auto-noclip stop reason=escape-lane-clear")
-			elseif recoveryAge >= (tonumber(CoinEngine.AutoNoclipMaxCrossTime) or 2.25) then
+			elseif stalledFor >= math.max(stuckConfirm, tonumber(CoinEngine.AutoNoclipNoProgressTimeout) or 1.10) then
+				-- El segmento solo se abandona si la posición real dejó de progresar; un cruce largo
+				-- que sigue avanzando no se cancela por tiempo. Se fuerza una nueva evaluación de ruta.
 				CoinEngine.AutoNoclipMode = nil
 				CoinEngine.AutoNoclipTarget = nil
 				CoinEngine.NoclipWanted = false
-				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.NoclipRetryCooldown) or 0.35)
-				LogEvent(string.format("auto-noclip abort reason=escape-route-timeout elapsed=%.2f", recoveryAge))
+				CoinEngine.AutoNoclipNextCheckAt = now + 0.04
+				threat.EscapeDestination = nil
+				threat.EscapeDestinationComputedAt = 0
+				threat.EscapePreparedAt = 0
+				threat.NextEscapeDestinationAt = now
+				threat.EscapePathBlocked = false
+				threat.CheckedEscapeDestination = nil
+				threat.EscapeRouteBlockedNow = false
+				threat.NextEscapeRouteCheckAt = 0
+				LogEvent(string.format("auto-noclip escape-route-no-progress stalled=%.2f action=replan", stalledFor))
 			else
 				CoinEngine.NoclipWanted = true
 			end
@@ -13253,12 +13395,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				CoinEngine.NoclipExitDestination = nil
 				CoinEngine.NoclipExitDestinationAt = 0
 				CoinEngine.NoclipWanted = true
-				if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
-					CoinEngine.NoclipHardLimitLogged = true
-					LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
-				else
-					LogEvent(string.format("auto-noclip escape-exit-replan elapsed=%.2f session=%.2f", recoveryAge, noclipSessionAge))
-				end
+				LogEvent(string.format("auto-noclip escape-exit-replan elapsed=%.2f session=%.2f", recoveryAge, noclipSessionAge))
 			else
 				CoinEngine.NoclipWanted = true
 			end
@@ -13334,12 +13471,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				-- a buscar una salida local. No restaurar colisión mientras el cuerpo sigue solapado.
 				CoinEngine.AutoNoclipStartedAt = now
 				CoinEngine.NoclipWanted = true
-				if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
-					CoinEngine.NoclipHardLimitLogged = true
-					LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
-				else
-					LogEvent(string.format("auto-noclip exit-solid-replan-near-waypoint elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
-				end
+				LogEvent(string.format("auto-noclip exit-solid-replan-near-waypoint elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
 			else
 				CoinEngine.NoclipWanted = true
 			end
@@ -13353,12 +13485,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			CoinEngine.NoclipExitStartPosition = nil
 			CoinEngine.AutoNoclipStartedAt = now
 			CoinEngine.NoclipWanted = true
-			if noclipSessionAge >= noclipHardLimit and not CoinEngine.NoclipHardLimitLogged then
-				CoinEngine.NoclipHardLimitLogged = true
-				LogEvent(string.format("auto-noclip hard-limit-exit-pending elapsed=%.2f inside=1;preserving-noclip-until-clear", noclipSessionAge))
-			else
-				LogEvent(string.format("auto-noclip exit-solid-replan elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
-			end
+			LogEvent(string.format("auto-noclip exit-solid-replan elapsed=%.2f session=%.2f", elapsed, noclipSessionAge))
 		else
 			CoinEngine.NoclipWanted = true
 		end
@@ -13372,7 +13499,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	end
 
 	if CoinEngine.AutoNoclipMode == "coin-route" then
-		local routeAge = now - (CoinEngine.AutoNoclipStartedAt or now)
+		local routeAge = now - (CoinEngine.AutoNoclipStartedAt or now) -- diagnostics only
 		local sameTarget = target and target.Parent and target == CoinEngine.AutoNoclipTarget and IsValidCoin(target)
 		local movedFromStart = CoinEngine.AutoNoclipStartPosition
 			and (root.Position - CoinEngine.AutoNoclipStartPosition).Magnitude or 0
@@ -13382,15 +13509,22 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			CoinEngine.AutoNoclipNextCheckAt = now + 0.10
 		end
 		local targetGap = sameTarget and (target.Position - root.Position).Magnitude or math.huge
+		if sameTarget then
+			local bestGap = tonumber(CoinEngine.AutoNoclipBestTargetGap) or math.huge
+			if targetGap <= bestGap - (tonumber(CoinEngine.AutoNoclipProgressThreshold) or 0.45) then
+				CoinEngine.AutoNoclipBestTargetGap = targetGap
+				CoinEngine.AutoNoclipLastProgressAt = now
+			end
+		end
+		local noProgressAge = math.max(0, now - (tonumber(CoinEngine.AutoNoclipLastProgressAt) or CoinEngine.AutoNoclipStartedAt or now))
+		local progressExpired = noProgressAge >= math.max(0.45, tonumber(CoinEngine.AutoNoclipNoProgressTimeout) or 1.10)
 		local shouldFinish = not sameTarget or routeClearNow or targetGap <= 4.0
-		local budgetExpired = routeAge >= (tonumber(CoinEngine.AutoNoclipCoinMaxTime) or 0.90)
-		local progressExpired = routeAge >= 0.38 and movedFromStart < 1.0
-		if shouldFinish or budgetExpired or progressExpired then
+		if shouldFinish or progressExpired then
 			local inside = IsInsideSolid(root.Position) -- fresh, not cached, before restoring collisions
 			if inside then
-				local rerouteAfterExit = sameTarget and not routeClearNow and (budgetExpired or progressExpired or targetGap <= 4.0)
+				local rerouteAfterExit = sameTarget and not routeClearNow and (progressExpired or targetGap <= 4.0)
 				CoinEngine.NoclipRerouteAfterExit = rerouteAfterExit
-				CoinEngine.NoclipRerouteReason = rerouteAfterExit and (progressExpired and "coin-route-no-progress" or "coin-route-budget-expired") or nil
+				CoinEngine.NoclipRerouteReason = rerouteAfterExit and "coin-route-no-progress" or nil
 				CoinEngine.NoclipRerouteTarget = rerouteAfterExit and target or nil
 				CoinEngine.AutoNoclipMode = "exit-solid"
 				CoinEngine.AutoNoclipTarget = target
@@ -13399,20 +13533,22 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				CoinEngine.NoclipWanted = true
 				CoinEngine.AutoNoclipNextCheckAt = now + (tonumber(CoinEngine.AutoNoclipCheckInterval) or 0.04)
 				ResetRouteNavigation(CoinEngine.CurrentTarget, now)
-				LogEvent(string.format("auto-noclip coin-route->exit-solid age=%.2f moved=%.1f clear=%d expired=%d deferReroute=%d", routeAge,
-					movedFromStart, routeClearNow and 1 or 0, budgetExpired and 1 or 0, rerouteAfterExit and 1 or 0))
+				LogEvent(string.format("auto-noclip coin-route->exit-solid age=%.2f moved=%.1f clear=%d noProgress=%.2f deferReroute=%d", routeAge,
+					movedFromStart, routeClearNow and 1 or 0, noProgressAge, rerouteAfterExit and 1 or 0))
 				return target
 			end
 			CoinEngine.AutoNoclipMode = nil
 			CoinEngine.AutoNoclipTarget = nil
 			CoinEngine.AutoNoclipStartPosition = nil
+			CoinEngine.AutoNoclipLastProgressAt = 0
+			CoinEngine.AutoNoclipBestTargetGap = math.huge
 			CoinEngine.NoclipWanted = false
 			CoinEngine.AutoNoclipNextCheckAt = now + 0.08
 			ResetRouteNavigation(CoinEngine.CurrentTarget, now)
-			LogEvent(string.format("auto-noclip coin-route-stop age=%.2f moved=%.1f clear=%d expired=%d progressExpired=%d", routeAge,
-				movedFromStart, routeClearNow and 1 or 0, budgetExpired and 1 or 0, progressExpired and 1 or 0))
-			if sameTarget and (budgetExpired or progressExpired) and not routeClearNow then
-				return RerouteBlockedCoin(target, "coin-route-time-or-progress-budget")
+			LogEvent(string.format("auto-noclip coin-route-stop age=%.2f moved=%.1f clear=%d noProgress=%.2f", routeAge,
+				movedFromStart, routeClearNow and 1 or 0, noProgressAge))
+			if sameTarget and progressExpired and not routeClearNow then
+				return RerouteBlockedCoin(target, "coin-route-no-progress-watchdog")
 			end
 			return target
 		end
@@ -13467,10 +13603,12 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 				CoinEngine.AutoNoclipTarget = target
 				CoinEngine.AutoNoclipStartedAt = now
 				CoinEngine.AutoNoclipStartPosition = root.Position
+				CoinEngine.AutoNoclipLastProgressAt = now
+				CoinEngine.AutoNoclipBestTargetGap = targetGap
 				CoinEngine.NoclipWanted = true
 				CoinEngine.AutoNoclipNextCheckAt = now + 0.10
-				LogEvent(string.format("auto-noclip start reason=no-fast-detour dist=%.1f target=%s budget=%.2f", targetGap,
-					target.Name, tonumber(CoinEngine.AutoNoclipCoinMaxTime) or 0.90))
+				LogEvent(string.format("auto-noclip start reason=no-fast-detour dist=%.1f target=%s noProgressWatchdog=%.2f", targetGap,
+					target.Name, tonumber(CoinEngine.AutoNoclipNoProgressTimeout) or 1.10))
 				return target
 			else
 				local reason = CoinEngine.AutoNoclipCoinRouteEnabled == false and "coin-route-disabled"
@@ -13801,64 +13939,29 @@ local function ControllerStep(dt)
 		return
 	end
 
-	-- Protección contra tirones: un pico aislado queda limitado por el presupuesto de
-	-- desplazamiento/frame más abajo. Solo una demora grave o una racha lenta reinicia la ruta.
+	-- V10 mobile workload governor: a slow frame reduces secondary work, not movement intent.
+	-- The old branch imposed 0.25-0.75 s pauses, zeroed speed and reset the current route after
+	-- frame-time spikes. That made the avatar hover and duplicated threat probing; the ordinary
+	-- frame-distance and command-slew caps below remain responsible for safe movement.
 	if tonumber(dt) and dt >= 0.085 then
-		local hitchDt = tonumber(dt) or 0
-		-- Count recent slow frames to distinguish one-off stalls from a sustained performance drop.
-		local recentSlowCount = 0
+		local slowCount = 0
 		for i = #recentSlowFrameTimes, 1, -1 do
-			if now - recentSlowFrameTimes[i] <= slowFrameWindowSeconds then
-				recentSlowCount += 1
-			else
-				break
-			end
+			if now - recentSlowFrameTimes[i] <= slowFrameWindowSeconds then slowCount += 1 else break end
 		end
-		-- A single moderate hitch is already constrained by frameSpeedCap below. Do not
-		-- turn it into a full stop + acceleration restart; reserve hard recovery for a severe
-		-- hitch or a sustained burst of slow frames.
-		local hardRecovery = hitchDt >= 0.18 or recentSlowCount >= 3
-		local emergencyDetectedBeforeRecovery = false
-		if hardRecovery then
-			-- A severe hitch must not repeatedly bypass Murder proximity updates. Sample the
-			-- threat once before any recovery return; if critical escape begins, preserve that
-			-- transition and let escape override the stale farm pause.
-			local earlyRoot, earlyHum = GetRoot(), GetHumanoid()
-			if roundActive and earlyRoot and earlyHum and earlyHum.Health > 0 and IsSafeCoinPosition(earlyRoot.Position) then
-				earlyThreatTransition, earlyThreatDistance = UpdateThreatResponse(earlyRoot, now)
-				threatUpdatedForThisFrame = true
-			end
-			local threatState = CoinEngine.ThreatResponse
-			emergencyDetectedBeforeRecovery = threatState.Active and threatState.EmergencyEscape
+		local requestedLevel, hold = 0, 0
+		if dt >= 0.18 or slowCount >= 5 then requestedLevel, hold = 2, 2.25
+		elseif dt >= 0.085 or slowCount >= 3 then requestedLevel, hold = 1, 1.25 end
+		if requestedLevel > 0 then
+			CoinEngine.PerformanceLoadLevel = math.max(tonumber(CoinEngine.PerformanceLoadLevel) or 0, requestedLevel)
+			CoinEngine.PerformanceLoadUntil = math.max(tonumber(CoinEngine.PerformanceLoadUntil) or 0, now + hold)
 		end
-		if hardRecovery and not emergencyDetectedBeforeRecovery then
-			local recovery = hitchDt >= 0.25 and 0.65 or 0.25
-			if recentSlowCount >= 4 then recovery = math.max(recovery, 0.55) end
-			if recentSlowCount >= 7 then recovery = math.max(recovery, 0.75) end
-			pauseUntil = math.max(pauseUntil, now + recovery)
-			currentSpeed = 0
-			CoinEngine.LastCommandVelocity = Vector3.zero
-			-- If the current coin is still behind solid geometry after a severe/repeated hitch,
-			-- blacklist it briefly so the next target scan can choose another route.
-			local hitchRoot = GetRoot()
-			local hitchTarget = CoinEngine.CurrentTarget
-			local blockedTarget = false
-			if hitchRoot and hitchTarget and hitchTarget.Parent then
-				local ok, blocked = pcall(function()
-					return not HasClearCoinRoute(hitchRoot.Position, hitchTarget)
-				end)
-				blockedTarget = ok and blocked == true
-			end
-			if blockedTarget then
-				CoinEngine.Blacklist[hitchTarget] = now + 2.0
-				SetCurrent(nil, now)
-			end
-			ResetPath()
-			CoinEngine.TargetTrack = nil
-			LogEvent(string.format("lag-recovery dt=%.1fms hold=%.2f slowBurst=%d solid=%d target-reset=1 blocked-target=%d",
-				hitchDt * 1000, recovery, recentSlowCount, solidOverlapActive and 1 or 0, blockedTarget and 1 or 0))
-			return
-		end
+	elseif now >= (tonumber(CoinEngine.PerformanceLoadUntil) or 0) then
+		CoinEngine.PerformanceLoadLevel = 0
+	end
+	if now >= (tonumber(CoinEngine.PerformanceLoadLastLogAt) or 0) and CoinEngine.PerformanceLoadLevel > 0 then
+		CoinEngine.PerformanceLoadLastLogAt = now + 1.5
+		LogEvent(string.format("mobile-workload-profile level=%d dt=%.1fms slowFrames=%d movement-paused=0",
+			tonumber(CoinEngine.PerformanceLoadLevel) or 0, (tonumber(dt) or 0) * 1000, #recentSlowFrameTimes))
 	end
 
 	local root, hum = GetRoot(), GetHumanoid()
@@ -14328,9 +14431,13 @@ local function ControllerStep(dt)
 		* ((CoinEngine.ChainGroupActive and not CoinEngine.ThreatResponse.Active
 			and not (CoinEngine.NoclipWanted or noclipOn)) and (tonumber(CoinEngine.ChainGroupMultiplier) or 1.15) or 1)
 	CoinEngine.LastBaseEffectiveSpeed = sliderSpeed * CoinEngine.SpeedBonusMultiplier
-	CoinEngine.CurrentEmergencySpeedMultiplier = CoinEngine.EmergencyRecoveryActive
+	-- Una huida urgente del Murder usa un unico multiplicador x1.50 sobre la velocidad efectiva.
+	-- Suprime el x1.45 de recuperación para esta misma maniobra y evita que se apilen.
+	local murderEscapeSpeedActive = CoinEngine.ThreatResponse.Active == true
+		and CoinEngine.ThreatResponse.EmergencyEscape == true
+	CoinEngine.CurrentEmergencySpeedMultiplier = CoinEngine.EmergencyRecoveryActive and not murderEscapeSpeedActive
 		and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0
-	local speed = CoinEngine.LastBaseEffectiveSpeed * CoinEngine.CurrentEmergencySpeedMultiplier
+	local speed = CoinEngine.LastBaseEffectiveSpeed * (murderEscapeSpeedActive and 1.50 or CoinEngine.CurrentEmergencySpeedMultiplier)
 	if math.abs((tonumber(CoinEngine.LastLoggedSpeedBonusMultiplier) or 0) - CoinEngine.SpeedBonusMultiplier) > 0.001 then
 		LogEvent(string.format("autofarm-passive-speed configured=%.1f cappedBase=%.1f multiplier=%.3f requested=%.1f group=%d members=%d noclipEnvelope=%d",
 			CoinEngine.ConfiguredSliderSpeed, sliderSpeed, CoinEngine.SpeedBonusMultiplier, speed,
@@ -14363,7 +14470,9 @@ local function ControllerStep(dt)
 	-- de 16/22, el limite se deriva del tiempo real entre actualizaciones: el comando no
 	-- debe desplazar mas que MaxCommandStepPerFrame en un solo Heartbeat. Esto permite 100
 	-- con frames estables y conserva una reduccion proporcional si el cliente se ralentiza.
-	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed) * (SafeOn() and 1 or ((tonumber(CoinEngine.SpeedBonusMultiplier) or 1) * CoinEngine.CurrentEmergencySpeedMultiplier))
+	local escapeEnvelopeMultiplier = murderEscapeSpeedActive and 1.50 or CoinEngine.CurrentEmergencySpeedMultiplier
+	local safetyCap = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
+		* (SafeOn() and 1 or ((tonumber(CoinEngine.SpeedBonusMultiplier) or 1) * escapeEnvelopeMultiplier))
 	local maxStep = math.max(0.25, tonumber(CoinEngine.MaxCommandStepPerFrame) or 1.5)
 	-- Keep adaptive NoClip on its previous 80-speed / 1.5-step safety envelope. The expanded
 	-- slider range applies to ordinary coin movement, not to temporary NoClip navigation.
@@ -14396,8 +14505,8 @@ local function ControllerStep(dt)
 		and (now - CoinEngine.solidOverlapSince) >= 0.35 and (now - lastProgress) >= 0.35
 	-- Unicamente durante el cierre rapido, permitir una subida moderada del limite en frames estables;
 	-- los guardas de latencia/tirones siguen prevaleciendo para no crear saltos grandes.
-	if CoinEngine.ThreatResponse.EmergencyEscape and sampleDt < 0.040 and pingCap == 100 and not solidStall then
-		frameSpeedCap = math.min(safetyCap * 1.10, maxStep / math.max(sampleDt, 1 / 240))
+	if murderEscapeSpeedActive and sampleDt < 0.040 and pingCap == 100 and not solidStall then
+		frameSpeedCap = math.min(safetyCap, maxStep / math.max(sampleDt, 1 / 240))
 		safetyReason = safetyReason == "normal" and "rapid-close-envelope" or (safetyReason .. "+rapid-close-envelope")
 	end
 	if solidStall and speed > 12 then
@@ -14405,31 +14514,31 @@ local function ControllerStep(dt)
 		safetyReason = safetyReason == "normal" and "solid-stall" or (safetyReason .. "+solid-stall")
 	end
 
-	-- Threat-only internal boost: the visible Tween Speed slider/state is never changed.
-	-- Ordinary/Haste threat response adds 25 speed units (25->50, 50->75, 75->100).
-	-- Sprint gets at least +25 and scales up to +55% of the selected base speed.
-	-- The existing adaptive/latency safety reduction is retained proportionally; boosts are
-	-- suppressed during a confirmed solid-stall to avoid pushing harder into blocked geometry.
+	-- Amenaza no urgente: conserva los impulsos existentes para poder y persecución.
+	-- Escape urgente: el x1.50 ya se aplicó a LastBaseEffectiveSpeed arriba; no suma +25 ni +45%.
 	local threat = CoinEngine.ThreatResponse
 	if threat.Active and threat.Murderer and not solidStall then
-		local detector = _G.Celestial and _G.Celestial.PowerDetector
-		local isSprintMurderer = detector and detector.CurrentPlayer == threat.Murderer
-			and detector.CurrentPower == "Sprint"
-		local desiredThreatSpeed = sliderSpeed + 25
-		local boostReason = "murder-escape"
 		if threat.EmergencyEscape then
-			-- La rampa se acorta mas abajo; este impulso sigue limitado por frameSpeedCap.
-			desiredThreatSpeed = sliderSpeed + math.max(8, sliderSpeed * 0.10)
-			boostReason = "rapid-close-escape"
-		elseif isSprintMurderer then
-			desiredThreatSpeed = sliderSpeed + math.max(25, sliderSpeed * 0.55)
-			boostReason = "murder-escape-sprint"
-		end
-		local safetyScale = sliderSpeed > 0 and math.clamp(speed / sliderSpeed, 0, 1) or 0
-		local additionalSpeed = math.max(0, desiredThreatSpeed - sliderSpeed) * safetyScale
-		if additionalSpeed > 0 then
-			speed = math.min(speed + additionalSpeed, 124)
-			safetyReason = safetyReason == "normal" and boostReason or (safetyReason .. "+" .. boostReason)
+			local baseEffective = math.max(0, tonumber(CoinEngine.LastBaseEffectiveSpeed) or sliderSpeed)
+			local effectivePingLimit = pingCap < 100 and pingCap or math.huge
+			speed = math.min(baseEffective * 1.50, 150, effectivePingLimit)
+			safetyReason = safetyReason == "normal" and "murder-escape-x1.50" or (safetyReason .. "+murder-escape-x1.50")
+		else
+			local detector = _G.Celestial and _G.Celestial.PowerDetector
+			local isSprintMurderer = detector and detector.CurrentPlayer == threat.Murderer
+				and detector.CurrentPower == "Sprint"
+			local desiredThreatSpeed = sliderSpeed + 25
+			local boostReason = "murder-escape"
+			if isSprintMurderer then
+				desiredThreatSpeed = sliderSpeed + math.max(25, sliderSpeed * 0.55)
+				boostReason = "murder-escape-sprint"
+			end
+			local safetyScale = sliderSpeed > 0 and math.clamp(speed / sliderSpeed, 0, 1) or 0
+			local additionalSpeed = math.max(0, desiredThreatSpeed - sliderSpeed) * safetyScale
+			if additionalSpeed > 0 then
+				speed = math.min(speed + additionalSpeed, 124)
+				safetyReason = safetyReason == "normal" and boostReason or (safetyReason .. "+" .. boostReason)
+			end
 		end
 	end
 	if speed > frameSpeedCap then
@@ -14437,7 +14546,7 @@ local function ControllerStep(dt)
 		local capReason = sampleDt >= 0.060 and "step-budget-slow-frame" or (sampleDt >= 0.040 and "step-budget-frame" or "stable-cap")
 		safetyReason = safetyReason == "normal" and capReason or (safetyReason .. "+" .. capReason)
 	end
-	if CoinEngine.CurrentEmergencySpeedMultiplier > 1 then
+	if CoinEngine.CurrentEmergencySpeedMultiplier > 1 and not murderEscapeSpeedActive then
 		safetyReason = safetyReason == "normal" and "emergency-recovery-x1.45" or (safetyReason .. "+emergency-recovery-x1.45")
 	end
 	if safetyReason ~= CoinEngine.LastSafetyReason then
@@ -14449,8 +14558,15 @@ local function ControllerStep(dt)
 	CoinEngine.LastSafetyCap = speed
 	-- Probe more often at high commanded speeds, but keep the interval bounded to avoid per-frame
 	-- full route work. NoClip independently overrides its safety cap and step budget below.
-	CoinEngine.ObstacleRouteRefreshInterval = math.clamp(4.5 / math.max(speed, 1), 0.06, 0.14)
-	CoinEngine.ObstacleRouteCacheTTL = math.min(0.12, CoinEngine.ObstacleRouteRefreshInterval)
+	local baseRouteInterval = math.clamp(4.5 / math.max(speed, 1), 0.06, 0.14)
+	local loadLevel = tonumber(CoinEngine.PerformanceLoadLevel) or 0
+	local urgentThreat = CoinEngine.ThreatResponse and (CoinEngine.ThreatResponse.EmergencyEscape or CoinEngine.ThreatResponse.Active)
+	if not urgentThreat then
+		if loadLevel >= 2 then baseRouteInterval = math.min(0.24, baseRouteInterval * 1.65)
+		elseif loadLevel == 1 then baseRouteInterval = math.min(0.18, baseRouteInterval * 1.30) end
+	end
+	CoinEngine.ObstacleRouteRefreshInterval = baseRouteInterval
+	CoinEngine.ObstacleRouteCacheTTL = math.min(loadLevel >= 2 and not urgentThreat and 0.22 or 0.12, baseRouteInterval)
 	dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.10)
 	local ramp = Param(CoinEngine.RampTime, CoinEngine.SafeRampTime)
 	if CoinEngine.ThreatResponse.Active then chainAccelerationActive = false end
@@ -14459,8 +14575,39 @@ local function ControllerStep(dt)
 		-- en serie no se multiplican entre si. La velocidad maxima solicitada no cambia.
 		ramp = ramp / CHAIN_ACCELERATION_MULTIPLIER
 	end
-	if CoinEngine.ThreatResponse.EmergencyEscape and not solidStall and sampleDt < 0.040 then
-		ramp = math.min(ramp, 0.30) -- respuesta de huida independiente; nunca depende del boost de monedas
+	if murderEscapeSpeedActive and not solidStall and sampleDt < 0.040 then
+		ramp = math.min(ramp, 0.10) -- respuesta urgente; el multiplicador x1.50 ya se aplicó una sola vez
+	end
+	-- Scope the boost before it is used (the older draft referenced a local declared later).
+	-- It applies only to the current valid, nearly vertically aligned descent and never to escape/NoClip.
+	local verticalDescentBoostActive = false
+	local earlyDescentTarget = CoinEngine.CurrentTarget
+	if CoinEngine.VerticalCoinDescentActive == true and earlyDescentTarget
+		and CoinEngine.VerticalCoinDescentTarget == earlyDescentTarget and earlyDescentTarget.Parent
+		and not (CoinEngine.ThreatResponse and (CoinEngine.ThreatResponse.Active or CoinEngine.ThreatResponse.EmergencyEscape))
+		and not CoinEngine.EmergencyRecoveryActive and not CoinEngine.AirRecoveryActive
+		and not CoinEngine.NoclipWanted and not noclipOn and not State.NoClipActive then
+		local descentDelta = earlyDescentTarget.Position - root.Position
+		local descentHorizontal = Vector3.new(descentDelta.X, 0, descentDelta.Z).Magnitude
+		verticalDescentBoostActive = descentDelta.Y < 0
+			and descentHorizontal <= (tonumber(CoinEngine.VerticalCoinDescentBoostHorizontalTolerance) or 1.25)
+	end
+	if verticalDescentBoostActive then
+		-- Apply x2 once to the unmodified base effective speed. Respect the ping cap and normal
+		-- per-frame movement budget; on stable frames the vertical-only step budget may expand modestly.
+		local verticalReference = math.max(0, tonumber(CoinEngine.LastBaseEffectiveSpeed) or speed)
+		local verticalLimit = tonumber(CoinEngine.VerticalCoinDescentSpeedLimit) or 200
+		local verticalRequest = math.min(verticalReference * 2.0, verticalLimit)
+		local verticalSafetyCap = math.min(verticalLimit, math.max(safetyCap, math.min(verticalRequest, safetyCap * 2.0)))
+		local verticalStepBudget = sampleDt < 0.040 and math.max(maxStep, 2.25) or maxStep
+		local verticalFrameCap = math.min(verticalSafetyCap, verticalStepBudget / math.max(sampleDt, 1 / 240))
+		frameSpeedCap = verticalFrameCap
+		CoinEngine.SpeedSafetyHoldCap = frameSpeedCap
+		verticalRequest = math.min(verticalRequest, frameSpeedCap, pingCap)
+		speed = verticalRequest
+		CoinEngine.LastSafetyCap = speed
+		ramp = math.min(ramp, 0.08)
+		safetyReason = safetyReason == "normal" and "vertical-descent-x2" or (safetyReason .. "+vertical-descent-x2")
 	end
 	currentSpeed = math.min(speed, currentSpeed + speed * dt / ramp)   -- rampa gradual; el limite efectivo no cambia
 	CoinEngine.EmergencyRecoverySpeedApplied = CoinEngine.CurrentEmergencySpeedMultiplier > 1
@@ -14530,6 +14677,12 @@ local function ControllerStep(dt)
 	end
 
 	local rootPos = root.Position
+	verticalDescentBoostActive = verticalDescentBoostActive
+		and CoinEngine.VerticalCoinDescentActive == true
+		and CoinEngine.VerticalCoinDescentTarget == target
+		and not (CoinEngine.ThreatResponse and (CoinEngine.ThreatResponse.EmergencyEscape or CoinEngine.ThreatResponse.Active))
+		and not CoinEngine.EmergencyRecoveryActive and not CoinEngine.AirRecoveryActive
+		and not CoinEngine.NoclipWanted and not noclipOn and not State.NoClipActive
 	-- Punto de aproximación: centro horizontal de la moneda, a una altura donde el root pueda tocarla.
 	-- Dirigirse al centro geométrico de la moneda hacía que el personaje quedara a varios studs en horizontal
 	-- al dispararse la recogida por distancia 3D.
@@ -14538,6 +14691,11 @@ local function ControllerStep(dt)
 	local delta = approachPos - rootPos
 	local dist = delta.Magnitude
 	local moveAim = approachPos
+	-- If the coin is nearly vertically aligned, keep X/Z fixed and command a straight descent.
+	local horizontalTargetGap = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	local verticalOnlyDescent = verticalDescentBoostActive
+		and horizontalTargetGap <= (tonumber(CoinEngine.VerticalCoinDescentDirectHorizontalTolerance) or 0.35)
+	if verticalOnlyDescent then moveAim = Vector3.new(rootPos.X, approachPos.Y, rootPos.Z) end
 	local navigationDetour = false
 	local noclipExitMove = CoinEngine.NoclipWanted and CoinEngine.AutoNoclipMode == "exit-solid"
 	local airRecoveryMove = false
@@ -14550,8 +14708,8 @@ local function ControllerStep(dt)
 		navigationDetour = true -- suppress collection and coin-distance steering during the local recovery step
 	elseif CoinEngine.VerticalCoinDescentActive and CoinEngine.VerticalCoinDescentTarget == target
 		and not CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
-		moveAim = approachPos -- direct validated descent; bypass horizontal waypoint/detour evaluation
-		navigationDetour = false
+		moveAim = verticalOnlyDescent and Vector3.new(rootPos.X, approachPos.Y, rootPos.Z) or approachPos
+		navigationDetour = false -- direct validated descent; bypass horizontal waypoint/detour evaluation
 	elseif CoinEngine.AirRecoveryActive and not CoinEngine.NoclipWanted and not noclipOn then
 		local landingAim = GetAirRecoveryDestination(root, target, now)
 		if landingAim then
@@ -14813,8 +14971,8 @@ local function ControllerStep(dt)
 	else
 		-- Vuelo: durante un desvio validado, el vector apunta al waypoint; la distancia real
 		-- a la moneda sigue controlando recogida/validacion, no el sentido de giro.
-		local steeringDelta = navigationDetour and moveDelta or delta
-		local steeringDist = navigationDetour and moveDist or dist
+		local steeringDelta = (verticalOnlyDescent or navigationDetour) and moveDelta or delta
+		local steeringDist = (verticalOnlyDescent or navigationDetour) and moveDist or dist
 		if (airRecoveryMove or noclipExitMove or collisionRestoreHold) and steeringDist <= 0.001 then
 			-- No hay destino local válido o se restaura colisión: no conservar un comando de movimiento obsoleto.
 			CoinEngine.LastCommandVelocity = Vector3.zero
@@ -14863,7 +15021,13 @@ local function ControllerStep(dt)
 		end
 		lastFlightV = v
 		if v == v and flightVel then
-			ApplyStableFlightVelocity(dir, v, dt)
+			if verticalOnlyDescent then
+				local verticalCap = math.min(tonumber(CoinEngine.LastBaseEffectiveSpeed) or v, tonumber(CoinEngine.VerticalCoinDescentSpeedLimit) or 200) * 2.0
+				verticalCap = math.min(verticalCap, tonumber(CoinEngine.VerticalCoinDescentSpeedLimit) or 200)
+				ApplyStableFlightVelocity(dir, v, dt, verticalCap, tonumber(CoinEngine.VerticalCoinDescentAccelerationMultiplier) or 2.0)
+			else
+				ApplyStableFlightVelocity(dir, v, dt)
+			end
 			velApplied = true
 		end
 		local horiz = Vector3.new(dir.X, 0, dir.Z)
