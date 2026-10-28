@@ -1,4 +1,4 @@
--- CELESTIAL HUB v3.47: verified Murder-safe coin routing, continuous chaining, and retryable airborne recovery; adaptive NoClip internals preserved.
+-- CELESTIAL HUB v3.48: cooperative threat-route planning sliced across scheduler resumes, cached decisions during movement, and single movement authority; adaptive NoClip internals preserved.
 -- V3.45 localized timing update: 7s general airborne cap; validated 9s/20s descent tiers and adaptive NoClip hard limit preserved.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
@@ -6634,6 +6634,27 @@ local CoinEngine = {
 		SafeCoinRouteMurderer = nil,
 		SafeCoinRouteCheckedAt = 0,
 		NextSafeCoinCheckAt = 0,
+		SafeCoinRouteValidationPending = false,
+		SafeCoinRouteValidationToken = 0,
+		SafeCoinRouteValidationTarget = nil,
+		-- Cooperative planners publish results only; ControllerStep remains the sole movement authority.
+		SafeCoinSearchPending = false,
+		SafeCoinSearchToken = 0,
+		SafeCoinSearchNextAllowedAt = 0,
+		SafeCoinSearchResult = nil,
+		SafeCoinSearchResultAt = 0,
+		SafeCoinSearchOrigin = nil,
+		SafeCoinSearchMurderer = nil,
+		SafeCoinSearchMurderPosition = nil,
+		SafeCoinSearchMode = nil,
+		SafeCoinSearchSourceTarget = nil,
+		SafeCoinSearchUrgent = false,
+		EscapeDestinationSearchPending = false,
+		EscapeDestinationSearchToken = 0,
+		EscapeDestinationSearchNextAllowedAt = 0,
+		EscapeDestinationSearchMurderer = nil,
+		EscapeDestinationSearchOrigin = nil,
+		EscapeDestinationSearchMurderPosition = nil,
 		SafeReleaseSince = nil,
 		SafeReleaseHold = 0.45,
 		Active = false,
@@ -9463,12 +9484,12 @@ end
 CoinEngine.escapeRayParams.FilterType = Enum.RaycastFilterType.Exclude
 CoinEngine.escapeRayParams.RespectCanCollide = true
 local escapeAngles = {0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150}
-local function GetMurderEscapeDestination(root, murderer, now)
+local function GetMurderEscapeDestination(root, murderer, now, cooperativeToken, forceRecompute)
 	local threat = CoinEngine.ThreatResponse
 	if not root or not murderer then return nil end
 	local murderRoot = GetRoot(murderer)
 	if not murderRoot then return nil end
-	if threat.EscapeDestination and now < (threat.NextEscapeDestinationAt or 0) then
+	if not forceRecompute and threat.EscapeDestination and now < (threat.NextEscapeDestinationAt or 0) then
 		local cachedDestination = threat.EscapeDestination
 		local cachedGap = (cachedDestination - root.Position).Magnitude
 		local currentSeparation = (root.Position - murderRoot.Position).Magnitude
@@ -9503,7 +9524,7 @@ local function GetMurderEscapeDestination(root, murderer, now)
 	CoinEngine.escapeRayParams.FilterDescendantsInstances = ignore
 
 	local bestDestination, bestSeparation, bestTravel = nil, -math.huge, -math.huge
-	for _, degrees in ipairs(escapeAngles) do
+	for angleIndex, degrees in ipairs(escapeAngles) do
 		local angle = math.rad(degrees)
 		local c, sn = math.cos(angle), math.sin(angle)
 		local direction = Vector3.new(away.X * c - away.Z * sn, 0, away.X * sn + away.Z * c).Unit
@@ -9526,12 +9547,50 @@ local function GetMurderEscapeDestination(root, murderer, now)
 				end
 			end
 		end
+		if cooperativeToken and angleIndex % 2 == 0 then
+			task.wait()
+			if threat.EscapeDestinationSearchToken ~= cooperativeToken or not State.FarmEnabled
+				or GetRoot() ~= root or GetRoot(murderer) ~= murderRoot
+				or (threat.Murderer ~= murderer and threat.CachedMurderer ~= murderer) then
+				return nil
+			end
+		end
 	end
 
 	-- No usable lane means an actual physical obstruction was found in every tested
 	-- evasive direction. The fallback is kept, but the coordinated recovery can now
 	-- recognize this exceptional state instead of waiting until the root overlaps a wall.
-	threat.EscapePathBlocked = bestDestination == nil
+	local pathBlocked = bestDestination == nil
+	if cooperativeToken then
+		-- A route planned over several scheduler slices is committed only after checking it
+		-- against the current root/murder positions. Invalidated plans never overwrite newer state.
+		if threat.EscapeDestinationSearchToken ~= cooperativeToken or not State.FarmEnabled
+			or GetRoot() ~= root or GetRoot(murderer) ~= murderRoot
+			or (threat.Murderer ~= murderer and threat.CachedMurderer ~= murderer) then
+			return nil
+		end
+		local liveRootPos, liveMurderPos = root.Position, murderRoot.Position
+		if bestDestination and not pathBlocked then
+			local remainsSeparated = (bestDestination - liveMurderPos).Magnitude >= (liveRootPos - liveMurderPos).Magnitude + 1.0
+			local routeClear = false
+			pcall(function() routeClear = HasClearCharacterPath(liveRootPos, bestDestination, ignore, root, CoinEngine.escapeRayParams) end)
+			if not remainsSeparated or not routeClear then bestDestination = nil; pathBlocked = true end
+		end
+		fromPos = liveRootPos
+		if not bestDestination then
+			local liveAway = Vector3.new(liveRootPos.X - liveMurderPos.X, 0, liveRootPos.Z - liveMurderPos.Z)
+			if liveAway.Magnitude < 0.05 then
+				local look = root.CFrame.LookVector
+				liveAway = Vector3.new(-look.X, 0, -look.Z)
+			end
+			if liveAway.Magnitude < 0.05 then liveAway = Vector3.new(1, 0, 0) end
+			liveAway = liveAway.Unit
+			local fallback = liveRootPos + liveAway * 14
+			bestDestination = Vector3.new(fallback.X, liveRootPos.Y, fallback.Z)
+		end
+		now = os.clock()
+	end
+	threat.EscapePathBlocked = pathBlocked
 	if not bestDestination then
 		local fallback = fromPos + away * 14
 		bestDestination = Vector3.new(fallback.X, fromPos.Y, fallback.Z)
@@ -9545,6 +9604,94 @@ local function GetMurderEscapeDestination(root, murderer, now)
 	LogEvent(string.format("murder-escape-destination travel=%.1f separation=%.1f", (bestDestination - fromPos).Magnitude,
 		(bestDestination - murderRoot.Position).Magnitude))
 	return bestDestination
+end
+
+-- Route geometry is cooperative: ControllerStep keeps issuing movement from the last
+-- valid destination while this single on-demand worker checks a few escape directions per slice.
+local function RequestMurderEscapeDestination(root, murderer, now)
+	local threat = CoinEngine.ThreatResponse
+	if not root or not murderer or not State.FarmEnabled then return false end
+	if threat.EscapeDestinationSearchPending then return false end
+	if now < (tonumber(threat.EscapeDestinationSearchNextAllowedAt) or 0) then return false end
+	local murderRoot = GetRoot(murderer)
+	if not murderRoot then return false end
+	threat.EscapeDestinationSearchToken = (tonumber(threat.EscapeDestinationSearchToken) or 0) + 1
+	local token = threat.EscapeDestinationSearchToken
+	local origin = root.Position
+	local murderPosition = murderRoot.Position
+	threat.EscapeDestinationSearchPending = true
+	threat.EscapeDestinationSearchMurderer = murderer
+	threat.EscapeDestinationSearchOrigin = origin
+	threat.EscapeDestinationSearchMurderPosition = murderPosition
+	task.defer(function()
+		local ok, destination = pcall(GetMurderEscapeDestination, root, murderer, os.clock(), token, true)
+		if threat.EscapeDestinationSearchToken ~= token then return end
+		threat.EscapeDestinationSearchPending = false
+		local finishedAt = os.clock()
+		threat.EscapeDestinationSearchNextAllowedAt = finishedAt + 0.12
+		local currentRoot = GetRoot()
+		local currentMurderer = threat.Murderer or threat.CachedMurderer
+		local currentMurderRoot = currentMurderer and GetRoot(currentMurderer)
+		if not ok or not destination or not State.FarmEnabled or currentRoot ~= root
+			or currentMurderer ~= murderer or not currentMurderRoot or threat.Murderer ~= murderer then
+			if threat.EscapeDestinationSearchToken == token and threat.Murderer ~= murderer and not threat.EmergencyEscape then
+				threat.EscapeDestination = nil
+				threat.EscapeDestinationComputedAt = 0
+				threat.EscapePreparedAt = 0
+				threat.EscapePreparedOriginPosition = nil
+				threat.EscapePreparedMurderPosition = nil
+				threat.EscapePreparedFor = nil
+				threat.EscapePathBlocked = false
+				threat.CheckedEscapeDestination = nil
+				threat.EscapeRouteBlockedNow = false
+				threat.NextEscapeRouteCheckAt = 0
+				threat.NextEscapeDestinationAt = 0
+			end
+			return
+		end
+		local currentGap = (currentRoot.Position - currentMurderRoot.Position).Magnitude
+		local destGap = (destination - currentMurderRoot.Position).Magnitude
+		if (destination - currentRoot.Position).Magnitude > 6 and destGap >= currentGap + 1 then
+			threat.EscapePreparedAt = finishedAt
+			threat.EscapePreparedOriginPosition = currentRoot.Position
+			threat.EscapePreparedMurderPosition = currentMurderRoot.Position
+			threat.EscapePreparedFor = murderer
+		else
+			threat.EscapeDestination = nil
+			threat.EscapeDestinationComputedAt = 0
+			threat.NextEscapeDestinationAt = finishedAt + 0.12
+		end
+	end)
+	return true
+end
+
+local function GetEscapeDestinationForMovement(root, murderer, now)
+	local threat = CoinEngine.ThreatResponse
+	local murderRoot = murderer and GetRoot(murderer)
+	if not root or not murderRoot then return nil end
+	local currentGap = (root.Position - murderRoot.Position).Magnitude
+	local cached = threat.EscapeDestination
+	if cached and IsSafeCoinPosition(cached) then
+		local destinationGap = (cached - root.Position).Magnitude
+		local separation = (cached - murderRoot.Position).Magnitude
+		local useful = destinationGap > 1.0 and (threat.EscapePathBlocked or separation >= currentGap + 1.0)
+		if useful then
+			if now >= (tonumber(threat.NextEscapeDestinationAt) or 0) then RequestMurderEscapeDestination(root, murderer, now) end
+			return cached
+		end
+	end
+	RequestMurderEscapeDestination(root, murderer, now)
+	-- Do not hold the frame until the route planner finishes. Use the same short-away fallback
+	-- the existing planner already used when every corridor was blocked, then replace it only
+	-- when the cooperative planner publishes a validated destination.
+	local away = Vector3.new(root.Position.X - murderRoot.Position.X, 0, root.Position.Z - murderRoot.Position.Z)
+	if away.Magnitude < 0.05 then
+		local look = root.CFrame.LookVector
+		away = Vector3.new(-look.X, 0, -look.Z)
+	end
+	if away.Magnitude < 0.05 then away = Vector3.new(1, 0, 0) end
+	local fallback = root.Position + away.Unit * 14
+	return Vector3.new(fallback.X, root.Position.Y, fallback.Z)
 end
 
 local function IsThreatSafeCoin(coin)
@@ -9676,12 +9823,168 @@ local function PickThreatCoin(fromPos, exclude, now, routeCheckLimit, requireSaf
 	return candidate
 end
 
+local function PickThreatCoinCooperative(fromPos, exclude, now, routeCheckLimit, requireSafeRoute, cooperative, cooperativeToken)
+	local startedAt = os.clock()
+	local threat = CoinEngine.ThreatResponse
+	local murderer = threat.Murderer or threat.CachedMurderer
+	local murderRoot = murderer and GetRoot(murderer)
+	requireSafeRoute = requireSafeRoute == true
+	if not threat.Active or not murderRoot then
+		if requireSafeRoute then return nil end
+		return PickNearest(fromPos, exclude, now, routeCheckLimit)
+	end
+
+	local murderPos = murderRoot.Position
+	local predictedMurderPos = murderPos
+	pcall(function()
+		local velocity = murderRoot.AssemblyLinearVelocity
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+		if horizontal.Magnitude > 30 then horizontal = horizontal.Unit * 30 end
+		predictedMurderPos = murderPos + horizontal * 0.35
+	end)
+	local preferredGap = Param(CoinEngine.PreferredVerticalGap, CoinEngine.SafePreferredVerticalGap)
+	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
+	if requireSafeRoute then maxRouteChecks = math.max(1, maxRouteChecks) end
+	local startThreatGap = math.min((fromPos - murderPos).Magnitude, (fromPos - predictedMurderPos).Magnitude)
+	local minimumSafeEndpointGap = math.max(tonumber(threat.CoinDangerReleaseDistance) or 36, startThreatGap + 6.0)
+	local minimumSafeRouteGap = math.max(8.0, startThreatGap - 4.0)
+	local highDropThreshold = math.max(10.0, tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+	local highDropMaxGap = math.max(highDropThreshold, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+	local highDropHorizontalLimitSq = (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5) ^ 2
+	local sourceCoins = {}
+	local function CooperativeSearchStillValid()
+		return not cooperative or (State.FarmEnabled and threat.SafeCoinSearchToken == cooperativeToken
+			and threat.Active and (threat.Murderer or threat.CachedMurderer) == murderer)
+	end
+	local snapshotIndex = 0
+	for coin in pairs(CoinEngine.CoinCache) do
+		sourceCoins[#sourceCoins + 1] = coin
+		snapshotIndex += 1
+		if cooperative and snapshotIndex % 96 == 0 then
+			task.wait()
+			if not CooperativeSearchStillValid() then return nil end
+		end
+	end
+
+	local function ScoreThreatCandidate(coinPos)
+		local currentGap = (coinPos - murderPos).Magnitude
+		local predictedGap = (coinPos - predictedMurderPos).Magnitude
+		local safetyGap = math.min(currentGap, predictedGap)
+		local routeVector = coinPos - fromPos
+		local awayVector = fromPos - murderPos
+		local awayDot = 0
+		if routeVector.Magnitude > 0.01 and awayVector.Magnitude > 0.01 then
+			awayDot = routeVector.Unit:Dot(awayVector.Unit)
+		end
+		local directionPenalty = (1 - awayDot) * 16
+		local segment = coinPos - fromPos
+		local lengthSquared = segment:Dot(segment)
+		local routeGap = math.huge
+		if lengthSquared > 0.001 then
+			local function GapToSegment(threatPos)
+				local t = math.clamp((threatPos - fromPos):Dot(segment) / lengthSquared, 0, 1)
+				return (fromPos + segment * t - threatPos).Magnitude
+			end
+			routeGap = math.min(GapToSegment(murderPos), GapToSegment(predictedMurderPos))
+		end
+		local routeRiskPenalty = math.max(0, (tonumber(threat.CoinDangerReleaseDistance) or 36) - routeGap) * 1.15
+		local separationReward = math.min(safetyGap, 120) * 0.55
+		return CoinTravelScore(fromPos, coinPos) + directionPenalty + routeRiskPenalty - separationReward, safetyGap, routeGap
+	end
+
+	local function FindCandidate(verticalLimit)
+		local candidates = {} -- bounded shortlist; deep validation only after cheap spatial filtering
+		for snapshotIndex, coin in ipairs(sourceCoins) do
+			if cooperative and snapshotIndex % 32 == 0 then
+				task.wait()
+				if not CooperativeSearchStillValid() then return nil end
+			end
+			if coin ~= exclude then
+				if not coin or not coin.Parent then
+					if coin then UnregisterCoin(coin) end
+				else
+					local blacklistedUntil = CoinEngine.Blacklist[coin]
+					if blacklistedUntil and blacklistedUntil <= now then
+						CoinEngine.Blacklist[coin] = nil
+						blacklistedUntil = nil
+					end
+					local posOK, coinPos = pcall(function() return coin.Position end)
+					if posOK and IsFiniteVec(coinPos) and not blacklistedUntil
+						and not IsCoinTemporarilyExcluded(coin, now) then
+						local delta = coinPos - fromPos
+						local verticalGap = math.abs(delta.Y)
+						local distanceSquared = delta:Dot(delta)
+						local horizontalDistanceSquared = delta.X * delta.X + delta.Z * delta.Z
+						local directHighDrop = delta.Y <= -highDropThreshold and -delta.Y <= highDropMaxGap
+							and horizontalDistanceSquared <= highDropHorizontalLimitSq
+						if (verticalGap <= verticalLimit or directHighDrop)
+							and distanceSquared <= maxDistance * maxDistance then
+							-- Cached candidates were validated on registration; deep marker/transparency checks are
+							-- only repeated for geometrically relevant coins, not every coin in the whole map.
+							if IsValidCoin(coin, true) then
+								local score, safetyGap, routeGap = ScoreThreatCandidate(coinPos)
+								local routeSafe = safetyGap >= minimumSafeEndpointGap and routeGap >= minimumSafeRouteGap
+								if not requireSafeRoute or routeSafe then
+									score -= GetCoinChainBonus(coin)
+									CoinEngine.InsertBoundedCoinCandidate(candidates, coin, score, 12)
+								end
+							else
+								UnregisterCoin(coin)
+							end
+						end
+					end
+				end
+			end
+		end
+		if not CooperativeSearchStillValid() then return nil end
+		if #candidates == 0 then return nil end
+		-- InsertBoundedCoinCandidate keeps this shortlist sorted by score.
+		local fallback, routeChecks = nil, 0
+		for i = 1, math.min(12, #candidates) do
+			local coin = candidates[i].coin
+			if IsGrounded(coin) then
+				fallback = fallback or coin
+				if maxRouteChecks == 0 then return fallback end
+				if routeChecks < maxRouteChecks then
+					routeChecks += 1
+					if HasClearCoinRoute(fromPos, coin) then return coin end
+					if cooperative then
+						task.wait()
+						if not CooperativeSearchStillValid() then return nil end
+					end
+				end
+			else
+				CoinEngine.Blacklist[coin] = now + 2.5
+			end
+		end
+		if requireSafeRoute then return nil end
+		return fallback
+	end
+
+	local candidate
+	if requireSafeRoute then
+		-- Strict safety search uses the broader vertical range in one pass; repeating the preferred
+		-- range after all its paths failed would raycast the same candidates a second time.
+		candidate = FindCandidate(maxGap)
+	else
+		candidate = FindCandidate(preferredGap)
+		if not candidate then candidate = FindCandidate(maxGap) end
+	end
+	if not cooperative then RecordNavigationTiming("selection", startedAt, candidate) end
+	return candidate
+end
+
 local function ClearThreatSafeCoinRoute(threat)
 	if not threat then return end
 	threat.SafeCoinRouteActive = false
 	threat.SafeCoinRouteTarget = nil
 	threat.SafeCoinRouteMurderer = nil
 	threat.SafeCoinRouteCheckedAt = 0
+	threat.SafeCoinRouteValidationToken = (tonumber(threat.SafeCoinRouteValidationToken) or 0) + 1
+	threat.SafeCoinRouteValidationPending = false
+	threat.SafeCoinRouteValidationTarget = nil
 end
 
 local function IsSafeThreatCoinRoute(root, coin, murderer, murderRoot, now, checkGeometry)
@@ -9729,7 +10032,210 @@ local function IsSafeThreatCoinRoute(root, coin, murderer, murderRoot, now, chec
 	return true
 end
 
+-- Revalidate the currently followed safe route outside ControllerStep. A cheap threat-distance
+-- check remains synchronous; physical route geometry is checked by one on-demand deferred worker.
+local function RequestThreatSafeRouteValidation(root, coin, murderer, murderRoot, now)
+	local threat = CoinEngine.ThreatResponse
+	if not root or not coin or not murderer or not murderRoot or not State.FarmEnabled then return false end
+	if threat.SafeCoinRouteValidationPending then
+		return threat.SafeCoinRouteValidationTarget == coin
+	end
+	if threat.SafeCoinRouteTarget ~= coin or threat.SafeCoinRouteMurderer ~= murderer then return false end
+	threat.SafeCoinRouteValidationToken = (tonumber(threat.SafeCoinRouteValidationToken) or 0) + 1
+	local token = threat.SafeCoinRouteValidationToken
+	threat.SafeCoinRouteValidationPending = true
+	threat.SafeCoinRouteValidationTarget = coin
+	task.defer(function()
+		-- Let the current movement callback return before doing physical route casts.
+		task.wait()
+		if threat.SafeCoinRouteValidationToken ~= token then return end
+		local liveRoot = GetRoot()
+		local liveMurderer = threat.Murderer or threat.CachedMurderer
+		local liveMurderRoot = liveMurderer and GetRoot(liveMurderer)
+		if not State.FarmEnabled or not liveRoot or liveRoot ~= root or not coin.Parent
+			or threat.SafeCoinRouteTarget ~= coin or threat.SafeCoinRouteMurderer ~= murderer
+			or liveMurderer ~= murderer or not liveMurderRoot then
+			threat.SafeCoinRouteValidationPending = false
+			threat.SafeCoinRouteValidationTarget = nil
+			return
+		end
+		local checkedAt = os.clock()
+		local ok, routeOK = pcall(IsSafeThreatCoinRoute, liveRoot, coin, murderer, liveMurderRoot, checkedAt, true)
+		if threat.SafeCoinRouteValidationToken ~= token then return end
+		threat.SafeCoinRouteValidationPending = false
+		threat.SafeCoinRouteValidationTarget = nil
+		if not ok or not routeOK then
+			ClearThreatSafeCoinRoute(threat)
+		else
+			threat.SafeCoinRouteCheckedAt = checkedAt
+			threat.NextSafeCoinCheckAt = checkedAt + 0.18
+		end
+	end)
+	return true
+end
+
+local function IsSafeThreatCoinRouteFromPosition(root, coin, murderer, murderRoot, now, checkGeometry, fromPosOverride)
+	if not root or not coin or not coin.Parent or not murderRoot or not murderer or not IsAvailable(coin, now) then return false end
+	if not IsThreatSafeCoin(coin) then return false end
+	local fromPos, coinPos = fromPosOverride or root.Position, coin.Position
+	local murderPos = murderRoot.Position
+	local predictedPos = murderPos
+	pcall(function()
+		local velocity = murderRoot.AssemblyLinearVelocity
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+		if horizontal.Magnitude > 30 then horizontal = horizontal.Unit * 30 end
+		predictedPos = murderPos + horizontal * 0.35
+	end)
+	local startGap = math.min((fromPos - murderPos).Magnitude, (fromPos - predictedPos).Magnitude)
+	local endGap = math.min((coinPos - murderPos).Magnitude, (coinPos - predictedPos).Magnitude)
+	local requiredEndpointGap
+	if checkGeometry then
+		requiredEndpointGap = math.max(tonumber(CoinEngine.ThreatResponse.CoinDangerReleaseDistance) or 36, startGap - 4.0)
+	else
+		requiredEndpointGap = math.max(tonumber(CoinEngine.ThreatResponse.CoinDangerReleaseDistance) or 36, startGap + 6.0)
+	end
+	if endGap < requiredEndpointGap then return false end
+	local segment = coinPos - fromPos
+	local lengthSquared = segment:Dot(segment)
+	local routeGap = math.huge
+	if lengthSquared > 0.001 then
+		local function GapTo(threatPos)
+			local t = math.clamp((threatPos - fromPos):Dot(segment) / lengthSquared, 0, 1)
+			return (fromPos + segment * t - threatPos).Magnitude
+		end
+		routeGap = math.min(GapTo(murderPos), GapTo(predictedPos))
+	end
+	if routeGap < math.max(8.0, startGap - 4.0) then return false end
+	local delta = coinPos - fromPos
+	local verticalGap = math.abs(delta.Y)
+	local highDrop = delta.Y <= -(tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+		and -delta.Y <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+		and Vector3.new(delta.X, 0, delta.Z).Magnitude <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
+	if delta.Magnitude > Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+		or (verticalGap > Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap) and not highDrop) then return false end
+	if checkGeometry then
+		if not IsGrounded(coin) or not HasClearCoinRoute(fromPos, coin) then return false end
+	end
+	return true
+end
+
+-- Expensive threat-aware candidate enumeration and route raycasts are sliced across scheduler
+-- yields. The worker publishes a candidate only; movement state is changed by ControllerStep.
+local function RequestThreatSafeCoinSearch(root, exclude, now, routeCheckLimit, reason, prefetchTarget, fromPositionOverride)
+	local threat = CoinEngine.ThreatResponse
+	local murderer = threat.Murderer or threat.CachedMurderer
+	local murderRoot = murderer and GetRoot(murderer)
+	if not root or not murderer or not murderRoot or not threat.Active or not State.FarmEnabled then return false end
+	local mode = prefetchTarget and "prefetch" or "route"
+	local urgentRouteSearch = mode == "route" and (threat.EmergencyEscape == true
+		or reason == "acute-threat" or reason == "escape-safe-alternative" or reason == "threat-transition")
+	if threat.SafeCoinSearchPending then
+		local pendingMode = threat.SafeCoinSearchMode
+		local pendingWasUrgent = threat.SafeCoinSearchUrgent == true
+		local supersede = mode == "route" and (pendingMode == "prefetch" or (urgentRouteSearch and not pendingWasUrgent))
+		if supersede then
+			-- Invalidate stale/lower-priority work once; an already-urgent search is allowed to finish.
+			threat.SafeCoinSearchToken = (tonumber(threat.SafeCoinSearchToken) or 0) + 1
+			threat.SafeCoinSearchPending = false
+		else
+			return true
+		end
+	end
+	if now < (tonumber(threat.SafeCoinSearchNextAllowedAt) or 0) and not urgentRouteSearch then return false end
+	threat.SafeCoinSearchToken = (tonumber(threat.SafeCoinSearchToken) or 0) + 1
+	local token = threat.SafeCoinSearchToken
+	local searchOrigin = fromPositionOverride or root.Position
+	local sourceTarget = prefetchTarget
+	local murderOrigin = murderRoot.Position
+	threat.SafeCoinSearchPending = true
+	threat.SafeCoinSearchMode = mode
+	threat.SafeCoinSearchSourceTarget = sourceTarget
+	threat.SafeCoinSearchUrgent = urgentRouteSearch
+	threat.SafeCoinSearchResult = nil
+	threat.SafeCoinSearchResultAt = 0
+	task.defer(function()
+		local ok, candidate = pcall(PickThreatCoinCooperative, searchOrigin, exclude, os.clock(), routeCheckLimit or 6, true, true, token)
+		local finishedAt = os.clock()
+		if threat.SafeCoinSearchToken ~= token then return end
+		threat.SafeCoinSearchPending = false
+		threat.SafeCoinSearchUrgent = false
+		threat.SafeCoinSearchNextAllowedAt = finishedAt + 0.12
+		local currentRoot = GetRoot()
+		local currentMurderer = threat.Murderer or threat.CachedMurderer
+		local currentMurderRoot = currentMurderer and GetRoot(currentMurderer)
+		if not ok or not candidate or not State.FarmEnabled or not threat.Active
+			or currentRoot ~= root or currentMurderer ~= murderer or not currentMurderRoot then return end
+		if sourceTarget and (CoinEngine.CurrentTarget ~= sourceTarget or not sourceTarget.Parent
+			or (sourceTarget.Position - searchOrigin).Magnitude > 2.0) then return end
+		if (currentMurderRoot.Position - murderOrigin).Magnitude > 10.0 then return end
+		local validationOrigin = sourceTarget and searchOrigin or currentRoot.Position
+		if not IsSafeThreatCoinRouteFromPosition(currentRoot, candidate, murderer, currentMurderRoot, finishedAt, true,
+			sourceTarget and validationOrigin or nil) then return end
+		threat.SafeCoinSearchResult = candidate
+		threat.SafeCoinSearchResultAt = finishedAt
+		threat.SafeCoinSearchOrigin = validationOrigin
+		threat.SafeCoinSearchMurderer = murderer
+		threat.SafeCoinSearchMurderPosition = currentMurderRoot.Position
+		threat.SafeCoinSearchMode = mode
+		threat.SafeCoinSearchSourceTarget = sourceTarget
+		LogEvent(string.format("threat-route-search-ready reason=%s mode=%s target=%s elapsed=%.1fms",
+			tostring(reason or "unspecified"):gsub("[%c%s]", "_"):sub(1, 28), mode, tostring(candidate.Name),
+			(finishedAt - now) * 1000))
+	end)
+	return true
+end
+
+local function ConsumeThreatSafeCoinSearch(root, now, desiredMode, sourceTarget)
+	local threat = CoinEngine.ThreatResponse
+	local candidate = threat.SafeCoinSearchResult
+	if not candidate then return nil end
+	local mode = threat.SafeCoinSearchMode
+	if desiredMode and mode ~= desiredMode then return nil end
+	local age = now - (tonumber(threat.SafeCoinSearchResultAt) or 0)
+	local murderer = threat.Murderer or threat.CachedMurderer
+	local murderRoot = murderer and GetRoot(murderer)
+	if age < 0 or age > 0.45 or not root or not IsAvailable(candidate, now) or not IsThreatSafeCoin(candidate)
+		or murderer ~= threat.SafeCoinSearchMurderer or not murderRoot then
+		threat.SafeCoinSearchResult = nil
+		threat.SafeCoinSearchResultAt = 0
+		return nil
+	end
+	if sourceTarget and (mode ~= "prefetch" or threat.SafeCoinSearchSourceTarget ~= sourceTarget
+		or CoinEngine.CurrentTarget ~= sourceTarget or not sourceTarget.Parent
+		or not threat.SafeCoinSearchOrigin or (sourceTarget.Position - threat.SafeCoinSearchOrigin).Magnitude > 2.0) then
+		threat.SafeCoinSearchResult = nil
+		threat.SafeCoinSearchResultAt = 0
+		return nil
+	end
+	if mode == "route" then
+		local origin = threat.SafeCoinSearchOrigin
+		if not origin or (root.Position - origin).Magnitude > 7.0
+			or (murderRoot.Position - (threat.SafeCoinSearchMurderPosition or murderRoot.Position)).Magnitude > 8.0
+			or not IsSafeThreatCoinRoute(root, candidate, murderer, murderRoot, now, false) then
+			threat.SafeCoinSearchResult = nil
+			threat.SafeCoinSearchResultAt = 0
+			return nil
+		end
+	elseif mode == "prefetch" then
+		if not threat.SafeCoinSearchOrigin or not threat.SafeCoinSearchSourceTarget
+			then threat.SafeCoinSearchResult = nil; threat.SafeCoinSearchResultAt = 0; return nil end
+		if not IsSafeThreatCoinRouteFromPosition(root, candidate, murderer, murderRoot, now, false, threat.SafeCoinSearchOrigin) then
+			threat.SafeCoinSearchResult = nil
+			threat.SafeCoinSearchResultAt = 0
+			return nil
+		end
+	end
+	threat.SafeCoinSearchResult = nil
+	threat.SafeCoinSearchResultAt = 0
+	return candidate
+end
+
 local function MarkThreatSafeCoinRoute(threat, coin, murderer, now)
+	if threat.SafeCoinRouteValidationTarget ~= coin then
+		threat.SafeCoinRouteValidationToken = (tonumber(threat.SafeCoinRouteValidationToken) or 0) + 1
+		threat.SafeCoinRouteValidationPending = false
+		threat.SafeCoinRouteValidationTarget = nil
+	end
 	threat.SafeCoinRouteActive = coin ~= nil
 	threat.SafeCoinRouteTarget = coin
 	threat.SafeCoinRouteMurderer = coin and murderer or nil
@@ -9966,13 +10472,12 @@ local function UpdateThreatResponse(root, now)
 		end
 		if needsPrepare then
 			threat.NextEscapeDestinationAt = 0
-			local prepared = GetMurderEscapeDestination(root, murderer, now)
-			threat.EscapePreparedAt = now
-			threat.EscapePreparedOriginPosition = root.Position
-			threat.EscapePreparedMurderPosition = murderRoot.Position
-			if prepared then
-				LogEvent(string.format("murder-escape-prepared dist=%.1f closing=%.1f ttc=%.2f blocked=%d",
-					distance, closingSpeed, timeToCritical, threat.EscapePathBlocked and 1 or 0))
+			-- Preparation yields between a small number of raycasts; farm movement continues on
+			-- its current valid route while the next escape destination is being evaluated.
+			local queued = RequestMurderEscapeDestination(root, murderer, now)
+			if queued then
+				LogEvent(string.format("murder-escape-preparing dist=%.1f closing=%.1f ttc=%.2f pending=1",
+					distance, closingSpeed, timeToCritical))
 			end
 		end
 	end
@@ -10017,15 +10522,14 @@ local function UpdateThreatResponse(root, now)
 		if not safeTarget or not safeTarget.Parent or not IsThreatSafeCoin(safeTarget) then
 			ClearThreatSafeCoinRoute(threat)
 			safeCoinRouteInvalidated = true
-		elseif now >= (tonumber(threat.NextSafeCoinCheckAt) or 0) then
-			local routeOK = IsSafeThreatCoinRoute(root, safeTarget, murderer, murderRoot, now, true)
-			if routeOK then
-				threat.SafeCoinRouteCheckedAt = now
-				threat.NextSafeCoinCheckAt = now + 0.18
-			else
-				ClearThreatSafeCoinRoute(threat)
-				safeCoinRouteInvalidated = true
-			end
+		elseif not IsSafeThreatCoinRoute(root, safeTarget, murderer, murderRoot, now, false) then
+			-- Immediate low-cost safety check: if the threat gap/risk changed, do not keep the route.
+			ClearThreatSafeCoinRoute(threat)
+			safeCoinRouteInvalidated = true
+		elseif now >= (tonumber(threat.NextSafeCoinCheckAt) or 0) and not threat.SafeCoinRouteValidationPending then
+			-- Geometry is deferred so this movement step never waits for the route raycasts.
+			threat.NextSafeCoinCheckAt = now + 0.18
+			RequestThreatSafeRouteValidation(root, safeTarget, murderer, murderRoot, now)
 		end
 	end
 
@@ -10042,12 +10546,14 @@ local function UpdateThreatResponse(root, now)
 		if currentCoin and IsSafeThreatCoinRoute(root, currentCoin, murderer, murderRoot, now, true) then
 			MarkThreatSafeCoinRoute(threat, currentCoin, murderer, now)
 		else
-			local alternative = PickThreatCoin(root.Position, currentCoin, now, 6, true)
+			local alternative = ConsumeThreatSafeCoinSearch(root, now, "route")
 			if alternative then
 				MarkThreatSafeCoinRoute(threat, alternative, murderer, now)
 				LogEvent(string.format("murder-nearby-safe-coin-route dist=%.1f targetSep=%.1f target=%s",
 					distance, (alternative.Position - murderRoot.Position).Magnitude, tostring(alternative.Name)))
 				return "safe-coin-route", distance
+			else
+				RequestThreatSafeCoinSearch(root, currentCoin, now, 6, "nearby-threat")
 			end
 		end
 	end
@@ -10071,14 +10577,16 @@ local function UpdateThreatResponse(root, now)
 		-- committing to an escape waypoint that may lead toward the map edge. If none passes, escape wins.
 		threat.Active = true
 		threat.Murderer = murderer
-		local safeCoin = PickThreatCoin(root.Position, nil, now, 6, true)
+		local safeCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
 		if safeCoin and IsSafeThreatCoinRoute(root, safeCoin, murderer, murderRoot, now, false) then
 			MarkThreatSafeCoinRoute(threat, safeCoin, murderer, now)
 			threat.LastSeenAt = now
 			threat.LastDistance = distance
-			LogEvent(string.format("murder-safe-coin-route dist=%.1f targetSep=%.1f target=%s routeChecks=6",
+			LogEvent(string.format("murder-safe-coin-route dist=%.1f targetSep=%.1f target=%s routeChecks=cooperative",
 				distance, (safeCoin.Position - murderRoot.Position).Magnitude, tostring(safeCoin.Name)))
 			return "safe-coin-route", distance
+		else
+			RequestThreatSafeCoinSearch(root, nil, now, 6, "acute-threat")
 		end
 
 		-- The prepared escape destination is reusable only if still safe and increases separation.
@@ -10115,9 +10623,8 @@ local function UpdateThreatResponse(root, now)
 
 	-- If an escape was already active, periodically re-check safe coin alternatives. This is bounded
 	-- (one short candidate search every 0.45 s), and never steals control unless a route is verified.
-	if threat.EmergencyEscape and murderer and murderRoot and now >= (tonumber(threat.NextSafeCoinCheckAt) or 0) then
-		threat.NextSafeCoinCheckAt = now + 0.45
-		local safeCoin = PickThreatCoin(root.Position, nil, now, 6, true)
+	if threat.EmergencyEscape and murderer and murderRoot then
+		local safeCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
 		if safeCoin and IsSafeThreatCoinRoute(root, safeCoin, murderer, murderRoot, now, false) then
 			MarkThreatSafeCoinRoute(threat, safeCoin, murderer, now)
 			threat.LastSeenAt = now
@@ -10125,6 +10632,9 @@ local function UpdateThreatResponse(root, now)
 			LogEvent(string.format("murder-safe-coin-route recovered-from-escape dist=%.1f targetSep=%.1f target=%s",
 				distance, (safeCoin.Position - murderRoot.Position).Magnitude, tostring(safeCoin.Name)))
 			return "safe-coin-route", distance
+		elseif now >= (tonumber(threat.NextSafeCoinCheckAt) or 0) then
+			threat.NextSafeCoinCheckAt = now + 0.45
+			RequestThreatSafeCoinSearch(root, nil, now, 6, "escape-safe-alternative")
 		end
 	end
 
@@ -10226,7 +10736,8 @@ local function FindClearAlternativeCoin(root, blockedTarget, now)
 		-- During threat-aware rerouting, only use a coin whose whole route passed the strict
 		-- separation and physical-clearance checks. A soft fallback can keep the avatar chasing
 		-- a blocked or exposed coin and recreate the stall this branch is meant to resolve.
-		candidate = PickThreatCoin(root.Position, blockedTarget, now, 6, true)
+		candidate = ConsumeThreatSafeCoinSearch(root, now, "route")
+		if not candidate then RequestThreatSafeCoinSearch(root, blockedTarget, now, 6, "blocked-route-alternative") end
 		if candidate then
 			local threat = CoinEngine.ThreatResponse
 			MarkThreatSafeCoinRoute(threat, candidate, threat.Murderer or threat.CachedMurderer, now)
@@ -10446,16 +10957,12 @@ local function PrepareNext(now, force)
 
 	local nxt
 	if threatActive then
-		if CoinEngine.ThreatResponse.SafeCoinRouteActive or not CoinEngine.ThreatResponse.EmergencyEscape then
-			nxt = PickThreatCoin(cur.Position, cur, now, 2, true)
-			if not nxt and not CoinEngine.ThreatResponse.EmergencyEscape
-				and not CoinEngine.ThreatResponse.SafeCoinRouteActive then
-				-- Soft prefetch is used only before a strict safe route is latched. While such a route
-				-- is active, do not prefetch an unchecked destination that could replace it later.
-				nxt = PickThreatCoin(cur.Position, cur, now, 0, false)
-			end
+		if not CoinEngine.ThreatResponse.EmergencyEscape then
+			nxt = ConsumeThreatSafeCoinSearch(GetRoot(), now, "prefetch", cur)
+			if not nxt then RequestThreatSafeCoinSearch(GetRoot(), cur, now, 2, "next-target-prefetch", cur, cur.Position) end
 		else
-			nxt = PickThreatCoin(cur.Position, cur, now, 0, false)
+			-- Emergency escape owns movement; a future coin is not allowed to preempt it.
+			nxt = nil
 		end
 	else
 		nxt = PickNearest(cur.Position, cur, now, 0)
@@ -10546,9 +11053,9 @@ local function AdvanceTarget(root, now)
 	end
 	local c, safeRouteCandidate
 	if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
-		c = PickThreatCoin(root.Position, nil, now, 6, true)
+		c = ConsumeThreatSafeCoinSearch(root, now, "route")
 		safeRouteCandidate = c ~= nil
-		if not c and not CoinEngine.ThreatResponse.SafeCoinRouteActive then c = PickThreatCoin(root.Position, nil, now, 2, false) end
+		if not c then RequestThreatSafeCoinSearch(root, nil, now, 6, "advance-target") end
 	elseif CoinEngine.ThreatResponse.Active then
 		c = nil -- the emergency escape branch is the only movement authority in this state
 	else
@@ -10563,6 +11070,16 @@ local function AdvanceTarget(root, now)
 	else
 		CoinEngine.CurrentTarget = nil
 		CoinEngine.NextTarget = nil
+		if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
+			local threat = CoinEngine.ThreatResponse
+			threat.EmergencyEscape = true
+			threat.EmergencyEscapeStartedAt = now
+			threat.Murderer = threat.Murderer or threat.CachedMurderer
+			threat.EscapeDestination = nil
+			threat.EscapeDestinationComputedAt = 0
+			threat.NextEscapeDestinationAt = 0
+			RequestMurderEscapeDestination(root, threat.Murderer, now)
+		end
 		-- Sin objetivo, espera al proximo evento de cache o al vencimiento pertinente; evita
 		-- repetir la misma busqueda en cada frame. RegisterCoin despierta el selector al instante.
 		local retryDelay = CoinEngine.ThreatResponse.Active and 0.10 or 0.20
@@ -12549,11 +13066,13 @@ local function ControllerStep(dt)
 		if saferCoin and (not saferCoin.Parent or not IsThreatSafeCoin(saferCoin)) then saferCoin = nil; verifiedSafeRoute = false end
 		if not saferCoin and not threat.EmergencyEscape then
 			if safeRouteTransition then
-				saferCoin = PickThreatCoin(root.Position, nil, now, 4, true)
+				saferCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
+				if not saferCoin then RequestThreatSafeCoinSearch(root, nil, now, 4, "threat-transition") end
 				verifiedSafeRoute = saferCoin ~= nil
 				if saferCoin then MarkThreatSafeCoinRoute(threat, saferCoin, threat.Murderer or threat.CachedMurderer, now) end
 			else
-				saferCoin = PickThreatCoin(root.Position, nil, now, 6, true)
+				saferCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
+				if not saferCoin then RequestThreatSafeCoinSearch(root, nil, now, 6, "threat-transition") end
 				verifiedSafeRoute = saferCoin ~= nil
 				-- Do not substitute a coin whose route was never verified while an urgent threat owns movement.
 			end
@@ -12583,7 +13102,8 @@ local function ControllerStep(dt)
 			threat.SafeCoinRouteActive and 1 or 0))
 	elseif threatTransition == "safe-coin-route-invalid" then
 		local threat = CoinEngine.ThreatResponse
-		local replacement = PickThreatCoin(root.Position, CoinEngine.CurrentTarget, now, 4, true)
+		local replacement = ConsumeThreatSafeCoinSearch(root, now, "route")
+		if not replacement then RequestThreatSafeCoinSearch(root, CoinEngine.CurrentTarget, now, 4, "current-route-invalid") end
 		if replacement then
 			MarkThreatSafeCoinRoute(threat, replacement, threat.Murderer or threat.CachedMurderer, now)
 			SetCurrent(replacement, now)
@@ -12676,7 +13196,7 @@ local function ControllerStep(dt)
 		end
 		SetStatus("murder-escape")
 		EnsureFlight(root, hum)
-		local destination = GetMurderEscapeDestination(root, threat.Murderer, now)
+		local destination = GetEscapeDestinationForMovement(root, threat.Murderer, now)
 		UpdateAutoNoclip(root, nil, now, destination)
 		local escapeLocalNoclipMove = CoinEngine.NoclipWanted
 			and (CoinEngine.AutoNoclipMode == "exit-solid" or CoinEngine.AutoNoclipMode == "escape-route")
@@ -12764,9 +13284,9 @@ local function ControllerStep(dt)
 		threat.NextRouteCheckAt = now + threat.RouteCheckInterval
 		local cur = CoinEngine.CurrentTarget
 		if not cur or not IsAvailable(cur, now) or not IsThreatSafeCoin(cur) then
-			local saferCoin = PickThreatCoin(root.Position, nil, now, 6, true)
+			local saferCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
 			local verifiedSafeRoute = saferCoin ~= nil
-			if not saferCoin and not threat.EmergencyEscape and not threat.SafeCoinRouteActive then saferCoin = PickThreatCoin(root.Position, nil, now, 2, false) end
+			if not saferCoin then RequestThreatSafeCoinSearch(root, cur, now, 6, "threat-route-check") end
 			if saferCoin and saferCoin ~= cur then
 				if verifiedSafeRoute then MarkThreatSafeCoinRoute(threat, saferCoin, threat.Murderer or threat.CachedMurderer, now) end
 				SetCurrent(saferCoin, now)
@@ -12837,9 +13357,9 @@ local function ControllerStep(dt)
 		if cur and cur.Parent and not routeHold and now >= (targetLockUntil or 0) then
 			local cand, candidateIsSafeRoute
 			if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
-				cand = PickThreatCoin(root.Position, nil, now, 6, true)
+				cand = ConsumeThreatSafeCoinSearch(root, now, "route")
 				candidateIsSafeRoute = cand ~= nil
-				if not cand and not CoinEngine.ThreatResponse.SafeCoinRouteActive then cand = PickThreatCoin(root.Position, nil, now, 1, false) end
+				if not cand then RequestThreatSafeCoinSearch(root, nil, now, 6, "target-improvement") end
 			elseif CoinEngine.ThreatResponse.Active then
 				cand = nil
 			else
@@ -13310,8 +13830,11 @@ local function ControllerStep(dt)
 					local chainNext = CanChainTo(chainCoin)
 					CoinEngine.LastChainCommandMs = nil
 					if not chainNext then
-						if CoinEngine.ThreatResponse.Active then
-							chainCoin = PickThreatCoin(root.Position, target, now, 4, not CoinEngine.ThreatResponse.EmergencyEscape)
+						if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
+							chainCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
+							if not chainCoin then RequestThreatSafeCoinSearch(root, target, now, 4, "post-collect-chain") end
+						elseif CoinEngine.ThreatResponse.Active then
+							chainCoin = nil -- escape remains the sole motion priority until a safe route is ready
 						else
 							chainCoin = PickNearest(root.Position, target, now)
 						end
