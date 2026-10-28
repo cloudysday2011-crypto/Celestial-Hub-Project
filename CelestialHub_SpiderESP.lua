@@ -1,5 +1,5 @@
--- CELESTIAL HUB v3.48: cooperative threat-route planning sliced across scheduler resumes, cached decisions during movement, and single movement authority; adaptive NoClip internals preserved.
--- V3.49 localized recovery fix: no age-only cap for ordinary flight; 9s/20s descent watchdogs and a 10s wall-crossing ceiling remain separate.
+-- CELESTIAL HUB AUTOFARM EXTREME V9: async 10->10->20 coin batches, predictive Murder escape, coverage-aware scoring; single movement authority preserved.
+-- Preserves uncapped normal-flight duration, separate 9s/20s descent watchdogs, and the 10s wall-crossing ceiling.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
 -- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
@@ -6504,7 +6504,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 end)
 
 -- ====================================================================
--- CELESTIAL HUB AUTOFARM EXTREME V8: lotes de hasta 5 monedas + reposicion anticipada + encadenamiento continuo
+-- CELESTIAL HUB AUTOFARM EXTREME V9: lotes dinamicos 10->10->20 + escape predictivo + cobertura
 -- Mantiene el registro incremental por eventos y el unico controlador fisico de movimiento existente.
 -- AUTO-FARM V3.10: seleccion de monedas con prioridad horizontal, suelo cercano y frenado anticipado\n-- COIN FARMING SYSTEM (v2: OBJETIVOS DINAMICOS / MOVIMIENTO CONTINUO)
 -- Gestor de monedas (cache incremental por eventos) + selector de objetivos
@@ -6541,20 +6541,44 @@ local CoinEngine = {
 	NextTargetCacheRevision = -1,
 	NextTargetPreparedAt = 0,
 	NextTargetOriginPosition = nil,
-	-- V8: lote compartido de hasta cinco objetivos, sin detectores ni bucles de movimiento adicionales.
+	-- V9: active batch + prefetched batch share the event-fed cache and one background builder.
 	BatchTargets = {},
-	BatchSize = 5,
-	BatchRefreshInterval = 5.0,
-	BatchNextRefreshAt = 0, -- periodic full replan, every five seconds
-	BatchNextRepairAt = 0,  -- event-driven vacancy repair; never moves the periodic deadline
+	BatchNextTargets = {},
+	BatchSize = 10,
+	BatchActiveCapacity = 10,
+	BatchNextCapacity = 10,
+	BatchCollectedCount = 0,          -- only confirmed post-touch instance removals count
+	BatchPendingCollectCount = 0,
+	BatchGeneration = 0,
+	BatchNextReady = false,
 	BatchNeedsRefresh = true,
+	BatchNextNeedsRefresh = true,
+	BatchRefreshInterval = 5.0,
+	BatchNextRefreshAt = 0,
+	BatchNextRepairAt = 0,
+	BatchNextRepairRevision = -1,
+	BatchNextPrefetchExpanded = false,
 	BatchLastBuildAt = 0,
 	BatchLastRevision = -1,
 	BatchBuildCount = 0,
 	BatchLastBuildMs = 0,
 	BatchLastSelectedCount = 0,
+	BatchBuildToken = 0,
+	BatchBuildPending = false,
+	BatchBuildMode = nil,
+	BatchBuildRequestedSize = 0,
+	BatchPrefetchStartedForGeneration = -1,
+	PendingCollectConfirmations = setmetatable({}, {__mode = "k"}),
+	PendingCollectTimeout = 5.0,
+	PendingCollectSweepAt = 0,
+	CoinCoverageCache = setmetatable({}, {__mode = "k"}),
 	LastTouchRequestCompleteAt = 0,
 	LastTouchToMovementMs = -1,
+	LastObservedCollectionAt = 0,
+	LastObservedCollectionCoin = nil,
+	LastObservedCollectionToChainCommandMs = -1,
+	LastChainCommandAt = 0,
+	LastChainCommandSourceCoin = nil,
 	CoinNeighborCount = setmetatable({}, {__mode = "k"}), -- densidad local, actualizada por eventos
 	CoinPositionSnapshot = setmetatable({}, {__mode = "k"}),
 	CoinSpatialCells = {},
@@ -6592,18 +6616,22 @@ local CoinEngine = {
 	ThreatResponse = {
 		Enabled = true,
 		EnterDistance = 15,       -- amenaza ordinaria
-		ReleaseDistance = 35,     -- zona de salida con histéresis
-		SafeDistance = 35,
-		CriticalEscapeDistance = 30, -- menos de 30 studs: evasión prioritaria aunque no haya LOS
+		ReleaseDistance = 50,     -- rearma el farmeo solo cuando hay separación estable
+		SafeDistance = 50,
+		CriticalEscapeDistance = 30, -- legacy hard fallback; immediate threshold is tracked separately
+		ImmediateCriticalDistance = 20,
+		CoverageRiskDistance = 45,
+		CoverageRiskActive = false,
+		CoverageRiskSince = 0,
 		RapidCloseFromDistance = 38, -- detecta el cruce rápido desde la zona exterior
 		RapidCloseTriggerDistance = 30,
 		RapidCloseWindow = 0.85,
 		-- Prediction is sampled on a stable time interval instead of noisy per-frame deltas.
-		PredictivePrepareDistance = 50,
-		PredictivePrepareClosingSpeed = 6,
-		PredictivePrepareTTC = 2.2,
-		PredictiveEscapeClosingSpeed = 10,
-		PredictiveEscapeTTC = 0.80,
+		PredictivePrepareDistance = 55,
+		PredictivePrepareClosingSpeed = 4,
+		PredictivePrepareTTC = 5.0,
+		PredictiveEscapeClosingSpeed = 8,
+		PredictiveEscapeTTC = 1.80,
 		ClosingSampleInterval = 0.08,
 		ClosingSpeedSamples = 0,
 		LastMeasuredMurderer = nil,
@@ -7311,7 +7339,7 @@ local function RegisterCoin(coin)
 	CoinEngine.CoinCount += 1
 	CoinEngine.CoinCacheRevision += 1
 	CoinEngine.NextTargetCacheRevision = -1
-	if #(CoinEngine.BatchTargets or {}) < (tonumber(CoinEngine.BatchSize) or 5) then
+	if #(CoinEngine.BatchTargets or {}) < (tonumber(CoinEngine.BatchSize) or 10) then
 		CoinEngine.BatchNeedsRefresh = true
 		CoinEngine.BatchNextRepairAt = math.min(tonumber(CoinEngine.BatchNextRepairAt) or 0, os.clock())
 	end
@@ -7319,7 +7347,12 @@ local function RegisterCoin(coin)
 	nextPrepareAt = 0
 end
 
-local function UnregisterCoin(coin)
+local function UnregisterCoin(coin, removalReason)
+	if removalReason == "descendant-removing" then
+		if CoinEngine.ConfirmPendingCollection then CoinEngine.ConfirmPendingCollection(coin, os.clock()) end
+	elseif CoinEngine.CancelPendingCollection then
+		CoinEngine.CancelPendingCollection(coin)
+	end
 	if CoinEngine.CoinCache[coin] then
 		UpdateCoinNeighborhood(coin, false)
 		CoinEngine.CoinCache[coin] = nil
@@ -7333,13 +7366,24 @@ local function UnregisterCoin(coin)
 	CoinEngine.Attempts[coin] = nil
 	CoinEngine.GroundOk[coin] = nil
 	CoinEngine.RouteCheckCache[coin] = nil
-	local batchChanged = false
+	local batchChanged, nextBatchChanged = false, false
 	for i = #(CoinEngine.BatchTargets or {}), 1, -1 do
 		if CoinEngine.BatchTargets[i] == coin then
 			table.remove(CoinEngine.BatchTargets, i)
 			batchChanged = true
 		end
 	end
+	for i = #(CoinEngine.BatchNextTargets or {}), 1, -1 do
+		if CoinEngine.BatchNextTargets[i] == coin then
+			table.remove(CoinEngine.BatchNextTargets, i)
+			nextBatchChanged = true
+		end
+	end
+	if nextBatchChanged then
+		CoinEngine.BatchNextNeedsRefresh = true
+		CoinEngine.BatchNextRepairAt = os.clock()
+	end
+	CoinEngine.CoinCoverageCache[coin] = nil
 	if batchChanged then
 		CoinEngine.BatchNeedsRefresh = true
 		CoinEngine.BatchNextRepairAt = os.clock()
@@ -7450,7 +7494,10 @@ local function OnDescendantAdded(obj)
 end
 
 local function OnDescendantRemoving(obj)
-	if CoinEngine.CoinCache[obj] then UnregisterCoin(obj) end
+	if CoinEngine.CoinCache[obj] then UnregisterCoin(obj, "descendant-removing")
+	elseif CoinEngine.PendingCollectConfirmations and CoinEngine.PendingCollectConfirmations[obj] then
+		if CoinEngine.ConfirmPendingCollection then CoinEngine.ConfirmPendingCollection(obj, os.clock()) end
+	end
 end
 
 local function ResetPath()
@@ -7461,9 +7508,15 @@ local function ResetPath()
 	CoinEngine.NextTargetPreparedAt = 0
 	CoinEngine.NextTargetOriginPosition = nil
 	table.clear(CoinEngine.BatchTargets)
+	CoinEngine.BatchBuildToken = (CoinEngine.BatchBuildToken or 0) + 1
+	CoinEngine.BatchBuildPending = false
+	CoinEngine.BatchBuildMode = nil
+	CoinEngine.BatchBuildRequestedSize = 0
 	CoinEngine.BatchNeedsRefresh = true
 	CoinEngine.BatchNextRefreshAt = 0
 	CoinEngine.BatchNextRepairAt = 0
+	CoinEngine.BatchNextRepairRevision = -1
+	CoinEngine.BatchNextPrefetchExpanded = false
 	CoinEngine.BatchLastRevision = -1
 	bestDist = math.huge
 	noTargetUntil = 0
@@ -7508,6 +7561,23 @@ local function Deactivate()
 	table.clear(CoinEngine.GroundOk)
 	table.clear(CoinEngine.RouteCheckCache)
 	table.clear(CoinEngine.BatchTargets)
+	table.clear(CoinEngine.BatchNextTargets)
+	table.clear(CoinEngine.PendingCollectConfirmations)
+	table.clear(CoinEngine.CoinCoverageCache)
+	CoinEngine.BatchBuildToken = (CoinEngine.BatchBuildToken or 0) + 1
+	CoinEngine.BatchBuildPending = false
+	CoinEngine.BatchBuildMode = nil
+	CoinEngine.BatchBuildRequestedSize = 0
+	CoinEngine.BatchCollectedCount = 0
+	CoinEngine.BatchPendingCollectCount = 0
+	CoinEngine.BatchGeneration = (CoinEngine.BatchGeneration or 0) + 1
+	CoinEngine.BatchActiveCapacity = 10
+	CoinEngine.BatchNextCapacity = 10
+	CoinEngine.BatchNextReady = false
+	CoinEngine.BatchNextNeedsRefresh = true
+	CoinEngine.BatchPrefetchStartedForGeneration = -1
+	CoinEngine.BatchNextPrefetchExpanded = false
+	CoinEngine.BatchNextRepairRevision = -1
 	CoinEngine.BatchNeedsRefresh = true
 	CoinEngine.BatchNextRefreshAt = 0
 	CoinEngine.BatchNextRepairAt = 0
@@ -10059,6 +10129,8 @@ local function IsSafeThreatCoinRoute(root, coin, murderer, murderRoot, now, chec
 		routeGap = math.min(GapTo(murderPos), GapTo(predictedPos))
 	end
 	if routeGap < math.max(8.0, startGap - 4.0) then return false end
+	if CoinEngine.ThreatResponse.CoverageRiskActive and endGap <= (tonumber(CoinEngine.ThreatResponse.CoverageRiskDistance) or 45)
+		and CoinEngine.IsCoinCoveredFromMurderer and not CoinEngine.IsCoinCoveredFromMurderer(coin, murderer, now) then return false end
 	local delta = coinPos - fromPos
 	local verticalGap = math.abs(delta.Y)
 	local highDrop = delta.Y <= -(tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
@@ -10146,6 +10218,8 @@ local function IsSafeThreatCoinRouteFromPosition(root, coin, murderer, murderRoo
 		routeGap = math.min(GapTo(murderPos), GapTo(predictedPos))
 	end
 	if routeGap < math.max(8.0, startGap - 4.0) then return false end
+	if CoinEngine.ThreatResponse.CoverageRiskActive and endGap <= (tonumber(CoinEngine.ThreatResponse.CoverageRiskDistance) or 45)
+		and CoinEngine.IsCoinCoveredFromMurderer and not CoinEngine.IsCoinCoveredFromMurderer(coin, murderer, now) then return false end
 	local delta = coinPos - fromPos
 	local verticalGap = math.abs(delta.Y)
 	local highDrop = delta.Y <= -(tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
@@ -10326,6 +10400,9 @@ local function UpdateThreatResponse(root, now)
 		threat.Murderer = nil
 		threat.CachedMurderer = nil
 		threat.CoinThreatSnapshot = nil
+		threat.CoverageRiskActive = false
+		threat.CoverageRiskSince = 0
+		threat.CoverageSearchDeadline = 0
 		ClearThreatSafeCoinRoute(threat)
 		threat.LastDistance = math.huge
 		threat.LastMeasuredMurderer = nil
@@ -10354,6 +10431,9 @@ local function UpdateThreatResponse(root, now)
 		threat.Murderer = nil
 		threat.CachedMurderer = nil
 		threat.CoinThreatSnapshot = nil
+		threat.CoverageRiskActive = false
+		threat.CoverageRiskSince = 0
+		threat.CoverageSearchDeadline = 0
 		ClearThreatSafeCoinRoute(threat)
 		if threat.CoinDangerState then table.clear(threat.CoinDangerState) end
 		threat.LastDistance = math.huge
@@ -10446,6 +10526,9 @@ local function UpdateThreatResponse(root, now)
 		threat.EscapeDestination = nil
 		threat.EscapeDestinationComputedAt = 0
 		threat.EscapePreparedFor = nil
+		threat.CoverageRiskActive = false
+		threat.CoverageRiskSince = 0
+		threat.CoverageSearchDeadline = 0
 	end
 
 	-- LOS is shared by prediction and the hard proximity response; this cached ray is not
@@ -10467,18 +10550,50 @@ local function UpdateThreatResponse(root, now)
 	end
 
 	local closingSpeed = math.max(0, tonumber(threat.LastClosingSpeed) or 0)
+	local immediateDistance = tonumber(threat.ImmediateCriticalDistance) or 20
 	local timeToCritical = closingSpeed > 0 and math.max(0, distance - (tonumber(threat.CriticalEscapeDistance) or 30)) / closingSpeed or math.huge
+	local timeToImmediate = closingSpeed > 0 and math.max(0, distance - immediateDistance) / closingSpeed or math.huge
 	local predictivePrepare = murderer ~= nil and murderRoot ~= nil
-		and distance <= (tonumber(threat.PredictivePrepareDistance) or 50)
-		and closingSpeed >= (tonumber(threat.PredictivePrepareClosingSpeed) or 6)
+		and distance <= (tonumber(threat.PredictivePrepareDistance) or 55)
+		and closingSpeed >= (tonumber(threat.PredictivePrepareClosingSpeed) or 4)
 		and (tonumber(threat.ClosingSpeedSamples) or 0) >= 1
-		and ((distance - (tonumber(threat.CriticalEscapeDistance) or 30)) / math.max(closingSpeed, 1)) <= (tonumber(threat.PredictivePrepareTTC) or 2.2)
-	local predictiveEmergency = murderer ~= nil and murderRoot ~= nil
-		and distance <= (tonumber(threat.PredictivePrepareDistance) or 50)
-		and closingSpeed >= (tonumber(threat.PredictiveEscapeClosingSpeed) or 10)
-		and (tonumber(threat.ClosingSpeedSamples) or 0) >= 2
-		and timeToCritical <= (tonumber(threat.PredictiveEscapeTTC) or 0.80)
-		and (clearShotLane or distance <= (tonumber(threat.SafeDistance) or 35))
+		and timeToCritical <= (tonumber(threat.PredictivePrepareTTC) or 5.0)
+	local predictiveEmergency = murderer ~= nil and murderRoot ~= nil and (
+		distance <= immediateDistance
+		or (distance <= (tonumber(threat.CriticalEscapeDistance) or 30)
+			and closingSpeed >= (tonumber(threat.PredictiveEscapeClosingSpeed) or 8)
+			and (tonumber(threat.ClosingSpeedSamples) or 0) >= 2
+			and timeToImmediate <= (tonumber(threat.PredictiveEscapeTTC) or 1.8))
+		-- At about 35 studs, escape early only when several real samples show a fast approach
+		-- and the LOS is open. Slower approaches enter the coverage-routing branch instead.
+		or (distance <= 35 and closingSpeed >= 6
+			and (tonumber(threat.ClosingSpeedSamples) or 0) >= 2
+			and timeToImmediate <= 2.5 and clearShotLane)
+		or (distance <= (tonumber(threat.CoverageRiskDistance) or 45)
+			and closingSpeed >= 12 and (tonumber(threat.ClosingSpeedSamples) or 0) >= 2
+			and timeToImmediate <= 1.25 and clearShotLane))
+	local hardUrgent = murderer ~= nil and murderRoot ~= nil and (
+		distance <= immediateDistance or predictiveEmergency or rapidCriticalCross
+		or (distance < (tonumber(threat.CriticalEscapeDistance) or 30) and clearShotLane))
+	local coverageRisk = murderer ~= nil and murderRoot ~= nil
+		and distance >= (tonumber(threat.CriticalEscapeDistance) or 30)
+		and distance <= (tonumber(threat.CoverageRiskDistance) or 45)
+		and clearShotLane and not hardUrgent
+	local coverageRiskBecameActive = coverageRisk and not threat.Active
+	threat.CoverageRiskActive = coverageRisk
+	if coverageRisk then
+		threat.CoverageRiskSince = tonumber(threat.CoverageRiskSince) or now
+		if coverageRiskBecameActive then
+			threat.Active = true
+			threat.Murderer = murderer
+			threat.LastSeenAt = now
+			threat.LastDistance = distance
+			threat.CoverageSearchDeadline = now + 0.22
+			LogEvent(string.format("murder-coverage-risk dist=%.1f closing=%.1f los=1", distance, closingSpeed))
+		end
+	else
+		threat.CoverageRiskSince = 0
+	end
 
 	-- Prepare a usable escape destination while a reliable approach trend is developing.
 	-- This is planning only: farming keeps moving until the threat becomes urgent.
@@ -10539,6 +10654,8 @@ local function UpdateThreatResponse(root, now)
 		ClearThreatSafeCoinRoute(threat)
 		threat.Active = false
 		threat.EmergencyEscape = false
+		threat.CoverageRiskActive = false
+		threat.CoverageSearchDeadline = 0
 		threat.EscapeDestination = nil
 		threat.EscapePathBlocked = false
 		threat.CheckedEscapeDestination = nil
@@ -10577,9 +10694,9 @@ local function UpdateThreatResponse(root, now)
 	-- safer coin route over continuing to farm the currently exposed pocket. This check is bounded
 	-- to one attempt every 0.45 s and never runs during a predicted/critical emergency.
 	if threat.Active and not threat.EmergencyEscape and murderer and murderRoot
-		and distance <= (tonumber(threat.CoinDangerReleaseDistance) or 36)
+		and (distance <= (tonumber(threat.CoinDangerReleaseDistance) or 36) or coverageRisk)
 		and distance > (tonumber(threat.CriticalEscapeDistance) or 30)
-		and not rapidCriticalCross and not predictivePrepare and not predictiveEmergency
+		and not hardUrgent and not rapidCriticalCross and not predictivePrepare and not predictiveEmergency
 		and not threat.SafeCoinRouteActive and now >= (tonumber(threat.NextSafeCoinCheckAt) or 0) then
 		threat.NextSafeCoinCheckAt = now + 0.45
 		local currentCoin = CoinEngine.CurrentTarget
@@ -10604,7 +10721,7 @@ local function UpdateThreatResponse(root, now)
 		and distance < (threat.CriticalEscapeDistance or 30)
 	local acuteThreat = criticalProximity or rapidCriticalCross or predictiveEmergency
 	if acuteThreat and not threat.EmergencyEscape then
-		if threat.SafeCoinRouteActive and threat.SafeCoinRouteMurderer == murderer
+		if not hardUrgent and threat.SafeCoinRouteActive and threat.SafeCoinRouteMurderer == murderer
 			and threat.SafeCoinRouteTarget and threat.SafeCoinRouteTarget.Parent then
 			threat.Active = true
 			threat.Murderer = murderer
@@ -10617,7 +10734,7 @@ local function UpdateThreatResponse(root, now)
 		-- committing to an escape waypoint that may lead toward the map edge. If none passes, escape wins.
 		threat.Active = true
 		threat.Murderer = murderer
-		local safeCoin = ConsumeThreatSafeCoinSearch(root, now, "route")
+		local safeCoin = not hardUrgent and ConsumeThreatSafeCoinSearch(root, now, "route") or nil
 		if safeCoin and IsSafeThreatCoinRoute(root, safeCoin, murderer, murderRoot, now, false) then
 			MarkThreatSafeCoinRoute(threat, safeCoin, murderer, now)
 			threat.LastSeenAt = now
@@ -10625,7 +10742,7 @@ local function UpdateThreatResponse(root, now)
 			LogEvent(string.format("murder-safe-coin-route dist=%.1f targetSep=%.1f target=%s routeChecks=cooperative",
 				distance, (safeCoin.Position - murderRoot.Position).Magnitude, tostring(safeCoin.Name)))
 			return "safe-coin-route", distance
-		else
+		elseif not hardUrgent then
 			RequestThreatSafeCoinSearch(root, nil, now, 6, "acute-threat")
 		end
 
@@ -10678,7 +10795,7 @@ local function UpdateThreatResponse(root, now)
 		end
 	end
 
-	if safeCoinRouteInvalidated and not acuteThreat then
+	if safeCoinRouteInvalidated and not acuteThreat and not coverageRiskBecameActive then
 		return "safe-coin-route-invalid", distance
 	end
 
@@ -10750,7 +10867,10 @@ local function UpdateThreatResponse(root, now)
 		end
 	end
 
-	if wasActive ~= threat.Active then return threat.Active and "entered" or "released", distance end
+	if wasActive ~= threat.Active then
+		if coverageRiskBecameActive and threat.Active and not threat.EmergencyEscape then return "coverage-risk", distance end
+		return threat.Active and "entered" or "released", distance
+	end
 	return nil, distance
 end
 
@@ -10970,13 +11090,52 @@ CoinEngine.UpdateChainGroupState = function(root, now)
 end
 
 -- ====================================================================
--- V8 BATCH SELECTOR: one cache pass, up to five targets, greedy route order.
+-- V9 BATCH SELECTOR: cooperative 10 -> 10 -> 20 queue, predictive threat priority, greedy route order.
 -- The batch is only a plan; every leg is still revalidated by the existing controller.
 -- ====================================================================
+-- Coverage is sampled only for shortlisted coins, then reused briefly across route scoring.
+CoinEngine.coverageRayParams = RaycastParams.new()
+CoinEngine.coverageRayParams.FilterType = Enum.RaycastFilterType.Exclude
+CoinEngine.coverageRayParams.RespectCanCollide = true
+CoinEngine.IsCoinCoveredFromMurderer = function(coin, murderer, now)
+	if not (coin and coin.Parent and murderer and murderer.Parent == Players) then return false end
+	now = tonumber(now) or os.clock()
+	local murderRoot = GetRoot(murderer)
+	if not murderRoot then return false end
+	local murderPos = murderRoot.Position
+	local coinPos = GetCoinPositionSnapshot(coin) or coin.Position
+	local cached = CoinEngine.CoinCoverageCache[coin]
+	if cached and cached.murderer == murderer and now - (cached.at or 0) <= 0.40
+		and (cached.murderPos - murderPos).Magnitude <= 3.0
+		and (cached.coinPos - coinPos).Magnitude <= 1.5 then
+		return cached.covered == true
+	end
+	local ignore = {}
+	if murderer.Character then ignore[#ignore + 1] = murderer.Character end
+	if LocalPlayer and LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	CoinEngine.coverageRayParams.FilterDescendantsInstances = ignore
+	local origin = murderPos + Vector3.new(0, 1.2, 0)
+	local destination = coinPos + Vector3.new(0, 0.6, 0)
+	local ray = destination - origin
+	local covered = false
+	if ray.Magnitude > 0.1 then
+		local ok, hit = pcall(function()
+			return Workspace:Raycast(origin, ray, CoinEngine.coverageRayParams)
+		end)
+		covered = ok and hit ~= nil and hit.Instance ~= coin
+	end
+	CoinEngine.CoinCoverageCache[coin] = {
+		murderer = murderer, murderPos = murderPos, coinPos = coinPos,
+		at = now, covered = covered,
+	}
+	return covered
+end
+
 CoinEngine.BatchCoinEligible = function(coin, origin, now, excludeSet)
 	if not coin or (excludeSet and excludeSet[coin]) then return false end
 	if not IsAvailable(coin, now) or not IsThreatSafeCoin(coin) then return false end
-	if CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape then return false end
+	local threat = CoinEngine.ThreatResponse
+	if threat.Active and threat.EmergencyEscape then return false end
 	local pos = GetCoinPositionSnapshot(coin) or coin.Position
 	local delta = pos - origin
 	local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
@@ -10986,17 +11145,107 @@ CoinEngine.BatchCoinEligible = function(coin, origin, now, excludeSet)
 		and -delta.Y <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
 		and horizontal <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
 	if delta.Magnitude > maxDistance or (math.abs(delta.Y) > maxGap and not highDrop) then return false end
+	if threat.Active and threat.Murderer then
+		local murderRoot = GetRoot(threat.Murderer)
+		if not murderRoot or not IsSafeThreatCoinRouteFromPosition(GetRoot(), coin, threat.Murderer, murderRoot, now, false, origin) then
+			return false
+		end
+		local coinGap = (pos - murderRoot.Position).Magnitude
+		if threat.CoverageRiskActive and coinGap <= (tonumber(threat.CoverageRiskDistance) or 45)
+			and not CoinEngine.IsCoinCoveredFromMurderer(coin, threat.Murderer, now) then
+			return false
+		end
+	end
 	return true
 end
 
-CoinEngine.RemoveCoinFromBatch = function(coin, now)
+CoinEngine.TrackPendingCollection = function(coin, now)
+	if not coin or CoinEngine.DiagNoCollect then return false end
+	local pending = CoinEngine.PendingCollectConfirmations[coin]
+	if pending then return true end
+	local inActiveBatch = false
+	for _, item in ipairs(CoinEngine.BatchTargets) do
+		if item == coin then inActiveBatch = true; break end
+	end
+	CoinEngine.PendingCollectConfirmations[coin] = {
+		requestedAt = tonumber(now) or os.clock(),
+		generation = tonumber(CoinEngine.BatchGeneration) or 0,
+		wasBatchTarget = inActiveBatch,
+	}
+	CoinEngine.BatchPendingCollectCount = (CoinEngine.BatchPendingCollectCount or 0) + (inActiveBatch and 1 or 0)
+	return true
+end
+
+CoinEngine.CancelPendingCollection = function(coin)
+	local pending = coin and CoinEngine.PendingCollectConfirmations[coin]
+	if not pending then return false end
+	CoinEngine.PendingCollectConfirmations[coin] = nil
+	if pending.wasBatchTarget then
+		CoinEngine.BatchPendingCollectCount = math.max(0, (CoinEngine.BatchPendingCollectCount or 0) - 1)
+	end
+	return true
+end
+
+CoinEngine.ConfirmPendingCollection = function(coin, now)
+	local pending = coin and CoinEngine.PendingCollectConfirmations[coin]
+	if not pending then return false end
+	CoinEngine.PendingCollectConfirmations[coin] = nil
+	if pending.wasBatchTarget then
+		CoinEngine.BatchPendingCollectCount = math.max(0, (CoinEngine.BatchPendingCollectCount or 0) - 1)
+		if pending.generation == (CoinEngine.BatchGeneration or 0) then
+			CoinEngine.BatchCollectedCount = (CoinEngine.BatchCollectedCount or 0) + 1
+		end
+	end
+	-- This is an observed client instance removal after a successful touch request, not a server ACK.
+	now = tonumber(now) or os.clock()
+	CoinEngine.LastObservedCollectionAt = now
+	CoinEngine.LastObservedCollectionCoin = coin
+	coinsCollectedTotal += 1
+	CoinEngine.BatchNeedsRefresh = true
+	CoinEngine.BatchNextRepairAt = now
+	if CoinEngine.LastChainCommandSourceCoin == coin and (tonumber(CoinEngine.LastChainCommandAt) or 0) > 0
+		and now >= (tonumber(CoinEngine.LastChainCommandAt) or 0) then
+		local afterCommandMs = (now - CoinEngine.LastChainCommandAt) * 1000
+		LogEvent(string.format("coin-removal-observed-after-chain-command delay-ms=%.2f ordering=movement-before-observed-removal batch=%d",
+			afterCommandMs, CoinEngine.BatchCollectedCount or 0))
+	end
+	LogEvent(string.format("coin-removal-observed count=%d generation=%d pending-request-age-ms=%.2f",
+		coinsCollectedTotal, CoinEngine.BatchGeneration or 0,
+		math.max(0, (now - (tonumber(pending.requestedAt) or now)) * 1000)))
+	return true
+end
+
+CoinEngine.SweepPendingCollectConfirmations = function(now)
+	now = tonumber(now) or os.clock()
+	if now < (tonumber(CoinEngine.PendingCollectSweepAt) or 0) then return end
+	CoinEngine.PendingCollectSweepAt = now + 0.20
+	for coin, pending in pairs(CoinEngine.PendingCollectConfirmations) do
+		if not coin.Parent then
+			CoinEngine.ConfirmPendingCollection(coin, now)
+		elseif now - (tonumber(pending.requestedAt) or now) >= (tonumber(CoinEngine.PendingCollectTimeout) or 5.0) then
+			CoinEngine.CancelPendingCollection(coin)
+		end
+	end
+end
+
+CoinEngine.RemoveCoinFromBatch = function(coin, now, requestPending)
 	if not coin then return false end
-	local removed = false
+	local removed, removedNext = false, false
 	for i = #(CoinEngine.BatchTargets or {}), 1, -1 do
 		if CoinEngine.BatchTargets[i] == coin then
 			table.remove(CoinEngine.BatchTargets, i)
 			removed = true
 		end
+	end
+	for i = #(CoinEngine.BatchNextTargets or {}), 1, -1 do
+		if CoinEngine.BatchNextTargets[i] == coin then
+			table.remove(CoinEngine.BatchNextTargets, i)
+			removedNext = true
+		end
+	end
+	if removedNext then
+		CoinEngine.BatchNextNeedsRefresh = true
+		CoinEngine.BatchNextRepairAt = tonumber(now) or os.clock()
 	end
 	if removed then
 		CoinEngine.BatchNeedsRefresh = true
@@ -11008,218 +11257,481 @@ end
 CoinEngine.SyncBatchForCurrent = function(coin, now)
 	if not coin then return end
 	local batch = CoinEngine.BatchTargets
-	local foundAt = nil
-	for i = 1, #batch do
-		if batch[i] == coin then foundAt = i; break end
-	end
+	local foundAt
+	for i = 1, #batch do if batch[i] == coin then foundAt = i; break end end
 	if foundAt then
 		for i = 1, foundAt - 1 do table.remove(batch, 1) end
 	else
-		-- Preserve the useful prefetched tail when an existing safety/route rule chooses
-		-- a target outside the batch; the current target becomes the first leg.
+		-- A safe reroute can choose a target outside the prepared plan; preserve the valid tail.
 		table.insert(batch, 1, coin)
-		while #batch > (tonumber(CoinEngine.BatchSize) or 5) do table.remove(batch) end
-		CoinEngine.BatchNeedsRefresh = #batch < (tonumber(CoinEngine.BatchSize) or 5)
+		local capacity = math.clamp(math.floor(tonumber(CoinEngine.BatchActiveCapacity) or 10), 1, 20)
+		while #batch > capacity do table.remove(batch) end
+		CoinEngine.BatchNeedsRefresh = true
 	end
-	while #batch > (tonumber(CoinEngine.BatchSize) or 5) do table.remove(batch) end
-	if #batch < (tonumber(CoinEngine.BatchSize) or 5) then
+	local capacity = math.clamp(math.floor(tonumber(CoinEngine.BatchActiveCapacity) or 10), 1, 20)
+	if #batch < capacity then
 		CoinEngine.BatchNeedsRefresh = true
 		CoinEngine.BatchNextRepairAt = math.min(tonumber(CoinEngine.BatchNextRepairAt) or 0, tonumber(now) or os.clock())
 	end
 end
 
+CoinEngine.RequestBatchBuild = function(origin, now, targetLimit, mode)
+	now = tonumber(now) or os.clock()
+	mode = mode == "next" and "next" or "active"
+	local threat = CoinEngine.ThreatResponse
+	if not origin or not CoinEngine.Active or not State.FarmEnabled or (threat and threat.EmergencyEscape) then
+		if mode == "next" then CoinEngine.BatchNextNeedsRefresh = true else CoinEngine.BatchNeedsRefresh = true end
+		return false
+	end
+	local limit = math.clamp(math.floor(tonumber(targetLimit) or 10), 1, 20)
+	if CoinEngine.BatchBuildPending then
+		local currentSize = tonumber(CoinEngine.BatchBuildRequestedSize) or 0
+		if CoinEngine.BatchBuildMode == mode and currentSize >= limit then return true end
+		-- Only upgrade/cancel a build for the same queue. A prefetch can never cancel
+		-- an active-queue refresh (or vice versa); 20 replaces a pending 10 prefetch.
+		if CoinEngine.BatchBuildMode ~= mode or limit <= currentSize then return false end
+		CoinEngine.BatchBuildToken = (CoinEngine.BatchBuildToken or 0) + 1
+		CoinEngine.BatchBuildPending = false
+	end
+	CoinEngine.BatchBuildToken = (CoinEngine.BatchBuildToken or 0) + 1
+	local token = CoinEngine.BatchBuildToken
+	local startOrigin = origin
+	local startedAt = os.clock()
+	local committed = false
+	CoinEngine.BatchBuildPending = true
+	CoinEngine.BatchBuildMode = mode
+	CoinEngine.BatchBuildRequestedSize = limit
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local seen, candidates, shortlisted = {}, {}, {}
+			local result = {}
+			local rootAtStart = GetRoot()
+			if mode == "active" then
+				local cur = CoinEngine.CurrentTarget
+				if cur and CoinEngine.BatchCoinEligible(cur, startOrigin, os.clock(), seen) then
+					result[#result + 1] = cur; seen[cur] = true
+				end
+				for _, coin in ipairs(CoinEngine.BatchTargets) do
+					if #result >= limit then break end
+					if not seen[coin] and CoinEngine.BatchCoinEligible(coin, startOrigin, os.clock(), seen) then
+						result[#result + 1] = coin; seen[coin] = true
+					end
+				end
+			else
+				for _, coin in ipairs(CoinEngine.BatchTargets) do seen[coin] = true end
+			end
+			local shortlistLimit = math.clamp(math.max(limit * 4, 40), 40, 100)
+			local function insertCandidate(coin, score)
+				if shortlisted[coin] then return end
+				if #candidates >= shortlistLimit and score >= candidates[#candidates].score then return end
+				local entry = {coin = coin, score = score}
+				local at = #candidates + 1
+				for i = 1, #candidates do if score < candidates[i].score then at = i; break end end
+				table.insert(candidates, at, entry)
+				shortlisted[coin] = true
+				if #candidates > shortlistLimit then
+					local removed = table.remove(candidates)
+					if removed then shortlisted[removed.coin] = nil end
+				end
+			end
+			local examined, candidateVisited = 0, {}
+			local maxDist = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+			local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+			local function considerCoin(coin)
+				if not coin or candidateVisited[coin] then return end
+				candidateVisited[coin] = true
+				if seen[coin] or not coin.Parent or not IsValidCoin(coin) or IsCoinTemporarilyExcluded(coin, os.clock()) then return end
+				local bl = CoinEngine.Blacklist[coin]
+				if bl and bl <= os.clock() then CoinEngine.Blacklist[coin] = nil; bl = nil end
+				if bl or not IsThreatSafeCoin(coin) then return end
+				local pos = GetCoinPositionSnapshot(coin) or coin.Position
+				local delta = pos - startOrigin
+				local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
+				-- Keep the established vertical-descent exception (including its actual max-gap guard).
+				local drop = -delta.Y >= (tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+					and -delta.Y <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+					and horizontal <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
+				if delta.Magnitude <= maxDist and (math.abs(delta.Y) <= maxGap or drop) then
+					local score = ThreatAwareCoinScore(startOrigin, pos, os.clock()) - GetCoinChainBonus(coin)
+					insertCandidate(coin, score)
+				end
+			end
+			local threatAbort = function()
+				if token ~= CoinEngine.BatchBuildToken or not State.FarmEnabled then return true end
+				if CoinEngine.ThreatResponse.EmergencyEscape then
+					if mode == "next" then CoinEngine.BatchNextNeedsRefresh = true else CoinEngine.BatchNeedsRefresh = true end
+					return true
+				end
+				return false
+			end
+			-- Local-first candidate scan: use the event-fed spatial index around the current
+			-- position and stop after a complete nearby ring has enough options. A registry-wide
+			-- cache pass is a fallback only when nearby cells cannot supply a useful shortlist.
+			local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
+			local cx, cy, cz = math.floor(startOrigin.X / cellSize), math.floor(startOrigin.Y / cellSize), math.floor(startOrigin.Z / cellSize)
+			local localTarget = math.min(shortlistLimit, math.max(limit * 2, 20))
+			for ring = 0, 2 do
+				for ix = cx - ring, cx + ring do
+					for iy = cy - ring, cy + ring do
+						for iz = cz - ring, cz + ring do
+							if math.max(math.abs(ix - cx), math.abs(iy - cy), math.abs(iz - cz)) == ring then
+								local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
+								if bucket then
+									for coin in pairs(bucket) do
+										examined += 1
+										considerCoin(coin)
+										if examined % 48 == 0 then
+											task.wait()
+											if threatAbort() then return end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				if #candidates >= localTarget then break end
+				if threatAbort() then return end
+			end
+			if #candidates < localTarget then
+				for coin in pairs(CoinEngine.CoinCache) do
+					if threatAbort() then return end
+					examined += 1
+					considerCoin(coin)
+					if examined % 48 == 0 then task.wait(); if threatAbort() then return end end
+					if #candidates >= shortlistLimit then break end
+				end
+			end
+			-- Coverage raycasts are restricted to the shortlist, never the full cache pass.
+			local currentThreat = CoinEngine.ThreatResponse
+			local murderer = currentThreat.Murderer or currentThreat.CachedMurderer
+			local murderRoot = murderer and GetRoot(murderer)
+			if murderRoot and (currentThreat.CoverageRiskActive or (rootAtStart and (rootAtStart.Position - murderRoot.Position).Magnitude <= 45)) then
+				local coverageChecked = 0
+				for _, entry in ipairs(candidates) do
+					if token ~= CoinEngine.BatchBuildToken or currentThreat.EmergencyEscape then return end
+					local coin = entry.coin
+					if coin and coin.Parent and (coin.Position - murderRoot.Position).Magnitude <= 45 then
+						if CoinEngine.IsCoinCoveredFromMurderer(coin, murderer, os.clock()) then
+							entry.score -= 18
+						else
+							entry.score += 16
+						end
+						coverageChecked += 1
+						if coverageChecked % 8 == 0 then
+							task.wait()
+							if threatAbort() then return end
+						end
+					end
+				end
+				table.sort(candidates, function(a, b) return a.score < b.score end)
+			end
+			local checked, buildNow = 0, os.clock()
+			local validatedCandidates = {}
+			local validationRoot = GetRoot()
+			if not validationRoot or (rootAtStart and validationRoot ~= rootAtStart) then return end
+			local validationOrigin = validationRoot.Position
+			local function validateCandidates()
+				for _, entry in ipairs(candidates) do
+					if #result >= limit then break end
+					if token ~= CoinEngine.BatchBuildToken or CoinEngine.ThreatResponse.EmergencyEscape then return false end
+					local coin = entry.coin
+					if not validatedCandidates[coin] and not seen[coin] then
+						validatedCandidates[coin] = true
+						checked += 1
+						if CoinEngine.BatchCoinEligible(coin, validationOrigin, os.clock(), seen) and IsGrounded(coin) then
+							result[#result + 1] = coin
+							seen[coin] = true
+						end
+						if checked % 8 == 0 then
+							task.wait()
+							if token ~= CoinEngine.BatchBuildToken or CoinEngine.ThreatResponse.EmergencyEscape then return false end
+						end
+					end
+				end
+				return true
+			end
+			if not validateCandidates() then return end
+			-- If the nearby shortlist was numerically large but most entries failed physical
+			-- validation, continue from the shared cache rather than returning a tiny batch.
+			-- This wider fallback is only paid for when the local options proved insufficient.
+			if #result < limit and not threatAbort() then
+				shortlistLimit = 100
+				for coin in pairs(CoinEngine.CoinCache) do
+					if threatAbort() then return end
+					examined += 1
+					considerCoin(coin)
+					if examined % 48 == 0 then task.wait(); if threatAbort() then return end end
+					if #candidates >= shortlistLimit then break end
+				end
+				local fallbackThreat = CoinEngine.ThreatResponse
+				local fallbackMurderer = fallbackThreat.Murderer or fallbackThreat.CachedMurderer
+				local fallbackMurderRoot = fallbackMurderer and GetRoot(fallbackMurderer)
+				if fallbackMurderRoot and (fallbackThreat.CoverageRiskActive or (validationRoot.Position - fallbackMurderRoot.Position).Magnitude <= 45) then
+					local fallbackCoverageChecked = 0
+					for _, entry in ipairs(candidates) do
+						if token ~= CoinEngine.BatchBuildToken or fallbackThreat.EmergencyEscape then return end
+						local coin = entry.coin
+						if not validatedCandidates[coin] and coin and coin.Parent and (coin.Position - fallbackMurderRoot.Position).Magnitude <= 45 then
+							if CoinEngine.IsCoinCoveredFromMurderer(coin, fallbackMurderer, os.clock()) then entry.score -= 18 else entry.score += 16 end
+							fallbackCoverageChecked += 1
+							if fallbackCoverageChecked % 8 == 0 then
+								task.wait()
+								if threatAbort() then return end
+							end
+						end
+					end
+					table.sort(candidates, function(a, b) return a.score < b.score end)
+				end
+				if not validateCandidates() then return end
+			end
+			-- Greedy nearest-neighbour ordering, bounded at 20x20; never factorial.
+			local routeStart = validationOrigin
+			if mode == "next" and #CoinEngine.BatchTargets > 0 then
+				local tail = CoinEngine.BatchTargets[#CoinEngine.BatchTargets]
+				if tail and tail.Parent then routeStart = tail.Position end
+			end
+			local firstLocked = result[1] == CoinEngine.CurrentTarget and CoinEngine.CurrentTarget ~= nil
+		local firstIndex = firstLocked and 2 or 1
+		for i = firstIndex, #result - 1 do
+			local bestIndex, bestScore = i, math.huge
+			for j = i, #result do
+				local coin = result[j]
+				if coin and coin.Parent then
+					local pos = GetCoinPositionSnapshot(coin) or coin.Position
+					local score = ThreatAwareCoinScore(routeStart, pos, os.clock()) - GetCoinChainBonus(coin)
+					local cache = CoinEngine.RouteCheckCache[coin]
+					if cache and os.clock() - (cache.at or 0) <= 0.12 and (routeStart - cache.fromPos).Magnitude <= 1.0 and cache.clear == false then score += 8 end
+					if score < bestScore then bestIndex, bestScore = j, score end
+				end
+			end
+			if bestIndex ~= i then result[i], result[bestIndex] = result[bestIndex], result[i] end
+			local chosen = result[i]
+			if chosen and chosen.Parent then routeStart = chosen.Position end
+		end
+			if token ~= CoinEngine.BatchBuildToken or CoinEngine.ThreatResponse.EmergencyEscape then return end
+			if mode == "active" then
+				local current = CoinEngine.CurrentTarget
+				local final, finalSeen = {}, {}
+				if current and CoinEngine.BatchCoinEligible(current, validationOrigin, os.clock(), finalSeen) then
+					final[#final + 1] = current; finalSeen[current] = true
+				end
+				for _, coin in ipairs(result) do
+					if #final >= limit then break end
+					if not finalSeen[coin] and CoinEngine.BatchCoinEligible(coin, validationOrigin, os.clock(), finalSeen) then
+						final[#final + 1] = coin; finalSeen[coin] = true
+					end
+				end
+				table.clear(CoinEngine.BatchTargets)
+				for _, coin in ipairs(final) do CoinEngine.BatchTargets[#CoinEngine.BatchTargets + 1] = coin end
+				CoinEngine.BatchNeedsRefresh = #final < limit
+				if #final == 0 and (CoinEngine.BatchGeneration or 0) > 0 then
+					CoinEngine.BatchNextPrefetchExpanded = true
+					CoinEngine.BatchNextNeedsRefresh = true
+					CoinEngine.BatchNextRepairAt = os.clock()
+				end
+			else
+				table.clear(CoinEngine.BatchNextTargets)
+				local finalSeen = {}
+				for _, coin in ipairs(CoinEngine.BatchTargets) do finalSeen[coin] = true end
+				for _, coin in ipairs(result) do
+					if #CoinEngine.BatchNextTargets >= limit then break end
+					if not finalSeen[coin] and CoinEngine.BatchCoinEligible(coin, validationOrigin, os.clock(), finalSeen) then
+						CoinEngine.BatchNextTargets[#CoinEngine.BatchNextTargets + 1] = coin
+						finalSeen[coin] = true
+					end
+				end
+				CoinEngine.BatchNextCapacity = limit
+				CoinEngine.BatchNextReady = #CoinEngine.BatchNextTargets > 0
+				CoinEngine.BatchNextNeedsRefresh = #CoinEngine.BatchNextTargets < limit
+				CoinEngine.BatchNextRepairRevision = CoinEngine.CoinCacheRevision or 0
+				CoinEngine.BatchNextRepairAt = os.clock() + (CoinEngine.BatchNextNeedsRefresh and 5.0 or 0.0)
+				CoinEngine.BatchNextRefreshAt = os.clock() + (tonumber(CoinEngine.BatchRefreshInterval) or 5.0)
+			end
+			CoinEngine.BatchLastBuildAt = os.clock()
+			CoinEngine.BatchLastRevision = CoinEngine.CoinCacheRevision or 0
+			CoinEngine.BatchLastSelectedCount = mode == "active" and #CoinEngine.BatchTargets or #CoinEngine.BatchNextTargets
+			CoinEngine.BatchBuildCount = (CoinEngine.BatchBuildCount or 0) + 1
+			CoinEngine.BatchLastBuildMs = math.max(0, (os.clock() - startedAt) * 1000)
+			if mode == "next" and #CoinEngine.BatchNextTargets == 0 and limit < 20 then
+				-- An empty 10-candidate search is direct evidence that the next group needs expansion.
+				CoinEngine.BatchNextPrefetchExpanded = true
+				CoinEngine.BatchNextRepairAt = os.clock()
+			end
+			if CoinEngine.BatchLastBuildMs >= 8 then
+				LogEvent(string.format("coin-batch-build mode=%s size=%d ms=%.2f cache=%d revision=%d", mode,
+					CoinEngine.BatchLastSelectedCount, CoinEngine.BatchLastBuildMs, CoinEngine.CoinCount or 0, CoinEngine.BatchLastRevision or 0))
+			end
+			committed = true
+		end)
+		if token == CoinEngine.BatchBuildToken then
+			CoinEngine.BatchBuildPending = false
+			CoinEngine.BatchBuildMode = nil
+			CoinEngine.BatchBuildRequestedSize = 0
+			if not ok or not committed then
+				if mode == "next" then
+					CoinEngine.BatchNextNeedsRefresh = true
+					CoinEngine.BatchNextRepairAt = os.clock()
+				else
+					CoinEngine.BatchNeedsRefresh = true
+				end
+				if not ok then LogEvent(string.format("coin-batch-build-error mode=%s error=%s", mode, tostring(err))) end
+			end
+		end
+	end)
+	return true
+end
+
+CoinEngine.PromotePreparedBatch = function(origin, now)
+	now = tonumber(now) or os.clock()
+	if not origin or CoinEngine.ThreatResponse.EmergencyEscape then return false end
+	local valid = {}
+	local seen = {}
+	for _, coin in ipairs(CoinEngine.BatchNextTargets) do
+		if CoinEngine.BatchCoinEligible(coin, origin, now, seen) then
+			valid[#valid + 1] = coin; seen[coin] = true
+		end
+	end
+	if #valid == 0 then
+		CoinEngine.BatchNextReady = false
+		CoinEngine.BatchNextNeedsRefresh = true
+		CoinEngine.BatchNextPrefetchExpanded = true
+		if not CoinEngine.BatchBuildPending then
+			if CoinEngine.RequestBatchBuild(origin, now, 20, "next") and CoinEngine.BatchBuildPending then
+				CoinEngine.BatchPrefetchStartedForGeneration = CoinEngine.BatchGeneration
+				CoinEngine.BatchNextNeedsRefresh = false
+			end
+		end
+		return false
+	end
+	CoinEngine.BatchGeneration = (CoinEngine.BatchGeneration or 0) + 1
+	table.clear(CoinEngine.BatchTargets)
+	for _, coin in ipairs(valid) do CoinEngine.BatchTargets[#CoinEngine.BatchTargets + 1] = coin end
+	table.clear(CoinEngine.BatchNextTargets)
+	CoinEngine.BatchActiveCapacity = math.clamp(tonumber(CoinEngine.BatchNextCapacity) or 10, 1, 20)
+	CoinEngine.BatchCollectedCount = 0
+	CoinEngine.BatchPendingCollectCount = 0
+	CoinEngine.BatchNextReady = false
+	CoinEngine.BatchNextNeedsRefresh = true
+	CoinEngine.BatchPrefetchStartedForGeneration = -1
+	CoinEngine.BatchNextPrefetchExpanded = false
+	CoinEngine.BatchNeedsRefresh = #CoinEngine.BatchTargets < CoinEngine.BatchActiveCapacity
+	CoinEngine.BatchNextRepairAt = now
+	LogEvent(string.format("coin-batch-promote capacity=%d valid=%d generation=%d", CoinEngine.BatchActiveCapacity, #valid, CoinEngine.BatchGeneration))
+	return true
+end
+
 CoinEngine.MaintainCoinBatch = function(origin, now, forceReplan)
 	if not origin then return end
 	now = tonumber(now) or os.clock()
-	local batch = CoinEngine.BatchTargets
-	local capacity = math.clamp(math.floor(tonumber(CoinEngine.BatchSize) or 5), 1, 5)
-	local current = CoinEngine.CurrentTarget
-	local periodicDue = now >= (tonumber(CoinEngine.BatchNextRefreshAt) or 0)
-	local startedAt = os.clock()
-
-	-- Prune only cached candidates; never traverse Workspace just to refill a batch.
-	local old = table.clone(batch)
-	local oldCount = #old
-	table.clear(batch)
-	local seen = {}
-	if current and IsAvailable(current, now) and IsThreatSafeCoin(current)
-		and not (CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape) then
-		batch[#batch + 1] = current
-		seen[current] = true
-	end
-	local preserveTail = not forceReplan and not periodicDue
-	if preserveTail then
-		for _, coin in ipairs(old) do
-			if #batch >= capacity then break end
-			if not seen[coin] and CoinEngine.BatchCoinEligible(coin, origin, now, seen) then
-				batch[#batch + 1] = coin
-				seen[coin] = true
-			end
-		end
-	end
-
-	local needsFill = #batch < capacity
-	if #batch < oldCount and not periodicDue and not forceReplan then
+	local threat = CoinEngine.ThreatResponse
+	local emergency = threat and threat.Active and threat.EmergencyEscape
+	if emergency then
+		-- Preserve the valid batch and yield immediately. Threat handling owns this frame;
+		-- do not prune coins merely because they are not safe destinations during an escape.
 		CoinEngine.BatchNeedsRefresh = true
-		CoinEngine.BatchNextRepairAt = math.min(tonumber(CoinEngine.BatchNextRepairAt) or 0, now)
-	end
-	local repairDue = (CoinEngine.BatchNeedsRefresh or needsFill)
-		and now >= (tonumber(CoinEngine.BatchNextRepairAt) or 0)
-	local doSearch = forceReplan or periodicDue or repairDue
-	if not doSearch then
+		CoinEngine.BatchNextNeedsRefresh = true
 		return
 	end
-	if CoinEngine.ThreatResponse.Active and CoinEngine.ThreatResponse.EmergencyEscape then
-		-- Escape remains the sole movement authority; the next safe batch is rebuilt when it releases.
+	local active = CoinEngine.BatchTargets
+	local activeSeen = {}
+	-- Prune stale entries in-place; this uses only the event-fed cache, never Workspace enumeration.
+	for i = #active, 1, -1 do
+		local coin = active[i]
+		if not CoinEngine.BatchCoinEligible(coin, origin, now, activeSeen) then
+			table.remove(active, i)
+			CoinEngine.BatchNeedsRefresh = true
+		else
+			activeSeen[coin] = true
+		end
+	end
+	local nextBatch, nextSeen = CoinEngine.BatchNextTargets, {}
+	local priorNextCount = #nextBatch
+	for coin in pairs(activeSeen) do nextSeen[coin] = true end
+	for i = #nextBatch, 1, -1 do
+		local coin = nextBatch[i]
+		if not CoinEngine.BatchCoinEligible(coin, origin, now, nextSeen) then
+			table.remove(nextBatch, i)
+		else
+			nextSeen[coin] = true
+		end
+	end
+	if #nextBatch < priorNextCount then
+		CoinEngine.BatchNextNeedsRefresh = true
+		CoinEngine.BatchNextRepairAt = now
+		if priorNextCount > 0 and #nextBatch == 0 then
+			-- The prepared 10 were entirely invalidated; expand immediately instead of repeating the same scan.
+			CoinEngine.BatchNextPrefetchExpanded = true
+		end
+	end
+	CoinEngine.BatchNextReady = #nextBatch > 0
+	-- Promote before requesting an active refresh, otherwise two queues could race to own the first leg.
+	if #active == 0 and #nextBatch > 0 then
+		if CoinEngine.PromotePreparedBatch(origin, now) then return end
+	end
+	local cap = math.clamp(math.floor(tonumber(CoinEngine.BatchActiveCapacity) or 10), 1, 20)
+	local collected = tonumber(CoinEngine.BatchCollectedCount) or 0
+	local pending = tonumber(CoinEngine.BatchPendingCollectCount) or 0
+	local outstanding = collected + pending
+	local remainingCapacity = math.max(0, cap - outstanding)
+	local activeMissing = (#active + pending) < math.max(0, cap - collected)
+	if activeMissing then
 		CoinEngine.BatchNeedsRefresh = true
-		CoinEngine.BatchNextRepairAt = now + 0.25
-		return
-	end
-
-	-- During an ordinary five-second refresh, keep only the active target fixed and plan a fresh
-	-- tail. During event-driven repair, keep all still-valid entries and fill only the vacancies.
-	if forceReplan or periodicDue then
-		local keepCurrent = batch[1] == current and current ~= nil
-		table.clear(batch)
-		table.clear(seen)
-		if keepCurrent and IsAvailable(current, now) and IsThreatSafeCoin(current) then
-			batch[1] = current
-			seen[current] = true
+		local activeQueueExhaustedAfterStart = #active == 0 and #nextBatch == 0
+			and ((CoinEngine.BatchGeneration or 0) > 0 or collected > 0)
+		if not activeQueueExhaustedAfterStart and not CoinEngine.BatchBuildPending and remainingCapacity > 0 then
+			CoinEngine.RequestBatchBuild(origin, now, remainingCapacity, "active")
 		end
 	end
-
-	local slots = capacity - #batch
-	if slots > 0 then
-		local shortlist = {}
-		local shortlisted = {}
-		local shortlistLimit = math.max(12, capacity * 4)
-		local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-		local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
-		local highDropThreshold = math.max(10.0, tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
-		local highDropMaxGap = math.max(highDropThreshold, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
-		local function insertCandidate(coin, score)
-			if shortlisted[coin] then return end
-			if #shortlist >= shortlistLimit and score >= shortlist[#shortlist].score then return end
-			local entry = {coin = coin, score = score}
-			local insertAt = #shortlist + 1
-			for i = 1, #shortlist do
-				if score < shortlist[i].score then insertAt = i; break end
+	local queueRemaining = math.max(0, #active + pending)
+	local shouldStartPrefetch = collected >= 8
+		and CoinEngine.BatchPrefetchStartedForGeneration ~= CoinEngine.BatchGeneration
+	local canRepairPrefetch = CoinEngine.BatchPrefetchStartedForGeneration == CoinEngine.BatchGeneration
+		and CoinEngine.BatchNextNeedsRefresh
+		and #nextBatch < (tonumber(CoinEngine.BatchNextCapacity) or 10)
+		and (now >= (tonumber(CoinEngine.BatchNextRepairAt) or 0)
+			or (tonumber(CoinEngine.BatchNextRepairRevision) or -1) ~= (CoinEngine.CoinCacheRevision or 0))
+	if (shouldStartPrefetch or canRepairPrefetch) and not CoinEngine.BatchBuildPending then
+		local requestedSize = 10
+		if CoinEngine.BatchNextPrefetchExpanded then requestedSize = 20 end
+		if CoinEngine.RequestBatchBuild(origin, now, requestedSize, "next") then
+			if CoinEngine.BatchBuildPending and CoinEngine.BatchBuildMode == "next" then
+				CoinEngine.BatchPrefetchStartedForGeneration = CoinEngine.BatchGeneration
+				CoinEngine.BatchNextNeedsRefresh = false
 			end
-			table.insert(shortlist, insertAt, entry)
-			shortlisted[coin] = true
-			if #shortlist > shortlistLimit then
-				local removed = table.remove(shortlist)
-				if removed then shortlisted[removed.coin] = nil end
-			end
-		end
-		local function consider(coin)
-			if not coin or seen[coin] or shortlisted[coin] then return end
-			if not coin.Parent or not IsValidCoin(coin) then
-				UnregisterCoin(coin)
-				return
-			end
-			if IsCoinTemporarilyExcluded(coin, now) then return end
-			local bl = CoinEngine.Blacklist[coin]
-			if bl and bl <= now then CoinEngine.Blacklist[coin] = nil; bl = nil end
-			if bl or not IsThreatSafeCoin(coin) then return end
-			local pos = GetCoinPositionSnapshot(coin) or coin.Position
-			local delta = pos - origin
-			local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
-			local highDrop = -delta.Y >= highDropThreshold and -delta.Y <= highDropMaxGap
-				and horizontal <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
-			if delta.Magnitude <= maxDistance and (math.abs(delta.Y) <= maxGap or highDrop) then
-				local score = ThreatAwareCoinScore(origin, pos, now) - GetCoinChainBonus(coin)
-				insertCandidate(coin, score)
-			end
-		end
-		local function validateShortlist()
-			local checked = 0
-			for _, entry in ipairs(shortlist) do
-				if #batch >= capacity or checked >= 12 then break end
-				checked += 1
-				local coin = entry.coin
-				if not seen[coin] and CoinEngine.BatchCoinEligible(coin, origin, now, seen) then
-					if IsGrounded(coin) then
-						batch[#batch + 1] = coin
-						seen[coin] = true
-					else
-						CoinEngine.Blacklist[coin] = now + 2.5
-					end
-				end
-			end
-		end
-
-		local fullReplan = periodicDue or forceReplan
-		if not fullReplan then
-			-- Fast refill path: examine the spatial cells around the current route origin first.
-			-- The shared cache remains the source of truth; no Workspace/GetDescendants scan is used.
-			local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
-			local cx, cy, cz = math.floor(origin.X / cellSize), math.floor(origin.Y / cellSize), math.floor(origin.Z / cellSize)
-			for ix = cx - 1, cx + 1 do
-				for iy = cy - 1, cy + 1 do
-					for iz = cz - 1, cz + 1 do
-						local bucket = CoinEngine.CoinSpatialCells[CoinSpatialCellKey(ix, iy, iz)]
-						if bucket then for coin in pairs(bucket) do consider(coin) end end
-					end
-				end
-			end
-			validateShortlist()
-		end
-
-		if fullReplan or #batch < capacity then
-			-- Periodic planning may use the full event-fed cache. On an early vacancy refill,
-			-- the global fallback is paid only when nearby registered coins cannot fill the slot.
-			if not fullReplan then
-				table.clear(shortlist)
-				table.clear(shortlisted)
-			end
-			for coin in pairs(CoinEngine.CoinCache) do consider(coin) end
-			if fullReplan or #batch < capacity then validateShortlist() end
 		end
 	end
-	-- Greedy nearest-neighbour route over this small batch (at most five), not an expensive
-	-- all-permutations search. Preserve the currently-followed coin at position one.
-	if #batch > 1 then
-		local startIndex = 1
-		local routeStart = origin
-		if current and batch[1] == current then
-			startIndex = 2
-			routeStart = current.Position
-		end
-		for routeIndex = startIndex, #batch - 1 do
-			local bestIndex, bestScore = routeIndex, math.huge
-			for candidateIndex = routeIndex, #batch do
-				local coin = batch[candidateIndex]
-				if coin and coin.Parent then
-					local pos = GetCoinPositionSnapshot(coin) or coin.Position
-					local score = ThreatAwareCoinScore(routeStart, pos, now) - GetCoinChainBonus(coin)
-					-- Reuse recent route evidence only; do not add raycasts to each ranking comparison.
-					local routeCache = CoinEngine.RouteCheckCache[coin]
-					if routeCache and now - (routeCache.at or 0) <= 0.12
-						and (routeStart - routeCache.fromPos).Magnitude <= 1.0
-						and routeCache.clear == false then score += 8.0 end
-					if score < bestScore then bestIndex, bestScore = candidateIndex, score end
-				end
-			end
-			if bestIndex ~= routeIndex then batch[routeIndex], batch[bestIndex] = batch[bestIndex], batch[routeIndex] end
-			local chosen = batch[routeIndex]
-			if chosen and chosen.Parent then routeStart = chosen.Position end
+	-- If the current queue is exhausted (or one leg from exhaustion) and the prepared 10 are absent,
+	-- run the 20-candidate recovery search. This is a fallback, not the default work each cycle.
+	if queueRemaining <= 1 and #nextBatch == 0 and not CoinEngine.BatchBuildPending
+		and ((CoinEngine.BatchGeneration or 0) > 0 or collected > 0)
+		and (now >= (tonumber(CoinEngine.BatchNextRepairAt) or 0)
+			or (tonumber(CoinEngine.BatchNextRepairRevision) or -1) ~= (CoinEngine.CoinCacheRevision or 0)) then
+		CoinEngine.BatchNextNeedsRefresh = true
+		CoinEngine.BatchNextPrefetchExpanded = true
+		if CoinEngine.RequestBatchBuild(origin, now, 20, "next") and CoinEngine.BatchBuildPending then
+			CoinEngine.BatchPrefetchStartedForGeneration = CoinEngine.BatchGeneration
+			CoinEngine.BatchNextNeedsRefresh = false
 		end
 	end
-
-	CoinEngine.BatchLastBuildAt = now
-	CoinEngine.BatchLastRevision = CoinEngine.CoinCacheRevision or 0
-	CoinEngine.BatchLastSelectedCount = #batch
-	CoinEngine.BatchBuildCount = (CoinEngine.BatchBuildCount or 0) + 1
-	CoinEngine.BatchLastBuildMs = math.max(0, (os.clock() - startedAt) * 1000)
-	CoinEngine.BatchNeedsRefresh = #batch < capacity
-	CoinEngine.BatchNextRepairAt = now + (#batch < capacity and 0.50 or (tonumber(CoinEngine.BatchRefreshInterval) or 5.0))
-	if periodicDue or forceReplan or (tonumber(CoinEngine.BatchNextRefreshAt) or 0) <= 0 then
+	-- Initial startup gets the normal 10-target active plan. Later-generation recovery is handled
+	-- by the cooldown/revision-aware 20-target branch above, never by an unbounded per-frame retry.
+	if #active == 0 and #nextBatch == 0 and not CoinEngine.BatchBuildPending
+		and (CoinEngine.BatchGeneration or 0) == 0 then
+		CoinEngine.BatchNeedsRefresh = true
+		CoinEngine.RequestBatchBuild(origin, now, 10, "active")
+	end
+	if now >= (tonumber(CoinEngine.BatchNextRefreshAt) or 0) then
 		CoinEngine.BatchNextRefreshAt = now + (tonumber(CoinEngine.BatchRefreshInterval) or 5.0)
-	end
-	if CoinEngine.BatchLastBuildMs >= 8 then
-		LogEvent(string.format("coin-batch-build size=%d ms=%.2f cache=%d revision=%d", #batch,
-			CoinEngine.BatchLastBuildMs, CoinEngine.CoinCount or 0, CoinEngine.BatchLastRevision or 0))
+		-- Five seconds is a maintenance cadence only; it never pauses movement.
+		if collected >= 8 and #nextBatch == 0 and not CoinEngine.BatchBuildPending then
+			CoinEngine.BatchNextNeedsRefresh = true
+			local refreshSize = CoinEngine.BatchNextPrefetchExpanded and 20 or 10
+			if CoinEngine.RequestBatchBuild(origin, now, refreshSize, "next") and CoinEngine.BatchBuildPending then
+				CoinEngine.BatchPrefetchStartedForGeneration = CoinEngine.BatchGeneration
+				CoinEngine.BatchNextNeedsRefresh = false
+			end
+		end
 	end
 end
 
@@ -11240,6 +11752,15 @@ CoinEngine.GetNextBatchCoin = function(cur, now)
 			end
 			return nil
 		end
+	end
+	return nil
+end
+
+CoinEngine.GetNextPreparedBatchCoin = function(now)
+	now = tonumber(now) or os.clock()
+	if CoinEngine.ThreatResponse and CoinEngine.ThreatResponse.EmergencyEscape then return nil end
+	for _, coin in ipairs(CoinEngine.BatchNextTargets or {}) do
+		if CoinEngine.BatchCoinEligible(coin, (GetRoot() and GetRoot().Position) or coin.Position, now, nil) then return coin end
 	end
 	return nil
 end
@@ -11269,6 +11790,10 @@ local function PrepareNext(now, force)
 	CoinEngine.MaintainCoinBatch(cur.Position, now, force == true)
 	local batchNext = (not threatActive or not CoinEngine.ThreatResponse.EmergencyEscape)
 		and CoinEngine.GetNextBatchCoin(cur, now) or nil
+	if not batchNext and not CoinEngine.ThreatResponse.EmergencyEscape
+		and #CoinEngine.BatchTargets <= 1 and CoinEngine.BatchNextReady then
+		batchNext = CoinEngine.GetNextPreparedBatchCoin(now)
+	end
 	if batchNext and batchNext ~= currentNext then
 		currentNext = batchNext
 		nextStillValid = true
@@ -11330,7 +11855,17 @@ local function SetCurrent(coin, now)
 		CoinEngine.ChainGroupLastRevision = -1
 		CoinEngine.ChainGroupNextCheckAt = 0
 	end
-	if coin then CoinEngine.SyncBatchForCurrent(coin, now) end
+	if coin then
+		local isPrefetched = false
+		for _, prepared in ipairs(CoinEngine.BatchNextTargets or {}) do
+			if prepared == coin then isPrefetched = true; break end
+		end
+		if isPrefetched or (#(CoinEngine.BatchTargets or {}) == 0 and #(CoinEngine.BatchNextTargets or {}) > 0
+			and not CoinEngine.ThreatResponse.EmergencyEscape) then
+			CoinEngine.PromotePreparedBatch(coin.Position, now)
+		end
+		CoinEngine.SyncBatchForCurrent(coin, now)
+	end
 	CoinEngine.NextTarget = nil
 	CoinEngine.NextTargetCacheRevision = -1
 	CoinEngine.NextTargetPreparedAt = 0
@@ -11354,6 +11889,10 @@ end
 
 local function AdvanceTarget(root, now)
 	CoinEngine.MaintainCoinBatch(root and root.Position or nil, now, false)
+	if root and #(CoinEngine.BatchTargets or {}) == 0 and #(CoinEngine.BatchNextTargets or {}) > 0
+		and not CoinEngine.ThreatResponse.EmergencyEscape then
+		CoinEngine.PromotePreparedBatch(root.Position, now)
+	end
 	local batchedFirst = CoinEngine.GetNextBatchCoin(nil, now)
 	local nxt = CoinEngine.NextTarget or batchedFirst
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
@@ -11405,13 +11944,20 @@ local function AdvanceTarget(root, now)
 		CoinEngine.NextTarget = nil
 		if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
 			local threat = CoinEngine.ThreatResponse
-			threat.EmergencyEscape = true
-			threat.EmergencyEscapeStartedAt = now
-			threat.Murderer = threat.Murderer or threat.CachedMurderer
-			threat.EscapeDestination = nil
-			threat.EscapeDestinationComputedAt = 0
-			threat.NextEscapeDestinationAt = 0
-			RequestMurderEscapeDestination(root, threat.Murderer, now)
+			local coverSearchPending = threat.CoverageRiskActive and now < (tonumber(threat.CoverageSearchDeadline) or 0)
+			if coverSearchPending then
+				-- Give the cooperative covered-coin search a bounded 220ms window; no map scan is awaited.
+				noTargetUntil = math.min(tonumber(threat.CoverageSearchDeadline) or now, now + 0.08)
+				SetStatus("seeking-cover")
+			else
+				threat.EmergencyEscape = true
+				threat.EmergencyEscapeStartedAt = now
+				threat.Murderer = threat.Murderer or threat.CachedMurderer
+				threat.EscapeDestination = nil
+				threat.EscapeDestinationComputedAt = 0
+				threat.NextEscapeDestinationAt = 0
+				RequestMurderEscapeDestination(root, threat.Murderer, now)
+			end
 		end
 		-- Sin objetivo, espera al proximo evento de cache o al vencimiento pertinente; evita
 		-- repetir la misma busqueda en cada frame. RegisterCoin despierta el selector al instante.
@@ -12995,6 +13541,9 @@ local function CollectCoin(root, coin, now)
 		LogEvent("touch-api-unavailable")
 		return false
 	end
+	if not CoinEngine.DiagNoCollect and CoinEngine.TrackPendingCollection then
+		CoinEngine.TrackPendingCollection(coin, now)
+	end
 	local ok = true
 	if not CoinEngine.DiagNoCollect then
 		ok = pcall(function()
@@ -13003,6 +13552,7 @@ local function CollectCoin(root, coin, now)
 		end)
 	end
 	if not ok then
+		if CoinEngine.CancelPendingCollection then CoinEngine.CancelPendingCollection(coin) end
 		LogEvent("touch-api-failed")
 		return false
 	end
@@ -13057,6 +13607,22 @@ function CoinEngine.CleanupRoundCaches()
 	end
 	CoinEngine.CurrentTarget, CoinEngine.NextTarget = nil, nil
 	table.clear(CoinEngine.BatchTargets)
+	table.clear(CoinEngine.BatchNextTargets)
+	CoinEngine.BatchBuildToken = (CoinEngine.BatchBuildToken or 0) + 1
+	CoinEngine.BatchBuildPending = false
+	CoinEngine.BatchBuildMode = nil
+	CoinEngine.BatchBuildRequestedSize = 0
+	CoinEngine.BatchCollectedCount = 0
+	CoinEngine.BatchPendingCollectCount = 0
+	CoinEngine.BatchGeneration = (CoinEngine.BatchGeneration or 0) + 1
+	CoinEngine.BatchActiveCapacity = 10
+	CoinEngine.BatchNextCapacity = 10
+	CoinEngine.BatchNextReady = false
+	CoinEngine.BatchNextNeedsRefresh = true
+	CoinEngine.BatchPrefetchStartedForGeneration = -1
+	CoinEngine.BatchNextPrefetchExpanded = false
+	table.clear(CoinEngine.PendingCollectConfirmations)
+	table.clear(CoinEngine.CoinCoverageCache)
 	CoinEngine.BatchNeedsRefresh = true
 	CoinEngine.BatchNextRefreshAt = 0
 	CoinEngine.BatchNextRepairAt = 0
@@ -13236,6 +13802,7 @@ local function ControllerStep(dt)
 	if not CoinEngine.Active then Activate() end
 
 	local now = os.clock()
+	if CoinEngine.SweepPendingCollectConfirmations then CoinEngine.SweepPendingCollectConfirmations(now) end
 	local rawDt = dt
 	local threatUpdatedForThisFrame = false
 	local earlyThreatTransition, earlyThreatDistance = nil, nil
@@ -13372,11 +13939,13 @@ local function ControllerStep(dt)
 	else
 		threatTransition, threatDistance = UpdateThreatResponse(root, now)
 	end
-	if threatTransition == "entered" or threatTransition == "safe-coin-route" then
+	if threatTransition == "entered" or threatTransition == "escape-entered"
+		or threatTransition == "safe-coin-route" or threatTransition == "coverage-risk" then
 		chainAccelerationActive = false
 		local threat = CoinEngine.ThreatResponse
 		local safeRouteTransition = threatTransition == "safe-coin-route"
-		local saferCoin = safeRouteTransition and threat.SafeCoinRouteTarget or nil
+		local saferCoin = (safeRouteTransition or threatTransition == "coverage-risk")
+			and (threat.SafeCoinRouteActive and threat.SafeCoinRouteTarget or nil) or nil
 		local verifiedSafeRoute = safeRouteTransition and saferCoin ~= nil
 		if saferCoin and (not saferCoin.Parent or not IsThreatSafeCoin(saferCoin)) then saferCoin = nil; verifiedSafeRoute = false end
 		if not saferCoin and not threat.EmergencyEscape then
@@ -13395,6 +13964,9 @@ local function ControllerStep(dt)
 		if saferCoin then
 			if verifiedSafeRoute then MarkThreatSafeCoinRoute(threat, saferCoin, threat.Murderer or threat.CachedMurderer, now) end
 			SetCurrent(saferCoin, now)
+		elseif threatTransition == "coverage-risk" then
+			-- Do not keep following a previously selected exposed coin while a covered alternative is searched.
+			SetCurrent(nil, now)
 		elseif safeRouteTransition then
 			-- The verified target vanished between decision and application. Return to the existing
 			-- emergency path instead of substituting an unverified coin or stopping at the old target.
@@ -13523,21 +14095,16 @@ local function ControllerStep(dt)
 		-- local register set; this script has an intentionally large existing controller.
 		CoinEngine.EscapeUsesAdaptiveNoclip = CoinEngine.NoclipWanted or noclipOn or State.NoClipActive
 		CoinEngine.ConfiguredEscapeSpeed = math.clamp(tonumber(State.TweenSpeed) or 40, 10, 100)
-		CoinEngine.EscapeSpeedMultiplier = 1.0
-		-- Match normal AutoFarm: passive bonuses stay off during adaptive NoClip, but a confirmed
-		-- emergency recovery still contributes x1.45. The existing NoClip envelope below keeps
-		-- its original 80-speed and 1.5-per-update ceilings, so this does not alter NoClip policy.
+		CoinEngine.EscapeSpeedMultiplier = 1.50 -- one temporary escape multiplier; no 1.45 recovery stacking
+		-- Passive speed remains part of the effective baseline only when adaptive NoClip is inactive.
 		if not (CoinEngine.NoclipWanted or noclipOn or State.NoClipActive) then
 			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.PassiveSpeedMultiplier) or 1.10
 			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.PassiveFarmSpeedMultiplier) or 1.25
 		end
-		if CoinEngine.EmergencyRecoveryActive then
-			CoinEngine.EscapeSpeedMultiplier *= tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45
-		end
 		CoinEngine.EscapeSliderEnvelope = Param(CoinEngine.BaseMaxSpeed, CoinEngine.SafeMaxSpeed)
 		local safetyCap = math.min(CoinEngine.ConfiguredEscapeSpeed, CoinEngine.EscapeSliderEnvelope) * CoinEngine.EscapeSpeedMultiplier
 		if SafeOn() then
-			safetyCap = math.min(safetyCap, CoinEngine.EscapeSliderEnvelope) -- Safe Mode retains its existing hard ceiling.
+			safetyCap = math.min(safetyCap, CoinEngine.EscapeSliderEnvelope * 1.50)
 		elseif not CoinEngine.EscapeUsesAdaptiveNoclip then
 			safetyCap = math.min(safetyCap, (tonumber(CoinEngine.BaseMaxSpeed) or 100) * CoinEngine.EscapeSpeedMultiplier)
 		end
@@ -13587,9 +14154,8 @@ local function ControllerStep(dt)
 		end
 		if now >= (threat.NextEscapeLogAt or 0) then
 			threat.NextEscapeLogAt = now + 0.50
-			LogEvent(string.format("murder-escape-active dist=%.1f cap=%.1f slider=%.1f recover=%.2f los=%d noclip=%d dest=%d",
+			LogEvent(string.format("murder-escape-active dist=%.1f cap=%.1f slider=%.1f boost=1.50 recoveryStack=0 los=%d noclip=%d dest=%d",
 				threat.LastDistance or -1, escapeCap, tonumber(State.TweenSpeed) or -1,
-				CoinEngine.EmergencyRecoveryActive and (tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45) or 1.0,
 				threat.LastLineOfSightClear and 1 or 0, CoinEngine.NoclipWanted and 1 or 0, destination and 1 or 0))
 		end
 		return
@@ -14106,7 +14672,7 @@ local function ControllerStep(dt)
 			local settle = GetCollectSettle(now, safe)
 			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
 				-- Set only after CollectCoin returns success; this measures controller work, not physical travel time.
-				local collectionConfirmationClock = nil
+				local touchRequestCompleteClock = nil
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
@@ -14119,12 +14685,11 @@ local function ControllerStep(dt)
 				local preparedNextCoin = CoinEngine.NextTarget
 				local preparedNextAt = tonumber(CoinEngine.NextTargetPreparedAt) or 0
 				if CollectCoin(root, target, now) then
-					collectionConfirmationClock = os.clock()
-					CoinEngine.LastTouchRequestCompleteAt = collectionConfirmationClock
+					touchRequestCompleteClock = os.clock()
+					CoinEngine.LastTouchRequestCompleteAt = touchRequestCompleteClock
 					-- The existing success signal is a successful touch request, not authoritative server replication.
 					-- Remove only this attempted leg from the active route; CollectCoin's cooldown prevents immediate reselection.
-					CoinEngine.RemoveCoinFromBatch(target, now)
-					coinsCollectedTotal += 1
+					CoinEngine.RemoveCoinFromBatch(target, now, not CoinEngine.DiagNoCollect)
 					LogEvent(collectInfo)
 					hiTag = collectInfo
 
@@ -14165,7 +14730,7 @@ local function ControllerStep(dt)
 					end
 					if chainNext then
 						local chainSelectedClock = os.clock()
-						local transitionMs = math.max(0, (chainSelectedClock - collectionConfirmationClock) * 1000)
+						local transitionMs = math.max(0, (chainSelectedClock - touchRequestCompleteClock) * 1000)
 						CoinEngine.LastChainSelectionMs = transitionMs
 						SetCurrent(chainCoin, now)
 						if CoinEngine.ThreatResponse.Active and not CoinEngine.ThreatResponse.EmergencyEscape then
@@ -14196,8 +14761,16 @@ local function ControllerStep(dt)
 								nextV = math.max(nextV, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 							end
 							ApplyStableFlightVelocity(nextDelta / nextDist, nextV, dt)
-							CoinEngine.LastChainCommandMs = math.max(0, (os.clock() - collectionConfirmationClock) * 1000)
+							local chainCommandAt = os.clock()
+							CoinEngine.LastChainCommandMs = math.max(0, (chainCommandAt - touchRequestCompleteClock) * 1000)
 							CoinEngine.LastTouchToMovementMs = CoinEngine.LastChainCommandMs
+							CoinEngine.LastChainCommandAt = chainCommandAt
+							CoinEngine.LastChainCommandSourceCoin = target
+							local observedConfirmToCommandMs = -1
+							if CoinEngine.LastObservedCollectionCoin == target and (tonumber(CoinEngine.LastObservedCollectionAt) or 0) <= chainCommandAt then
+								observedConfirmToCommandMs = math.max(0, (chainCommandAt - CoinEngine.LastObservedCollectionAt) * 1000)
+							end
+							CoinEngine.LastObservedCollectionToChainCommandMs = observedConfirmToCommandMs
 							lastFlightV = nextV
 							velApplied = true -- emite la orden hacia la siguiente moneda en este mismo Heartbeat
 							local horiz = Vector3.new(nextDelta.X, 0, nextDelta.Z)
@@ -14210,8 +14783,9 @@ local function ControllerStep(dt)
 							velApplied = true
 						end
 						local commandMs = tonumber(CoinEngine.LastChainCommandMs) or transitionMs
-						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f confirmation-to-select-ms=%.2f confirmation-to-command-ms=%.2f prefetched-age-ms=%.2f density=%d",
-							CHAIN_ACCELERATION_MULTIPLIER, transitionMs, commandMs, preparedAgeMs,
+						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f touch-request-to-select-ms=%.2f touch-request-to-command-ms=%.2f observed-removal-to-command-ms=%.2f prefetched-age-ms=%.2f density=%d",
+							CHAIN_ACCELERATION_MULTIPLIER, transitionMs, commandMs,
+							CoinEngine.LastObservedCollectionToChainCommandMs or -1, preparedAgeMs,
 							tonumber(CoinEngine.CoinNeighborCount[chainCoin]) or 0))
 					else
 						chainAccelerationActive = false
