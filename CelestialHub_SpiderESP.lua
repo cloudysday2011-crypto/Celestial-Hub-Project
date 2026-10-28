@@ -1,4 +1,4 @@
--- V3.44 Residual Stall Hotfix: do not mask a stall at collection range; keep bounded contact approach commands alive.
+-- V3.45 localized timing update: 7s general airborne cap; validated 9s/20s descent tiers and adaptive NoClip hard limit preserved.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
 -- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
@@ -6714,11 +6714,12 @@ local CoinEngine = {
 	NoclipExitLastTryAt = 0,
 	NoclipExitAttempts = 0,
 	-- Supervisión coordinada de vuelo/NoClip: solo pertenece al controlador de navegación existente.
-	AirborneRecoveryLimit = 2.0,
+	AirborneRecoveryLimit = 7.0, -- general airborne maneuver ceiling; validated 9s/20s vertical descents take precedence
 	AirborneSupportDistance = 3.20,
 	AirborneProbeInterval = 0.08,
 	AirborneLookDownDistance = 100,
 	AirborneSince = nil,
+	AirborneGeneralLimitTriggered = false, -- one-shot per continuous airborne episode; never reset on target churn
 	-- Exceptional aerial window reserved for a validated, nearly vertical descent to the selected coin.
 	VerticalCoinDescentActive = false,
 	VerticalCoinDescentTarget = nil,
@@ -6885,6 +6886,7 @@ local function StopFlight()
 	CoinEngine.AutoNoclipTarget = nil
 	CoinEngine.AutoNoclipStartPosition = nil
 	CoinEngine.AirborneSince = nil
+	CoinEngine.AirborneGeneralLimitTriggered = false
 	CoinEngine.VerticalCoinDescentActive = false
 	CoinEngine.VerticalCoinDescentTarget = nil
 	CoinEngine.VerticalCoinDescentStartedAt = nil
@@ -10916,7 +10918,7 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			CoinEngine.EmergencyRecoveryStartedAt = now
 			CoinEngine.EmergencyRecoveryReason = reason
 			CoinEngine.EmergencyRecoveryReleaseSince = nil
-			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f limit=3.00",
+			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=7.00 noclipHardLimit=3.00",
 				tostring(reason), tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45, stalledFor, wallAge,
 				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0))
 		elseif reason == "wall-traversal-stall" then
@@ -11012,6 +11014,7 @@ local function UpdateAirborneRecoveryState(root, now)
 	if not root or not CoinEngine.Active or not State.FarmEnabled or State.NoClipActive then
 		if CoinEngine.VerticalCoinDescentActive then CoinEngine.ResetVerticalCoinDescent(now, "farm-or-context-inactive", false) end
 		CoinEngine.AirborneSince = nil
+		CoinEngine.AirborneGeneralLimitTriggered = false
 		CoinEngine.AirRecoveryActive = false
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
@@ -11059,6 +11062,7 @@ local function UpdateAirborneRecoveryState(root, now)
 				math.max(0, now - (CoinEngine.AirborneSince or now)), tostring(CoinEngine.AirRecoveryReason or "surface")))
 		end
 		CoinEngine.AirborneSince = nil
+		CoinEngine.AirborneGeneralLimitTriggered = false
 		CoinEngine.AirRecoveryActive = false
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
@@ -11140,6 +11144,29 @@ local function UpdateAirborneRecoveryState(root, now)
 			-- Normal airborne recovery stays suppressed only while the validated descent is progressing.
 			return false
 		end
+	end
+
+	-- General airborne ceiling: 7 seconds applies only after the validated 9s/20s vertical-descent
+	-- handler above has declined the special case. This is a one-shot transition into the existing
+	-- recovery path, not a delay; measured no-progress still starts recovery much earlier.
+	-- AutoNoclipHardLimit remains 3.0 intentionally: it belongs to the protected adaptive NoClip
+	-- crossing safety envelope and is not changed by this general airborne setting.
+	local generalAirborneLimit = math.clamp(tonumber(CoinEngine.AirborneRecoveryLimit) or 7.0, 3.0, 7.0)
+	if airborneFor >= generalAirborneLimit and not CoinEngine.AirborneGeneralLimitTriggered then
+		CoinEngine.AirborneGeneralLimitTriggered = true
+		if not CoinEngine.AirRecoveryActive then
+			CoinEngine.AirRecoveryActive = true
+			CoinEngine.AirRecoveryDestination = nil
+			CoinEngine.AirRecoveryDestinationAt = 0
+			CoinEngine.AirRecoveryDestinationTarget = nil
+			CoinEngine.AirRecoveryDestinationStart = root.Position
+			CoinEngine.AirRecoveryNoDestinationSince = nil
+			CoinEngine.AirRecoveryReason = "general-airborne-limit"
+			CoinEngine.AirRecoveryRetryAt = 0
+		end
+		LogEvent(string.format("air-recovery-general-limit elapsed=%.2f limit=%.2f descentException=inactive action=existing-recovery",
+			airborneFor, generalAirborneLimit))
+		return true
 	end
 
 	-- Si no existe superficie segura tras varios intentos y todavía quedan monedas, no mantener
