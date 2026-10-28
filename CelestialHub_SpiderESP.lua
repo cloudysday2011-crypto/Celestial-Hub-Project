@@ -1,3 +1,4 @@
+-- V3.44 Residual Stall Hotfix: do not mask a stall at collection range; keep bounded contact approach commands alive.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
 -- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
@@ -10835,8 +10836,14 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 	if previousPosition and elapsed >= 0.08 and previousDirection.Magnitude > 0.01 then
 		local displacement = position - previousPosition
 		local forwardDisplacement = displacement:Dot(previousDirection.Unit)
-		local threshold = math.max(tonumber(CoinEngine.EmergencyRecoveryProgressThreshold) or 0.28,
-			math.min(0.70, previousCommandSpeed * elapsed * 0.12))
+		-- Scale the progress threshold to the command actually issued. A fixed 0.28-stud
+		-- floor misclassified slow, deliberate contact-approach movement as a stall; a moving
+		-- avatar could then receive recovery commands even though it was making useful progress.
+		-- Keep a small noise floor and cap the threshold so high-speed requests remain responsive.
+		local progressThresholdCap = math.clamp(
+			type(CoinEngine.EmergencyRecoveryProgressThreshold) == "number"
+				and CoinEngine.EmergencyRecoveryProgressThreshold or 0.28, 0.08, 0.45)
+		local threshold = math.clamp(previousCommandSpeed * elapsed * 0.12, 0.06, progressThresholdCap)
 		-- Sideways jitter or movement against the prior command is not useful progress.
 		madeProgress = forwardDisplacement >= threshold
 	end
@@ -12858,7 +12865,8 @@ local function ControllerStep(dt)
 		-- (sin teleport) y no contar la moneda hasta que el juego realmente la retire.
 		if firetouchinterest then
 			if arriveTarget ~= target then arriveTarget = target; arriveAt = now end
-			lastProgress = now
+			-- Reaching collection range is not proof of locomotion progress. Do not refresh
+			-- lastProgress every frame here: failed touch confirmation must still be recoverable.
 			if CoinEngine.SoftBrake then
 				-- Reduce solo la velocidad de aproximacion, no la velocidad de crucero acumulada.
 				-- Al recoger la moneda, la cadena puede continuar acelerando sin arrancar otra vez desde cero.
@@ -13017,9 +13025,26 @@ local function ControllerStep(dt)
 				end
 			end
 		else
-			-- A distancia de contacto no hay que declarar recogida ni limpiar el objetivo manualmente.
-			-- La moneda desaparecera por el contacto del juego o seguira siendo el objetivo.
-			lastProgress = now
+			-- Sin firetouchinterest, el juego debe confirmar la recogida mediante contacto físico.
+			-- No devolver el frame sin una orden: SafeControllerStep convierte velApplied=false en
+			-- velocidad cero, lo que podía dejar al avatar inmóvil justo antes del contacto.
+			-- Mantener un avance corto y acotado hacia el punto de contacto; nunca marcarlo como
+			-- progreso si la posición real no cambió. El watchdog normal puede recuperar el caso raro
+			-- en el que la moneda no se recoge, sin prolongar el intento indefinidamente.
+			if dist > 0.001 and flightVel then
+				local contactFrameCap = math.min(4.0, tonumber(frameSpeedCap) or 4.0)
+				local contactApproachSpeed = math.min(contactFrameCap, math.max(2.5, tonumber(currentSpeed) or 0))
+				ApplyStableFlightVelocity(delta.Unit, contactApproachSpeed, dt)
+				lastFlightV = contactApproachSpeed
+				velApplied = true
+			else
+				-- At essentially zero separation there is no safe direction to synthesize.
+				-- Keep this explicit terminal command, but do not reset the no-progress watchdog.
+				CoinEngine.LastCommandVelocity = Vector3.zero
+				if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
+				lastFlightV = 0
+				velApplied = true
+			end
 		end
 	else
 		-- Vuelo: durante un desvio validado, el vector apunta al waypoint; la distancia real
