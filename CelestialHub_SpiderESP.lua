@@ -632,8 +632,12 @@ local function ScanGameMode()
 	if scoreMM2 > scoreDuels then return "MM2"
 	elseif scoreDuels > scoreMM2 then return "DUELS"
 	else
-		if pg and pg:FindFirstChild("MainGUI") then return "MM2" end
-		return "DUELS"
+		local hasMainGui = pg and pg:FindFirstChild("MainGUI") ~= nil
+		local hasDuelsGui = pg and (pg:FindFirstChild("DuelGUI") ~= nil or pg:FindFirstChild("DuelHUD") ~= nil)
+		if hasMainGui and not hasDuelsGui then return "MM2" end
+		if hasDuelsGui and not hasMainGui then return "DUELS" end
+		-- A tie or absence of identifying signals is unknown, not proof of DUELS.
+		return "UNKNOWN"
 	end
 end
 
@@ -5686,7 +5690,9 @@ local InfectionBarnESP = {
 	MapDeepScanCheckedAt = 0,
 	LastCharacterReadyAt = 0,
 	ModeCheckedAt = 0,
-	ModeSignalDetected = false,
+	ModeSignalDetected = false, -- true only for an explicit Infection signal
+	ModeSignalPresent = false,
+	ModeSignalKind = nil, -- INFECTION, MM2_NORMAL, OTHER, NON_INFECTION
 	ModeSignalText = nil,
 	ModeSignalObject = nil,
 	ModeSignalAttribute = nil,	
@@ -5726,16 +5732,33 @@ InfectionBarnESP.ReadExplicitModeSignal = function(now, allowDeepScan)
 		GAMEMODELABEL = true, CURRENTMODELABEL = true, ROUNDMODELABEL = true,
 		MODEINDICATOR = true, EVENTMODELABEL = true, ROUNDINFO = true,
 	}
-	local function ModeValueMatches(keyName, value)
+	local normalTokens = {
+		CLASSIC = true, NORMAL = true, NORMALMODE = true, MM2 = true,
+		MURDERMYSTERY2 = true, MURDERMYSTERY = true, STANDARD = true, REGULAR = true,
+	}
+	local otherTokens = {
+		DUEL = true, DUELS = true, SPIDER = true, ASSASSINS = true,
+		HIDEANDSEEK = true, HIDESEEK = true, ELEVATOR = true,
+	}
+	local function ClassifyModeValue(keyName, value)
 		local key = CH_NormalizeMapToken(keyName)
-		if not modeKeys[key] then return false end
-		if type(value) == "string" then
-			local token = CH_NormalizeMapToken(value)
-			return token:find("INFECTION", 1, true) ~= nil
-		elseif type(value) == "boolean" and value then
-			return key == "ISINFECTION" or key == "ISINFECTIONMODE" or key == "INFECTIONMODE"
+		if not modeKeys[key] then return nil end
+		if type(value) == "boolean" then
+			if value and (key == "ISINFECTION" or key == "ISINFECTIONMODE" or key == "INFECTIONMODE") then
+				return "INFECTION"
+			end
+			if value == false and (key == "ISINFECTION" or key == "ISINFECTIONMODE" or key == "INFECTIONMODE") then
+				return "NON_INFECTION"
+			end
+			return nil
 		end
-		return false
+		if type(value) ~= "string" then return nil end
+		local token = CH_NormalizeMapToken(value)
+		if token == "" then return nil end
+		if token:find("INFECTION", 1, true) then return "INFECTION" end
+		if normalTokens[token] then return "MM2_NORMAL" end
+		if otherTokens[token] then return "OTHER" end
+		return nil
 	end
 	local function ReadSignalObject(obj, prop, attributeName)
 		if not obj then return nil end
@@ -5747,54 +5770,58 @@ InfectionBarnESP.ReadExplicitModeSignal = function(now, allowDeepScan)
 		end)
 		return ok and value or nil
 	end
-	local function RememberSignal(obj, prop, attributeName, keyName, value)
+	local function RememberSignal(obj, prop, attributeName, value, kind)
 		InfectionBarnESP.ModeSignalObject = obj
 		InfectionBarnESP.ModeSignalProperty = prop
 		InfectionBarnESP.ModeSignalAttribute = attributeName
 		InfectionBarnESP.ModeSignalText = tostring(value)
-		InfectionBarnESP.ModeSignalDetected = true
+		InfectionBarnESP.ModeSignalKind = kind
+		InfectionBarnESP.ModeSignalPresent = kind ~= nil
+		InfectionBarnESP.ModeSignalDetected = kind == "INFECTION"
 		InfectionBarnESP.ModeCheckedAt = now
-		return true
+		return kind == "INFECTION", InfectionBarnESP.ModeSignalText, kind ~= nil, kind
 	end
-	-- Re-read an already located live signal each context pass. This catches round-mode changes
-	-- without repeating a complete descendant scan every Heartbeat/render update.
+	-- Re-read an already located live signal every context pass so round changes do not
+	-- require a full descendant scan. Recognized normal/other signals also invalidate stale Infection.
 	local cached = InfectionBarnESP.ModeSignalObject
 	if cached then
 		local cachedValue = ReadSignalObject(cached, InfectionBarnESP.ModeSignalProperty, InfectionBarnESP.ModeSignalAttribute)
 		local cachedKeyName = InfectionBarnESP.ModeSignalProperty == "attribute"
 			and InfectionBarnESP.ModeSignalAttribute or cached.Name
-		if cached.Parent and ModeValueMatches(cachedKeyName, cachedValue) then
-			InfectionBarnESP.ModeSignalDetected = true
+		local cachedKind = cached.Parent and ClassifyModeValue(cachedKeyName, cachedValue) or nil
+		if cachedKind then
+			InfectionBarnESP.ModeSignalDetected = cachedKind == "INFECTION"
+			InfectionBarnESP.ModeSignalPresent = true
+			InfectionBarnESP.ModeSignalKind = cachedKind
 			InfectionBarnESP.ModeSignalText = tostring(cachedValue)
-			return true, InfectionBarnESP.ModeSignalText
+			return cachedKind == "INFECTION", InfectionBarnESP.ModeSignalText, true, cachedKind
 		end
 		InfectionBarnESP.ModeSignalObject = nil
 		InfectionBarnESP.ModeSignalAttribute = nil
 		InfectionBarnESP.ModeSignalProperty = nil
 		InfectionBarnESP.ModeSignalText = nil
+		InfectionBarnESP.ModeSignalKind = nil
+		InfectionBarnESP.ModeSignalPresent = false
 		InfectionBarnESP.ModeSignalDetected = false
 	end
-	-- Cheap root-attribute checks run every pass so a direct replicated mode flag is observed promptly.
 	local roots = {Workspace, ReplicatedStorage, LocalPlayer:FindFirstChild("PlayerGui")}
+	-- Root attributes are cheap and checked before any broad discovery.
 	for _, root in ipairs(roots) do
 		if root then
 			local attrs = {}
 			pcall(function() attrs = root:GetAttributes() end)
 			for key, value in pairs(attrs) do
-				if ModeValueMatches(key, value) then
-					RememberSignal(root, "attribute", key, key, value)
-					return true, tostring(value)
-				end
+				local kind = ClassifyModeValue(key, value)
+				if kind then return RememberSignal(root, "attribute", key, value, kind) end
 			end
 		end
 	end
-	-- If the map itself is not a Barn candidate, do not scan all descendants for mode metadata.
-	-- Descendant discovery is deliberately throttled and bounded; names must identify mode metadata.
+	-- Full descendant discovery is only enabled for a plausible Barn map and is throttled.
 	if not allowDeepScan then
-		return InfectionBarnESP.ModeSignalDetected == true, InfectionBarnESP.ModeSignalText
+		return false, nil, false, nil
 	end
 	if now - (InfectionBarnESP.ModeCheckedAt or 0) < 1.25 then
-		return InfectionBarnESP.ModeSignalDetected == true, InfectionBarnESP.ModeSignalText
+		return false, nil, false, nil
 	end
 	InfectionBarnESP.ModeCheckedAt = now
 	for _, root in ipairs(roots) do
@@ -5807,10 +5834,8 @@ InfectionBarnESP.ReadExplicitModeSignal = function(now, allowDeepScan)
 				local attrs = {}
 				pcall(function() attrs = obj:GetAttributes() end)
 				for key, value in pairs(attrs) do
-					if ModeValueMatches(key, value) then
-						RememberSignal(obj, "attribute", key, key, value)
-						return true, tostring(value)
-					end
+					local kind = ClassifyModeValue(key, value)
+					if kind then return RememberSignal(obj, "attribute", key, value, kind) end
 				end
 				local prop, value = nil, nil
 				if obj:IsA("StringValue") or obj:IsA("BoolValue") then
@@ -5818,16 +5843,16 @@ InfectionBarnESP.ReadExplicitModeSignal = function(now, allowDeepScan)
 				elseif obj:IsA("TextLabel") or obj:IsA("TextButton") then
 					prop, value = "text", obj.Text
 				end
-				if prop and ModeValueMatches(obj.Name, value) then
-					RememberSignal(obj, prop, nil, obj.Name, value)
-					return true, tostring(value)
-				end
+				local kind = prop and ClassifyModeValue(obj.Name, value) or nil
+				if kind then return RememberSignal(obj, prop, nil, value, kind) end
 			end
 		end
 	end
 	InfectionBarnESP.ModeSignalDetected = false
+	InfectionBarnESP.ModeSignalPresent = false
+	InfectionBarnESP.ModeSignalKind = nil
 	InfectionBarnESP.ModeSignalText = nil
-	return false, nil
+	return false, nil, false, nil
 end
 
 local function CH_IsInfectionBarnMapLoaded()
@@ -5899,7 +5924,7 @@ local function CH_IsInfectionBarnMapLoaded()
 	elseif explicitOtherMap or now - (InfectionBarnESP.MapDeepScanCheckedAt or 0) >= 0.85 then
 		InfectionBarnESP.MapSignalObject = nil
 	end
-	local modeConfirmed, modeText = InfectionBarnESP.ReadExplicitModeSignal(now, mapFound)
+	local modeConfirmed, modeText, modeSignalPresent, modeSignalKind = InfectionBarnESP.ReadExplicitModeSignal(now, mapFound)
 	local gameTypeConfirmed = _G.Celestial.GameMode == "MM2"
 	local playersReady = #Players:GetPlayers() > 1
 	local localCharacter = LocalPlayer.Character
@@ -5917,11 +5942,17 @@ local function CH_IsInfectionBarnMapLoaded()
 	end
 	InfectionBarnESP.MapLoaded = mapFound
 	InfectionBarnESP.ModeSignalDetected = modeConfirmed
+	InfectionBarnESP.ModeSignalPresent = modeSignalPresent == true
+	InfectionBarnESP.ModeSignalKind = modeSignalKind
 	InfectionBarnESP.Confirmed = confirmed
 	if confirmed then
 		InfectionBarnESP.ContextStatus = "INFECTION_BARN"
 	elseif mapFound then
 		InfectionBarnESP.ContextStatus = "UNKNOWN_INFECTION_CANDIDATE"
+	elseif gameTypeConfirmed and modeSignalPresent and modeSignalKind == "MM2_NORMAL" and playersReady and characterReady then
+		InfectionBarnESP.ContextStatus = "MM2_NORMAL_CONFIRMED"
+	elseif gameTypeConfirmed and modeSignalPresent and modeSignalKind == "OTHER" and playersReady and characterReady then
+		InfectionBarnESP.ContextStatus = "OTHER_MM2_MODE_CONFIRMED"
 	elseif _G.Celestial.GameMode == "MM2" then
 		InfectionBarnESP.ContextStatus = "MM2_UNCONFIRMED_ROUND_MODE"
 	elseif _G.Celestial.GameMode == "DUELS" or _G.Celestial.GameMode == "SPIDER" then
@@ -5934,7 +5965,8 @@ local function CH_IsInfectionBarnMapLoaded()
 		context.Status = InfectionBarnESP.ContextStatus
 		context.IsInfectionBarn = confirmed
 		context.MapConfirmed = mapFound
-		context.ModeConfirmed = modeConfirmed and gameTypeConfirmed
+		context.ModeConfirmed = modeSignalPresent == true and gameTypeConfirmed
+		context.ModeSignalKind = modeSignalKind
 		context.RoundReady = characterReady and playersReady
 		context.RoundModeSignal = modeText
 		context.GameMode = _G.Celestial.GameMode
@@ -6693,7 +6725,17 @@ local CoinEngine = {
 	VerticalCoinDescentNextValidateAt = 0,
 	VerticalCoinDescentBlockedTarget = nil,
 	VerticalCoinDescentBlockedUntil = 0,
-	VerticalCoinDescentMaxTime = 9.0,
+	VerticalCoinDescentMaxTime = 9.0, -- preserved standard downward-descent exception
+	VerticalCoinHighAltitudeMaxTime = 20.0, -- separate exception only for a validated large vertical drop
+	VerticalCoinHighAltitudeThreshold = 30.0, -- minimum vertical separation for the 20-second tier
+	VerticalCoinHighAltitudeMaxVerticalGap = 300.0, -- bounded by the existing 300-stud max distance; only directly aligned descents qualify
+	VerticalCoinDescentHighAltitude = false,
+	VerticalCoinDescentProgressAnchorY = nil,
+	VerticalCoinDescentLastProgressAt = nil,
+	VerticalCoinDescentNextProgressCheckAt = 0,
+	VerticalCoinDescentNoProgressTimeout = 1.25,
+	VerticalCoinDescentProgressCheckInterval = 0.20,
+	VerticalCoinDescentProgressStep = 0.60,
 	VerticalCoinDescentStartHorizontalTolerance = 4.5,
 	VerticalCoinDescentKeepHorizontalTolerance = 5.5,
 	VerticalCoinDescentMinDrop = 2.0,
@@ -6843,6 +6885,10 @@ local function StopFlight()
 	CoinEngine.VerticalCoinDescentTarget = nil
 	CoinEngine.VerticalCoinDescentStartedAt = nil
 	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	CoinEngine.VerticalCoinDescentHighAltitude = false
+	CoinEngine.VerticalCoinDescentProgressAnchorY = nil
+	CoinEngine.VerticalCoinDescentLastProgressAt = nil
+	CoinEngine.VerticalCoinDescentNextProgressCheckAt = 0
 	CoinEngine.VerticalCoinDescentBlockedTarget = nil
 	CoinEngine.VerticalCoinDescentBlockedUntil = 0
 	CoinEngine.AirRecoveryActive = false
@@ -8990,6 +9036,10 @@ end
 CoinEngine.PickNearestPrefetchBounded = function(fromPos, exclude, now, maxGap, maxDistance)
 	local shortlist, limit = {}, 12
 	local maxDistanceSq = maxDistance * maxDistance
+	local highDropThreshold = math.max(10.0, tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+	local highDropMaxGap = math.max(highDropThreshold, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+	local highDropHorizontalLimitSq = 4.5 * 4.5
+	local highDropCandidate, highDropCandidateGap = nil, math.huge
 	local cellSize = math.max(1, tonumber(CoinEngine.ChainNeighborRadius) or 18)
 	local localRadius = math.min(maxDistance, cellSize)
 	local localRadiusSq = localRadius * localRadius
@@ -9003,8 +9053,17 @@ CoinEngine.PickNearestPrefetchBounded = function(fromPos, exclude, now, maxGap, 
 		local pos = coin.Position
 		local dx, dy, dz = pos.X - fromPos.X, pos.Y - fromPos.Y, pos.Z - fromPos.Z
 		local distanceSq = dx * dx + dy * dy + dz * dz
-		if math.abs(dy) > maxGap or distanceSq > maxDistanceSq then return end
+		local verticalDrop = -dy
+		local horizontalDistanceSquared = dx * dx + dz * dz
+		local directHighDrop = verticalDrop >= highDropThreshold and verticalDrop <= highDropMaxGap
+			and horizontalDistanceSquared <= highDropHorizontalLimitSq
+		if (math.abs(dy) > maxGap and not directHighDrop) or distanceSq > maxDistanceSq then return end
 		if localOnly and distanceSq > localRadiusSq then return end
+		-- The full-cache fallback may preserve an aligned lower coin for the special 20-second
+		-- descent tier. Keep the ordinary local shortlist preferred when it already has a usable coin.
+		if not localOnly and directHighDrop and verticalDrop < highDropCandidateGap then
+			highDropCandidate, highDropCandidateGap = coin, verticalDrop
+		end
 		local score = ThreatAwareCoinScore(fromPos, pos, now) - GetCoinChainBonus(coin)
 		CoinEngine.InsertBoundedCoinCandidate(shortlist, coin, score, limit)
 	end
@@ -9029,6 +9088,9 @@ CoinEngine.PickNearestPrefetchBounded = function(fromPos, exclude, now, maxGap, 
 	-- Only pay for a full-cache pass when the local spatial neighborhood has no usable coin.
 	table.clear(shortlist)
 	for coin in pairs(CoinEngine.CoinCache) do consider(coin, false) end
+	-- If the nearby neighborhood had no usable coin, retain a directly aligned high-drop target
+	-- for chaining; the normal controller validates its complete character path before descending.
+	if highDropCandidate and IsGrounded(highDropCandidate) then return highDropCandidate end
 	-- InsertBoundedCoinCandidate keeps this shortlist sorted as it is built.
 	return firstGroundedCandidate()
 end
@@ -9040,12 +9102,16 @@ end
 local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLimit)
 	local maxGap = math.min(tonumber(verticalLimit) or Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap),
 		Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap))
+	local highDropThreshold = math.max(10.0, tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+	local highDropMaxGap = math.max(highDropThreshold, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+	local highDropHorizontalLimitSq = 4.5 * 4.5
 	local maxDistance = Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
 	local maxRouteChecks = routeCheckLimit == nil and 1 or math.max(0, math.floor(tonumber(routeCheckLimit) or 0))
 	if maxRouteChecks == 0 then
 		return CoinEngine.PickNearestPrefetchBounded(fromPos, exclude, now, maxGap, maxDistance)
 	end
 	local candidates = {}
+	local highDropBest, highDropBestGap = nil, math.huge
 	local immediateBest, immediateBestScore = nil, math.huge
 	local immediateCheckedCoin, immediateGrounded = nil, false
 	local immediateRouteCheckConsumed = false
@@ -9137,9 +9203,15 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 				local pos = coin.Position
 				local dx, dy, dz = pos.X - fromPos.X, pos.Y - fromPos.Y, pos.Z - fromPos.Z
 				local verticalGap = math.abs(dy)
+				local horizontalDistanceSquared = dx * dx + dz * dz
+				local directHighDrop = dy <= -highDropThreshold and -dy <= highDropMaxGap
+					and horizontalDistanceSquared <= highDropHorizontalLimitSq
 				local distanceSquared = dx * dx + dy * dy + dz * dz
 				if not bl and not IsCoinTemporarilyExcluded(coin, now)
-					and verticalGap <= maxGap and distanceSquared <= maxDistance * maxDistance then
+					and (verticalGap <= maxGap or directHighDrop) and distanceSquared <= maxDistance * maxDistance then
+					if directHighDrop and verticalGap < highDropBestGap then
+						highDropBest, highDropBestGap = coin, verticalGap
+					end
 					local distance = math.sqrt(distanceSquared)
 					candidates[#candidates + 1] = {coin = coin}
 					local horizontalDelta = Vector3.new(dx, 0, dz)
@@ -9175,6 +9247,12 @@ local function PickNearestRaw(fromPos, exclude, now, verticalLimit, routeCheckLi
 				end
 			end
 		end
+	end
+	-- Prioritize one directly aligned high-drop coin when it is grounded and the direct route
+	-- passes the existing route check. The later movement controller still validates the full character volume.
+	if highDropBest and IsGrounded(highDropBest) then
+		if maxRouteChecks == 0 then return highDropBest end
+		if HasClearCoinRoute(fromPos, highDropBest) then return highDropBest end
 	end
 	if #candidates == 0 then return nil end
 
@@ -9919,10 +9997,13 @@ local function FindClearAlternativeCoin(root, blockedTarget, now)
 	if not root then return nil end
 	local prepared = CoinEngine.NextTarget
 	local function IsEligibleAlternative(coin)
-		return coin and coin ~= blockedTarget and IsAvailable(coin, now)
-			and IsThreatSafeCoin(coin)
-			and (coin.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-			and math.abs(coin.Position.Y - root.Position.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+		if not (coin and coin ~= blockedTarget and IsAvailable(coin, now) and IsThreatSafeCoin(coin)) then return false end
+		local delta = coin.Position - root.Position
+		local highDrop = -delta.Y >= (tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+			and -delta.Y <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+			and Vector3.new(delta.X, 0, delta.Z).Magnitude <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
+		return delta.Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+			and (math.abs(delta.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap) or highDrop)
 	end
 	if IsEligibleAlternative(prepared) and HasClearCoinRoute(root.Position, prepared) then return prepared end
 	local candidate
@@ -10200,9 +10281,15 @@ end
 local function AdvanceTarget(root, now)
 	local nxt = CoinEngine.NextTarget
 	local maxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	local nextDelta = nxt and (nxt.Position - root.Position) or nil
+	local nextHorizontalGap = nextDelta and Vector3.new(nextDelta.X, 0, nextDelta.Z).Magnitude or math.huge
+	local nextVerticalDrop = nextDelta and -nextDelta.Y or 0
+	local highDropAllowed = nextVerticalDrop >= (tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+		and nextVerticalDrop <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+		and nextHorizontalGap <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
 	if nxt and IsAvailable(nxt, now)
-		and (nxt.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-		and math.abs(nxt.Position.Y - root.Position.Y) <= maxGap
+		and (nextDelta).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+		and (math.abs(nextDelta.Y) <= maxGap or highDropAllowed)
 		and IsThreatSafeCoin(nxt) then
 		SetCurrent(nxt, now)
 		return
@@ -10866,6 +10953,10 @@ CoinEngine.ResetVerticalCoinDescent = function(now, reason, blacklistTarget)
 	CoinEngine.VerticalCoinDescentTarget = nil
 	CoinEngine.VerticalCoinDescentStartedAt = nil
 	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	CoinEngine.VerticalCoinDescentHighAltitude = false
+	CoinEngine.VerticalCoinDescentProgressAnchorY = nil
+	CoinEngine.VerticalCoinDescentLastProgressAt = nil
+	CoinEngine.VerticalCoinDescentNextProgressCheckAt = 0
 	if wasActive and CoinEngine.routeNavigation and ResetRouteNavigation then
 		ResetRouteNavigation(CoinEngine.CurrentTarget, now)
 	end
@@ -10912,7 +11003,9 @@ local function UpdateAirborneRecoveryState(root, now)
 		local descentActive = CoinEngine.VerticalCoinDescentActive == true
 		local descentAge = descentActive and CoinEngine.VerticalCoinDescentStartedAt
 			and math.max(0, now - CoinEngine.VerticalCoinDescentStartedAt) or 0
-		local descentLimit = math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
+		local descentLimit = descentActive and CoinEngine.VerticalCoinDescentHighAltitude
+			and math.max(1.0, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxTime) or 20.0)
+			or math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
 		if not descentActive or descentAge < descentLimit then
 			return CoinEngine.AirRecoveryActive == true
 		end
@@ -10950,9 +11043,9 @@ local function UpdateAirborneRecoveryState(root, now)
 	CoinEngine.AirborneSince = CoinEngine.AirborneSince or now
 	local airborneFor = now - CoinEngine.AirborneSince
 
-	-- A verified coin-below descent owns a separate 9-second timer that starts only when
-	-- the direct, safe path was confirmed. While it remains valid, the normal 3-second-style
-	-- airborne recovery is suppressed; invalidation or timeout returns to the existing recovery.
+	-- Validated vertical descents use exactly one timer: 9 seconds for an ordinary drop,
+	-- or 20 seconds only when the descent began from a large vertical separation. Their timer
+	-- does not reset on candidate churn. A separate vertical-progress watchdog exits early from spins.
 	if CoinEngine.VerticalCoinDescentActive then
 		local descentTarget = CoinEngine.VerticalCoinDescentTarget
 		local targetStillValid = descentTarget and descentTarget.Parent and CoinEngine.CoinCache[descentTarget]
@@ -10961,10 +11054,27 @@ local function UpdateAirborneRecoveryState(root, now)
 			CoinEngine.ResetVerticalCoinDescent(now, "target-invalidated", false)
 		else
 			local descentElapsed = now - (CoinEngine.VerticalCoinDescentStartedAt or now)
-			local descentLimit = math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
-			if descentElapsed >= descentLimit then
+			local highAltitude = CoinEngine.VerticalCoinDescentHighAltitude == true
+			local descentLimit = highAltitude
+				and math.max(1.0, tonumber(CoinEngine.VerticalCoinHighAltitudeMaxTime) or 20.0)
+				or math.max(1.0, tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
+			if now >= (CoinEngine.VerticalCoinDescentNextProgressCheckAt or 0) then
+				local anchorY = tonumber(CoinEngine.VerticalCoinDescentProgressAnchorY) or root.Position.Y
+				local progressStep = math.max(0.25, tonumber(CoinEngine.VerticalCoinDescentProgressStep) or 0.60)
+				if root.Position.Y <= anchorY - progressStep then
+					CoinEngine.VerticalCoinDescentProgressAnchorY = root.Position.Y
+					CoinEngine.VerticalCoinDescentLastProgressAt = now
+				end
+				CoinEngine.VerticalCoinDescentNextProgressCheckAt = now
+					+ math.max(0.08, tonumber(CoinEngine.VerticalCoinDescentProgressCheckInterval) or 0.20)
+			end
+			local lastVerticalProgressAt = tonumber(CoinEngine.VerticalCoinDescentLastProgressAt)
+				or CoinEngine.VerticalCoinDescentStartedAt or now
+			local noVerticalProgressFor = math.max(0, now - lastVerticalProgressAt)
+			local noProgressLimit = math.max(0.50, tonumber(CoinEngine.VerticalCoinDescentNoProgressTimeout) or 1.25)
+			if noVerticalProgressFor >= noProgressLimit then
 				local failedTarget = descentTarget
-				CoinEngine.ResetVerticalCoinDescent(now, "nine-second-timeout", true)
+				CoinEngine.ResetVerticalCoinDescent(now, "vertical-no-progress", true)
 				if CoinEngine.CurrentTarget == failedTarget then SetCurrent(nil, now) end
 				CoinEngine.AirRecoveryActive = true
 				CoinEngine.AirRecoveryDestination = nil
@@ -10972,13 +11082,30 @@ local function UpdateAirborneRecoveryState(root, now)
 				CoinEngine.AirRecoveryDestinationTarget = nil
 				CoinEngine.AirRecoveryDestinationStart = root.Position
 				CoinEngine.AirRecoveryNoDestinationSince = nil
-				CoinEngine.AirRecoveryReason = "vertical-coin-descent-timeout"
+				CoinEngine.AirRecoveryReason = "vertical-coin-descent-no-progress"
 				CoinEngine.AirRecoveryRetryAt = 0
-				LogEvent(string.format("vertical-coin-descent timeout elapsed=%.2f limit=%.2f action=existing-air-recovery", descentElapsed, descentLimit))
+				LogEvent(string.format("vertical-coin-descent stalled elapsed=%.2f noVerticalProgress=%.2f mode=%s action=existing-air-recovery",
+					descentElapsed, noVerticalProgressFor, highAltitude and "HIGH_ALTITUDE_20S" or "STANDARD_9S"))
 				return true
 			end
-			-- Do not reset the timer on target/waypoint churn. Only a confirmed support,
-			-- invalid target, invalid path, or this hard timeout ends the exception.
+			if descentElapsed >= descentLimit then
+				local failedTarget = descentTarget
+				local timeoutReason = highAltitude and "high-altitude-timeout" or "nine-second-timeout"
+				CoinEngine.ResetVerticalCoinDescent(now, timeoutReason, true)
+				if CoinEngine.CurrentTarget == failedTarget then SetCurrent(nil, now) end
+				CoinEngine.AirRecoveryActive = true
+				CoinEngine.AirRecoveryDestination = nil
+				CoinEngine.AirRecoveryDestinationAt = 0
+				CoinEngine.AirRecoveryDestinationTarget = nil
+				CoinEngine.AirRecoveryDestinationStart = root.Position
+				CoinEngine.AirRecoveryNoDestinationSince = nil
+				CoinEngine.AirRecoveryReason = highAltitude and "vertical-coin-descent-high-altitude-timeout" or "vertical-coin-descent-timeout"
+				CoinEngine.AirRecoveryRetryAt = 0
+				LogEvent(string.format("vertical-coin-descent timeout elapsed=%.2f limit=%.2f mode=%s action=existing-air-recovery",
+					descentElapsed, descentLimit, highAltitude and "HIGH_ALTITUDE_20S" or "STANDARD_9S"))
+				return true
+			end
+			-- Normal airborne recovery stays suppressed only while the validated descent is progressing.
 			return false
 		end
 	end
@@ -11146,7 +11273,10 @@ CoinEngine.UpdateVerticalCoinDescent = function(root, target, approachPos, now)
 	-- character has just left an edge, the next existing support probe will make this false.
 	if not active and CoinEngine.AirRecoveryLastSupported == true then return false end
 	-- A timed-out descent must finish its normal recovery before any new special descent starts.
-	if not active and CoinEngine.AirRecoveryActive and CoinEngine.AirRecoveryReason == "vertical-coin-descent-timeout" then
+	if not active and CoinEngine.AirRecoveryActive
+		and (CoinEngine.AirRecoveryReason == "vertical-coin-descent-timeout"
+			or CoinEngine.AirRecoveryReason == "vertical-coin-descent-high-altitude-timeout"
+			or CoinEngine.AirRecoveryReason == "vertical-coin-descent-no-progress") then
 		return false
 	end
 	local interval = math.max(0.08, tonumber(CoinEngine.VerticalCoinDescentValidateInterval) or 0.12)
@@ -11170,22 +11300,45 @@ CoinEngine.UpdateVerticalCoinDescent = function(root, target, approachPos, now)
 		CoinEngine.routeNavigation.noDetourPending = false
 		CoinEngine.VerticalCoinDescentNextValidateAt = now + interval
 	end
+	local highThreshold = math.max(10.0, tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+	-- Classify the tier against the coin's actual vertical position, consistently with selection
+	-- and stale-target validation; approach-height offset is only for the movement endpoint.
+	local currentDrop = root.Position.Y - target.Position.Y
+	local isHighAltitudeNow = currentDrop >= highThreshold
 	if not active then
 		CoinEngine.VerticalCoinDescentActive = true
 		CoinEngine.VerticalCoinDescentTarget = target
 		CoinEngine.VerticalCoinDescentStartedAt = now
-		LogEvent(string.format("vertical-coin-descent start dy=%.1f horizontal=%.2f exception=9.00 target=%s",
-			delta.Y, horizontalGap, tostring(target.Name)))
-	elseif targetChanged then
-		-- A different valid coin directly below may continue the same uninterrupted descent;
-		-- preserve the original start time instead of resetting the 9-second budget.
-		CoinEngine.VerticalCoinDescentTarget = target
-		LogEvent(string.format("vertical-coin-descent retarget elapsed=%.2f target=%s",
-			math.max(0, now - (CoinEngine.VerticalCoinDescentStartedAt or now)), tostring(target.Name)))
+		CoinEngine.VerticalCoinDescentHighAltitude = isHighAltitudeNow
+		CoinEngine.VerticalCoinDescentProgressAnchorY = root.Position.Y
+		CoinEngine.VerticalCoinDescentLastProgressAt = now
+		CoinEngine.VerticalCoinDescentNextProgressCheckAt = now + math.max(0.08, tonumber(CoinEngine.VerticalCoinDescentProgressCheckInterval) or 0.20)
+		local tier = isHighAltitudeNow and "HIGH_ALTITUDE_20S" or "STANDARD_9S"
+		local limit = isHighAltitudeNow and (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxTime) or 20.0)
+			or (tonumber(CoinEngine.VerticalCoinDescentMaxTime) or 9.0)
+		LogEvent(string.format("vertical-coin-descent start dy=%.1f horizontal=%.2f exception=%.2f mode=%s target=%s",
+			delta.Y, horizontalGap, limit, tier, tostring(target.Name)))
+	else
+		-- A different validated lower coin may continue the same descent. Preserve the original
+		-- timer and progress watchdog; once the large-drop tier is earned it cannot downgrade mid-flight.
+		if isHighAltitudeNow and not CoinEngine.VerticalCoinDescentHighAltitude then
+			CoinEngine.VerticalCoinDescentHighAltitude = true
+			LogEvent(string.format("vertical-coin-descent tier-upgrade elapsed=%.2f dy=%.1f limit=20.00",
+				math.max(0, now - (CoinEngine.VerticalCoinDescentStartedAt or now)), delta.Y))
+		end
+		if targetChanged then
+			CoinEngine.VerticalCoinDescentTarget = target
+			LogEvent(string.format("vertical-coin-descent retarget elapsed=%.2f mode=%s target=%s",
+				math.max(0, now - (CoinEngine.VerticalCoinDescentStartedAt or now)),
+				CoinEngine.VerticalCoinDescentHighAltitude and "HIGH_ALTITUDE_20S" or "STANDARD_9S", tostring(target.Name)))
+		end
 	end
 	-- A newly validated direct descent supersedes only generic airborne landing recovery. A hard-timeout
 	-- recovery is intentionally not canceled here.
-	if CoinEngine.AirRecoveryActive and CoinEngine.AirRecoveryReason ~= "vertical-coin-descent-timeout" then
+	if CoinEngine.AirRecoveryActive
+		and CoinEngine.AirRecoveryReason ~= "vertical-coin-descent-timeout"
+		and CoinEngine.AirRecoveryReason ~= "vertical-coin-descent-high-altitude-timeout"
+		and CoinEngine.AirRecoveryReason ~= "vertical-coin-descent-no-progress" then
 		CoinEngine.AirRecoveryActive = false
 		CoinEngine.AirRecoveryDestination = nil
 		CoinEngine.AirRecoveryDestinationAt = 0
@@ -11747,6 +11900,10 @@ function CoinEngine.CleanupRoundCaches()
 	CoinEngine.VerticalCoinDescentTarget = nil
 	CoinEngine.VerticalCoinDescentStartedAt = nil
 	CoinEngine.VerticalCoinDescentNextValidateAt = 0
+	CoinEngine.VerticalCoinDescentHighAltitude = false
+	CoinEngine.VerticalCoinDescentProgressAnchorY = nil
+	CoinEngine.VerticalCoinDescentLastProgressAt = nil
+	CoinEngine.VerticalCoinDescentNextProgressCheckAt = 0
 	CoinEngine.VerticalCoinDescentBlockedTarget = nil
 	CoinEngine.VerticalCoinDescentBlockedUntil = 0
 	CoinEngine.NextTargetCacheRevision = -1
@@ -12513,10 +12670,15 @@ local function ControllerStep(dt)
 	-- Si queda demasiado lejos/arriba despues de seleccionarla, se descarta en vez de perseguirla.
 	local targetDelta = target.Position - root.Position
 	local targetMaxGap = Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
+	local targetHorizontalGap = Vector3.new(targetDelta.X, 0, targetDelta.Z).Magnitude
+	local targetVerticalDrop = -targetDelta.Y
+	local directHighDropAllowed = targetVerticalDrop >= (tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+		and targetVerticalDrop <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+		and targetHorizontalGap <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
 	-- IsAvailable was already checked in the selector branch above; avoid repeating its
 	-- attributes/transparency/position checks in the same non-yielding controller pass.
 	if targetDelta.Magnitude > Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-		or math.abs(targetDelta.Y) > targetMaxGap then
+		or (math.abs(targetDelta.Y) > targetMaxGap and not directHighDropAllowed) then
 		LogEvent(string.format("stale-coin-target-invalid dist=%.1f dy=%.1f", targetDelta.Magnitude, targetDelta.Y))
 		CoinEngine.Blacklist[target] = now + 2.5
 		SetCurrent(nil, now)
@@ -12541,7 +12703,8 @@ local function ControllerStep(dt)
 		end
 	end
 	-- Identify a valid coin-below descent before generic route recovery can repeat horizontal planning.
-	-- The helper starts its 9-second timer only after physical-path validation succeeds.
+	-- The helper starts either the ordinary 9-second tier or the high-altitude 20-second tier
+	-- only after the direct character-volume path has been validated.
 	CoinEngine.UpdateVerticalCoinDescent(root, target,
 		target.Position + Vector3.new(0, math.max(0.5, (root.Size.Y + target.Size.Y) * 0.5 - 0.15), 0), now)
 	target = UpdateAutoNoclip(root, target, now)
@@ -12653,6 +12816,8 @@ local function ControllerStep(dt)
 			local minGap = Param(CoinEngine.MinCollectInterval, CoinEngine.SafeMinCollectInterval)
 			local settle = GetCollectSettle(now, safe)
 			if now - arriveAt >= settle and now - lastCollectAt >= minGap then
+				-- Set only after CollectCoin returns success; this measures controller work, not physical travel time.
+				local collectionConfirmationClock = nil
 				-- Detalle de cada recogida (para correlacionar kicks con las condiciones del toque):
 				-- d = distancia al toque, spd = velocidad fisica, arr = tiempo desde la llegada,
 				-- gap = tiempo desde la recogida anterior, settle = espera aplicada, dy = altura relativa.
@@ -12665,6 +12830,7 @@ local function ControllerStep(dt)
 				local preparedNextCoin = CoinEngine.NextTarget
 				local preparedNextAt = tonumber(CoinEngine.NextTargetPreparedAt) or 0
 				if CollectCoin(root, target, now) then
+					collectionConfirmationClock = os.clock()
 					coinsCollectedTotal += 1
 					LogEvent(collectInfo)
 					hiTag = collectInfo
@@ -12672,13 +12838,18 @@ local function ControllerStep(dt)
 					-- Valida la moneda preseleccionada. Si se desvanecio, elige una alternativa ahora mismo.
 					-- Una ruta bloqueada NO descarta el objetivo: UpdateAutoNoclip decide si debe cruzarla.
 					local function CanChainTo(coin)
-						return coin and coin ~= target and IsAvailable(coin, now)
-							and (coin.Position - root.Position).Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
-							and math.abs(coin.Position.Y - root.Position.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap)
-							and IsThreatSafeCoin(coin)
+						if not (coin and coin ~= target and IsAvailable(coin, now) and IsThreatSafeCoin(coin)) then return false end
+						local coinDelta = coin.Position - root.Position
+						local verticalDrop = -coinDelta.Y
+						local highDrop = verticalDrop >= (tonumber(CoinEngine.VerticalCoinHighAltitudeThreshold) or 30.0)
+							and verticalDrop <= (tonumber(CoinEngine.VerticalCoinHighAltitudeMaxVerticalGap) or 300.0)
+							and Vector3.new(coinDelta.X, 0, coinDelta.Z).Magnitude <= (tonumber(CoinEngine.VerticalCoinDescentStartHorizontalTolerance) or 4.5)
+						return coinDelta.Magnitude <= Param(CoinEngine.MaxDistance, CoinEngine.SafeMaxDistance)
+							and (math.abs(coinDelta.Y) <= Param(CoinEngine.MaxVerticalGap, CoinEngine.SafeMaxVerticalGap) or highDrop)
 					end
 					local chainCoin = preparedNextCoin
 					local chainNext = CanChainTo(chainCoin)
+					CoinEngine.LastChainCommandMs = nil
 					if not chainNext then
 						if CoinEngine.ThreatResponse.Active then
 							chainCoin = PickThreatCoin(root.Position, target, now)
@@ -12691,8 +12862,10 @@ local function ControllerStep(dt)
 						pauseUntil = math.max(pauseUntil, now + POST_COLLECT_PAUSE)
 					end
 					if chainNext then
+						local chainSelectedClock = os.clock()
+						local transitionMs = math.max(0, (chainSelectedClock - collectionConfirmationClock) * 1000)
+						CoinEngine.LastChainSelectionMs = transitionMs
 						SetCurrent(chainCoin, now)
-						local transitionMs = math.max(0, (os.clock() - (lastCollectAt or now)) * 1000)
 						CoinEngine.LastChainTransitionMs = transitionMs
 						CoinEngine.MaxChainTransitionMs = math.max(tonumber(CoinEngine.MaxChainTransitionMs) or 0, transitionMs)
 						CoinEngine.ChainTransitionCount = (CoinEngine.ChainTransitionCount or 0) + 1
@@ -12716,6 +12889,7 @@ local function ControllerStep(dt)
 								nextV = math.max(nextV, math.min(currentSpeed, CoinEngine.FlightMinSpeed))
 							end
 							ApplyStableFlightVelocity(nextDelta / nextDist, nextV, dt)
+							CoinEngine.LastChainCommandMs = math.max(0, (os.clock() - collectionConfirmationClock) * 1000)
 							lastFlightV = nextV
 							velApplied = true -- emite la orden hacia la siguiente moneda en este mismo Heartbeat
 							local horiz = Vector3.new(nextDelta.X, 0, nextDelta.Z)
@@ -12727,8 +12901,9 @@ local function ControllerStep(dt)
 							if flightVel then pcall(function() flightVel.Velocity = Vector3.zero end) end
 							velApplied = true
 						end
-						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f touch-to-target-ms=%.2f prefetched-age-ms=%.2f density=%d",
-							CHAIN_ACCELERATION_MULTIPLIER, transitionMs, preparedAgeMs,
+						local commandMs = tonumber(CoinEngine.LastChainCommandMs) or transitionMs
+						LogEvent(string.format("coin-chain-next immediate-steer=1 route-adaptive=1 chain-accel=%.2f confirmation-to-select-ms=%.2f confirmation-to-command-ms=%.2f prefetched-age-ms=%.2f density=%d",
+							CHAIN_ACCELERATION_MULTIPLIER, transitionMs, commandMs, preparedAgeMs,
 							tonumber(CoinEngine.CoinNeighborCount[chainCoin]) or 0))
 					else
 						chainAccelerationActive = false
@@ -14065,17 +14240,20 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 	-- already near Luau's active-local limit, and exceeding it prevents the whole file compiling.
 	local function DetectFastStartupModeFallback()
 		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		local hasMainGui = pg and pg:FindFirstChild("MainGUI") ~= nil
+		local hasDuelsGui = pg and (pg:FindFirstChild("DuelGUI") ~= nil or pg:FindFirstChild("DuelHUD") ~= nil)
+		if hasMainGui and hasDuelsGui then return "UNKNOWN" end
 		if game.PlaceId == 5118969548 and tonumber(Players.MaxPlayers) == 6 then
 			return "SPIDER"
 		end
-		if pg and pg:FindFirstChild("MainGUI") then return "MM2" end
-		if pg and (pg:FindFirstChild("DuelGUI") or pg:FindFirstChild("DuelHUD")) then return "DUELS" end
+		if hasMainGui and not hasDuelsGui then return "MM2" end
+		if hasDuelsGui and not hasMainGui then return "DUELS" end
 		if Workspace:FindFirstChild("CoinContainer") or Workspace:FindFirstChild("Normal") then return "MM2" end
 		if Workspace:FindFirstChild("DuelPads") or Workspace:FindFirstChild("QueuePad")
 			or Workspace:FindFirstChild("DuelArena") or Workspace:FindFirstChild("DuelsMap") then
 			return "DUELS"
 		end
-		return "DUELS"
+		return "UNKNOWN"
 	end
 
 	local function CleanupPartialStartupSpiderIndex()
@@ -14120,11 +14298,28 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 	elseif not detectedMode then
 		detectedMode = DetectFastStartupModeFallback()
 	end
-	if not detectedMode then detectedMode = "DUELS" end
+	if not detectedMode then detectedMode = "UNKNOWN" end
 
 	_G.Celestial.GameMode = detectedMode
 	print("✨ CELESTIAL FRAMEWORK: Detected game mode -> " .. tostring(detectedMode))
-	if detectedMode == "DUELS" or detectedMode == "SPIDER" then
+	-- If startup signals are genuinely incomplete, retry a few times with a bounded backoff.
+	-- UNKNOWN never gets silently rewritten to DUELS, and the retry worker terminates quickly.
+	if detectedMode == "UNKNOWN" then
+		task.spawn(function()
+			for _, delaySeconds in ipairs({1.0, 2.0, 3.0}) do
+				task.wait(delaySeconds)
+				if _G.Celestial.GameMode ~= "UNKNOWN" then return end
+				local retryOk, retryMode = pcall(ScanGameMode)
+				if retryOk and retryMode and retryMode ~= "UNKNOWN" then
+					_G.Celestial.GameMode = retryMode
+					detectedMode = retryMode
+					print("✨ CELESTIAL FRAMEWORK: Delayed mode confirmation -> " .. tostring(retryMode))
+					return
+				end
+			end
+		end)
+	end
+	if detectedMode == "DUELS" or detectedMode == "SPIDER" or detectedMode == "UNKNOWN" then
 		_G.Celestial.GameDetectionConnection = LocalPlayer.OnTeleport:Connect(function(teleportState)
 			if teleportState == Enum.TeleportState.Started or teleportState == Enum.TeleportState.InProgress
 				or teleportState == Enum.TeleportState.WaitingForServer then
