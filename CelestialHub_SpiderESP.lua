@@ -1,5 +1,5 @@
 -- CELESTIAL HUB v3.48: cooperative threat-route planning sliced across scheduler resumes, cached decisions during movement, and single movement authority; adaptive NoClip internals preserved.
--- V3.45 localized timing update: 7s general airborne cap; validated 9s/20s descent tiers and adaptive NoClip hard limit preserved.
+-- V3.49 localized recovery fix: no age-only cap for ordinary flight; 9s/20s descent watchdogs and a 10s wall-crossing ceiling remain separate.
 -- V3.41 Performance Optimization: reuse player-roster snapshots, bound coin prefetch work, and cache high-frequency power scans.
 -- Reduces redundant QMA Anti-Fling roster comparisons, inventory fallback scans, and repeated Ghost transparency traversal.
 -- Preserves the existing NoClip adaptive implementation and the v3.40 vertical coin descent exception.
@@ -6744,12 +6744,12 @@ local CoinEngine = {
 	NoclipExitLastTryAt = 0,
 	NoclipExitAttempts = 0,
 	-- Supervisión coordinada de vuelo/NoClip: solo pertenece al controlador de navegación existente.
-	AirborneRecoveryLimit = 10.0, -- general airborne / floor-transition ceiling; validated 9s/20s vertical descents take precedence
+	AirborneRecoveryLimit = nil, -- legacy compatibility only; ordinary flight is governed by measured progress, not elapsed airtime
 	AirborneSupportDistance = 3.20,
 	AirborneProbeInterval = 0.08,
 	AirborneLookDownDistance = 100,
 	AirborneSince = nil,
-	AirborneGeneralLimitTriggered = false,
+	AirborneGeneralLimitTriggered = false, -- legacy compatibility flag; never triggers recovery by elapsed airtime
 	AirborneGeneralRetryAt = 0, -- retries recovery after a failed landing; never resets the physical airborne clock
 	-- Exceptional aerial window reserved for a validated, nearly vertical descent to the selected coin.
 	VerticalCoinDescentActive = false,
@@ -6804,7 +6804,7 @@ local CoinEngine = {
 	EmergencyRecoverySpeedApplied = false,
 	LastBaseEffectiveSpeed = 0,
 	NoclipPhysicalStartedAt = nil,
-	AutoNoclipHardLimit = 3.0,
+	AutoNoclipHardLimit = 10.0, -- wall-crossing session ceiling only; ordinary flight has no age-only cutoff
 	AutoNoclipExitLeadTime = 0.70,
 	NoclipHardLimitLogged = false,
 	AutoNoclipStartedAt = 0,
@@ -11685,11 +11685,10 @@ CoinEngine.UpdateEmergencyRecoveryState = function(root, now)
 			CoinEngine.EmergencyRecoveryStartedAt = now
 			CoinEngine.EmergencyRecoveryReason = reason
 			CoinEngine.EmergencyRecoveryReleaseSince = nil
-			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=%.2f noclipHardLimit=%.2f",
+			LogEvent(string.format("autofarm-emergency-boost start reason=%s multiplier=%.2f noProgress=%.2f wallAge=%.2f air=%.2f airLimit=none noclipWallLimit=%.2f",
 				tostring(reason), tonumber(CoinEngine.EmergencyRecoveryMultiplier) or 1.45, stalledFor, wallAge,
 				CoinEngine.AirborneSince and math.max(0, now - CoinEngine.AirborneSince) or 0,
-				tonumber(CoinEngine.AirborneRecoveryLimit) or 10.0,
-				tonumber(CoinEngine.AutoNoclipHardLimit) or 3.0))
+				tonumber(CoinEngine.AutoNoclipHardLimit) or 10.0))
 		elseif reason == "wall-traversal-stall" then
 			CoinEngine.EmergencyRecoveryReason = reason
 		end
@@ -11917,34 +11916,12 @@ local function UpdateAirborneRecoveryState(root, now)
 		end
 	end
 
-	-- General airborne / floor-transition ceiling: 10 seconds applies only after the validated
-	-- 9s/20s direct vertical coin-descent handlers above decline the special case. This is a maximum,
-	-- not a wait: the independent no-progress watchdog starts recovery much earlier.
-	-- AutoNoclipHardLimit remains 3.0 intentionally; it belongs to the protected adaptive NoClip
-	-- crossing safety envelope and is not changed by this general airborne setting.
-	local generalAirborneLimit = math.clamp(tonumber(CoinEngine.AirborneRecoveryLimit) or 10.0, 3.0, 10.0)
-	local generalRetryAt = tonumber(CoinEngine.AirborneGeneralRetryAt) or 0
-	local generalLimitDue = airborneFor >= generalAirborneLimit
-		and (not CoinEngine.AirborneGeneralLimitTriggered
-			or (not CoinEngine.AirRecoveryActive and now >= generalRetryAt))
-	if generalLimitDue then
-		local retryAttempt = CoinEngine.AirborneGeneralLimitTriggered == true
-		CoinEngine.AirborneGeneralLimitTriggered = true
-		CoinEngine.AirborneGeneralRetryAt = now + 1.25
-		if not CoinEngine.AirRecoveryActive then
-			CoinEngine.AirRecoveryActive = true
-			CoinEngine.AirRecoveryDestination = nil
-			CoinEngine.AirRecoveryDestinationAt = 0
-			CoinEngine.AirRecoveryDestinationTarget = nil
-			CoinEngine.AirRecoveryDestinationStart = root.Position
-			CoinEngine.AirRecoveryNoDestinationSince = nil
-			CoinEngine.AirRecoveryReason = retryAttempt and "general-airborne-limit-retry" or "general-airborne-limit"
-			CoinEngine.AirRecoveryRetryAt = 0
-		end
-		LogEvent(string.format("air-recovery-general-limit elapsed=%.2f limit=%.2f retry=%d nextRetryIn=1.25 descentException=inactive action=existing-recovery",
-			airborneFor, generalAirborneLimit, retryAttempt and 1 or 0))
-		return true
-	end
+	-- Ordinary flight has no elapsed-time cutoff. AirborneSince is diagnostic context only;
+	-- the existing progress watchdog below is the sole general-flight recovery trigger.
+	-- The separate AutoNoclipHardLimit is enforced only by UpdateAutoNoclip while an actual
+	-- wall-crossing session is active. Validated vertical coin descents retain their 9s/20s caps.
+	CoinEngine.AirborneGeneralLimitTriggered = false
+	CoinEngine.AirborneGeneralRetryAt = 0
 
 	-- Si no existe superficie segura tras varios intentos y todavía quedan monedas, no mantener
 	-- al personaje congelado indefinidamente: liberar la recuperación una vez para que el mismo
@@ -12224,7 +12201,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 	local stuckConfirm = tonumber(CoinEngine.NoclipStuckConfirmTime) or 0.22
 	local noclipSessionAge = noclipOn and CoinEngine.NoclipPhysicalStartedAt
 		and math.max(0, now - CoinEngine.NoclipPhysicalStartedAt) or 0
-	local noclipHardLimit = tonumber(CoinEngine.AutoNoclipHardLimit) or 3.0
+	local noclipHardLimit = tonumber(CoinEngine.AutoNoclipHardLimit) or 10.0
 	local exitLeadTime = math.clamp(tonumber(CoinEngine.AutoNoclipExitLeadTime) or 0.70, 0.25, 1.0)
 
 	local function RerouteBlockedCoin(blockedTarget, reason)
@@ -12272,7 +12249,7 @@ local function UpdateAutoNoclip(root, target, now, escapeDestination)
 			local oldMode = CoinEngine.AutoNoclipMode
 			local oldTarget = target or CoinEngine.AutoNoclipTarget or CoinEngine.CurrentTarget
 			CoinEngine.NoclipRerouteAfterExit = oldMode == "coin-route" and oldTarget ~= nil
-			CoinEngine.NoclipRerouteReason = CoinEngine.NoclipRerouteAfterExit and "noclip-three-second-exit" or nil
+			CoinEngine.NoclipRerouteReason = CoinEngine.NoclipRerouteAfterExit and "noclip-ten-second-exit" or nil
 			CoinEngine.NoclipRerouteTarget = CoinEngine.NoclipRerouteAfterExit and oldTarget or nil
 			CoinEngine.AutoNoclipMode = "exit-solid"
 			CoinEngine.AutoNoclipTarget = oldTarget
