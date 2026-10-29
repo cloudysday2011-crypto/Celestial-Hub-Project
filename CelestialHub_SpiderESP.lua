@@ -4808,12 +4808,14 @@ local MM2LobbyDetector = {
         "waiting for players", "waiting for more players", "esperando jugadores", "votando",
     },
     ResultPhrases = {
+        -- Keep these specific to an actual MM2 round outcome. Generic words such as
+        -- "Victory", "Defeat", "You win" and "You lose" also occur in unrelated UI.
         "murderer wins", "murderer won", "murderer was killed", "murderer has been killed",
         "sheriff wins", "sheriff won", "innocents win", "innocents won",
         "survivors win", "survivors won", "round over", "round ended", "game over",
-        "victory", "defeat", "you win", "you lose", "hero wins", "fin de la ronda",
-        "ronda terminada", "partida terminada",
+        "hero wins", "fin de la ronda", "ronda terminada", "partida terminada",
     },
+    GenericResultPhrases = {"victory", "defeat", "you win", "you lose"},
 }
 
 function MM2LobbyDetector:IsZoneCandidate(obj)
@@ -4836,11 +4838,34 @@ function MM2LobbyDetector:RefreshUI(force)
     if not playerGui then return ui end
     local ok, descendants = pcall(function() return playerGui:GetDescendants() end)
     if not ok or not descendants then return ui end
+    local function isActuallyVisible(obj)
+        local current = obj
+        while current and current ~= playerGui do
+            if current:IsA("GuiObject") and not current.Visible then return false end
+            if current:IsA("ScreenGui") and not current.Enabled then return false end
+            current = current.Parent
+        end
+        return true
+    end
+    local function hasResultContext(obj)
+        local current = obj
+        while current and current ~= playerGui do
+            local name = string.lower(tostring(current.Name or "")):gsub("[%s_%-]", "")
+            if name:find("result", 1, true) or name:find("victory", 1, true)
+                or name:find("defeat", 1, true) or name:find("roundend", 1, true)
+                or name:find("gameover", 1, true) or name:find("endgame", 1, true)
+                or name:find("postgame", 1, true) then
+                return true
+            end
+            current = current.Parent
+        end
+        return false
+    end
     local inspected = 0
     for _, obj in ipairs(descendants) do
         inspected += 1
         if inspected > 1400 then break end
-        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible and isActuallyVisible(obj) then
             local txt = string.lower(tostring(obj.Text or "")):gsub("%s+", " ")
             for _, phrase in ipairs(self.LobbyPhrases) do
                 if string.find(txt, phrase, 1, true) then
@@ -4852,6 +4877,14 @@ function MM2LobbyDetector:RefreshUI(force)
                 if string.find(txt, phrase, 1, true) then
                     ui.result = true
                     break
+                end
+            end
+            if not ui.result and hasResultContext(obj) then
+                for _, phrase in ipairs(self.GenericResultPhrases) do
+                    if string.find(txt, phrase, 1, true) then
+                        ui.result = true
+                        break
+                    end
                 end
             end
             if ui.lobby and ui.result then break end
@@ -18377,6 +18410,14 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             local now = tick()
             if now - timerState.lastEndSignalScan < 0.35 then return timerState.lastEndSignal end
             timerState.lastEndSignalScan = now
+            -- The lobby/result UI can linger for a few frames after tools or roles arrive.
+            -- Ignore terminal signals during this short startup grace period so one stale
+            -- label or temporary character-health read cannot instantly gray the timer.
+            if timerState.phase == "Round" and timerState.roundStartTime
+                and now - timerState.roundStartTime < 1.35 then
+                timerState.lastEndSignal = false
+                return false
+            end
             local signal = false
             -- A generic lobby/loading UI phrase is ambiguous when independent global
             -- signals still prove that the round is running (e.g. players have role tools).
