@@ -39,6 +39,36 @@ local CoreGui = game:GetService("CoreGui")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = Workspace.CurrentCamera
+local Stats = game:GetService("Stats")
+local GuiService = game:GetService("GuiService")
+
+-- Dynamic Island configuration. The existing bubble asset is preserved as the default.
+-- Replace BUBBLE_IMAGE_ID with your own logo asset ID when desired.
+local BUBBLE_IMAGE_ID = "rbxassetid://118869628234830"
+local DYNAMIC_ISLAND_CONFIG = {
+    BubbleSize = 80,
+    CapsuleWidth = 360,
+    CapsuleHeight = 60,
+    RootWidth = 400,
+    RootHeight = 80,
+    RoundDuration = 180,
+    OpenDuration = 0.9,
+    FPSUpdateInterval = 0.16,
+    PingUpdateInterval = 0.25,
+    ScreenMargin = 8,
+    TimerFont = Enum.Font.Code,
+    Colors = {
+        CapsuleDark = Color3.fromRGB(11, 10, 23),
+        CapsulePurple = Color3.fromRGB(26, 21, 56),
+        MoonBlue = Color3.fromRGB(155, 190, 255),
+        Lilac = Color3.fromRGB(185, 166, 255),
+        Silver = Color3.fromRGB(211, 213, 223),
+        White = Color3.fromRGB(248, 248, 255),
+        TimerActive = Color3.fromRGB(93, 255, 157),
+        TimerEnded = Color3.fromRGB(145, 147, 160),
+        DarkButton = Color3.fromRGB(14, 13, 29),
+    },
+}
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
@@ -1082,8 +1112,7 @@ _G.Celestial.State = {
 	MurderAimbotActive = false, MurderStabAimbotActive = false,
 	StabSmoothness = 50, StabPredictionStrength = 5,
 	NoClipActive = false, FlyActive = false, InfiniteJumpActive = false, WallJumpActive = false,
-	BombBoostActive = false, ShowTimerActive = true, FPSCounterEnabled = false,
-	PingDisplayEnabled = false, FPSBoostActive = false, DisableParticles = false,
+	BombBoostActive = false, FPSBoostActive = false, DisableParticles = false,
 	DisableTrails = false, DisableShadows = false, DisableTextures = false,
 	DisableEffects = false, ReduceRenderEffects = false, FarmEnabled = false, TweenSpeed = 45, FarmSafeMode = true,
 	AntiAFKEnabled = false, AutoServerHopLowPlayers = false,
@@ -4460,11 +4489,10 @@ _G.Celestial.IsMM2LobbyPhaseConfirmed = function()
 
 	local confirmed = false
 	local roundState = _G.Celestial.RoundTimerState
-	local timerRemaining = roundState and tonumber(roundState.remaining) or nil
-	-- RoundTimerState inicia en phase="Idle", ended=true; solo se toma el fin del
-	-- temporizador como evidencia cuando el estado ya corresponde a una ronda.
-	if roundState and roundState.phase == "Round"
-		and (roundState.ended == true or (timerRemaining ~= nil and timerRemaining <= 0)) then
+	-- Un temporizador en 0:00 no confirma por sí solo el fin de la ronda.
+	-- El estado terminal solo se acepta cuando el detector de ronda lo ha confirmado.
+	if roundState and (roundState.phase == "Ended"
+		or (roundState.phase == "Round" and roundState.ended == true)) then
 		confirmed = true
 	end
 
@@ -16494,141 +16522,360 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			FPSDisplayValue = 60,
 			FPSLastDisplayUpdate = 0,
 			FPSSmoothedValue = 60,
-			LastPerformanceIslandMode = "Hidden",
 		}
 
-		local function GetPerformanceTextWidth(label, fallbackPerCharacter)
-			local width = 0
-			pcall(function() width = label.TextBounds.X end)
-			if type(width) ~= "number" or width <= 0 then
-				width = #tostring(label.Text) * fallbackPerCharacter
-			end
-			return math.max(1, math.ceil(width))
-		end
+        local function CreatePerformanceIsland()
+            local config = DYNAMIC_ISLAND_CONFIG
+            local root = Instance.new("Frame")
+            root.Name = "DynamicIslandRoot"
+            root.Size = UDim2.new(0, config.RootWidth, 0, config.RootHeight)
+            root.AnchorPoint = Vector2.new(0, 0)
+            root.Position = UDim2.new(0.5, -(config.RootWidth * 0.5), 0, 8)
+            root.BackgroundTransparency = 1
+            root.BorderSizePixel = 0
+            root.ClipsDescendants = false
+            root.Active = false
+            root.ZIndex = 124
+            root.Parent = ScreenGui
+            UIState.DynamicIslandRoot = root
 
-		local function CreatePerformanceIsland()
-			local frame = Instance.new("Frame")
-			frame.Name = "PerformanceIsland"
-			frame.Size = UDim2.new(0, 58, 0, 140)
-			frame.Position = UDim2.new(0, 2, 0.5, -88)
-			frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-			frame.BackgroundTransparency = 0
-			frame.BorderSizePixel = 0
-			frame.ZIndex = 125
-			frame.Visible = false
-			frame.ClipsDescendants = true
-			frame.Parent = ScreenGui
-			local corner = Instance.new("UICorner")
-			corner.CornerRadius = UDim.new(0.5, 0)
-			corner.Parent = frame
-			return frame
-		end
+            local scale = Instance.new("UIScale")
+            scale.Name = "DynamicIslandScale"
+            scale.Scale = 1
+            scale.Parent = root
+            UIState.DynamicIslandScale = scale
 
-		UIState.PerformanceIsland = CreatePerformanceIsland()
+            local glow = Instance.new("Frame")
+            glow.Name = "IslandGlow"
+            glow.Position = UDim2.new(0, 40, 0, 8)
+            glow.Size = UDim2.new(0, 0, 0, config.CapsuleHeight + 4)
+            glow.BackgroundColor3 = config.Colors.MoonBlue
+            glow.BackgroundTransparency = 0.82
+            glow.BorderSizePixel = 0
+            glow.ZIndex = 124
+            glow.Parent = root
+            local glowCorner = Instance.new("UICorner")
+            glowCorner.CornerRadius = UDim.new(1, 0)
+            glowCorner.Parent = glow
+            UIState.IslandGlow = glow
 
-		UIState.FPSValueLabel = Instance.new("TextLabel")
-		UIState.FPSValueLabel.Name = "FPSValue"
-		UIState.FPSValueLabel.Size = UDim2.new(0, 20, 0, 28)
-		UIState.FPSValueLabel.Position = UDim2.new(0.5, -10, 0, 9)
-		UIState.FPSValueLabel.BackgroundTransparency = 1
-		UIState.FPSValueLabel.Text = "60"
-		UIState.FPSValueLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-		UIState.FPSValueLabel.Font = Enum.Font.GothamBold
-		UIState.FPSValueLabel.TextSize = 17
-		UIState.FPSValueLabel.TextXAlignment = Enum.TextXAlignment.Center
-		UIState.FPSValueLabel.TextYAlignment = Enum.TextYAlignment.Center
-		UIState.FPSValueLabel.Rotation = -90
-		UIState.FPSValueLabel.ZIndex = 126
-		UIState.FPSValueLabel.Parent = UIState.PerformanceIsland
-		UIState.FPSGradient = Instance.new("UIGradient")
-		UIState.FPSGradient.Color = ColorSequence.new({
-			ColorSequenceKeypoint.new(0.0, Color3.fromRGB(248, 248, 250)),
-			ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 248, 185)),
-			ColorSequenceKeypoint.new(1.0, Color3.fromRGB(220, 200, 255))
-		})
-		UIState.FPSGradient.Offset = Vector2.new(-1, 0)
-		UIState.FPSGradient.Parent = UIState.FPSValueLabel
+            local bubbleGlow = Instance.new("Frame")
+            bubbleGlow.Name = "BubbleGlow"
+            bubbleGlow.Position = UDim2.new(0, -2, 0, -2)
+            bubbleGlow.Size = UDim2.new(0, config.BubbleSize + 4, 0, config.BubbleSize + 4)
+            bubbleGlow.BackgroundColor3 = config.Colors.MoonBlue
+            bubbleGlow.BackgroundTransparency = 0.82
+            bubbleGlow.BorderSizePixel = 0
+            bubbleGlow.ZIndex = 125
+            bubbleGlow.Parent = root
+            local bubbleGlowCorner = Instance.new("UICorner")
+            bubbleGlowCorner.CornerRadius = UDim.new(1, 0)
+            bubbleGlowCorner.Parent = bubbleGlow
 
-		UIState.PingValueLabel = Instance.new("TextLabel")
-		UIState.PingValueLabel.Name = "PingValue"
-		UIState.PingValueLabel.Size = UDim2.new(0, 20, 0, 38)
-		UIState.PingValueLabel.Position = UDim2.new(0.5, -10, 1, -47)
-		UIState.PingValueLabel.BackgroundTransparency = 1
-		UIState.PingValueLabel.Text = "0 ms"
-		UIState.PingValueLabel.TextColor3 = Color3.fromRGB(238, 238, 244)
-		UIState.PingValueLabel.Font = Enum.Font.GothamBold
-		UIState.PingValueLabel.TextSize = 16
-		UIState.PingValueLabel.TextXAlignment = Enum.TextXAlignment.Center
-		UIState.PingValueLabel.TextYAlignment = Enum.TextYAlignment.Center
-		UIState.PingValueLabel.Rotation = -90
-		UIState.PingValueLabel.ZIndex = 126
-		UIState.PingValueLabel.Parent = UIState.PerformanceIsland
-		UIState.PingGradient = Instance.new("UIGradient")
-		UIState.PingGradient.Color = ColorSequence.new({
-			ColorSequenceKeypoint.new(0.0, Color3.fromRGB(248, 248, 250)),
-			ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 248, 185)),
-			ColorSequenceKeypoint.new(1.0, Color3.fromRGB(220, 200, 255))
-		})
-		UIState.PingGradient.Offset = Vector2.new(-1, 0)
-		UIState.PingGradient.Parent = UIState.PingValueLabel
+            local bubbleBack = Instance.new("Frame")
+            bubbleBack.Name = "BubbleGradientBase"
+            bubbleBack.Position = UDim2.new(0, 0, 0, 0)
+            bubbleBack.Size = UDim2.new(0, config.BubbleSize, 0, config.BubbleSize)
+            bubbleBack.BackgroundColor3 = config.Colors.CapsuleDark
+            bubbleBack.BorderSizePixel = 0
+            bubbleBack.ZIndex = 126
+            bubbleBack.Parent = root
+            local bubbleBackCorner = Instance.new("UICorner")
+            bubbleBackCorner.CornerRadius = UDim.new(1, 0)
+            bubbleBackCorner.Parent = bubbleBack
+            local bubbleBackGradient = Instance.new("UIGradient")
+            bubbleBackGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, config.Colors.White),
+                ColorSequenceKeypoint.new(0.48, config.Colors.Lilac),
+                ColorSequenceKeypoint.new(1, config.Colors.MoonBlue),
+            })
+            bubbleBackGradient.Rotation = 35
+            bubbleBackGradient.Parent = bubbleBack
+            local bubbleBackStroke = Instance.new("UIStroke")
+            bubbleBackStroke.Thickness = 1.5
+            bubbleBackStroke.Transparency = 0.1
+            bubbleBackStroke.Color = config.Colors.Lilac
+            bubbleBackStroke.Parent = bubbleBack
+            local bubbleBackStrokeGradient = Instance.new("UIGradient")
+            bubbleBackStrokeGradient.Color = bubbleBackGradient.Color
+            bubbleBackStrokeGradient.Parent = bubbleBackStroke
+            UIState.BubbleGradientBase = bubbleBack
 
-		local function UpdatePerformanceIslandLayout()
-			local showFPS = State.FPSCounterEnabled == true
-			local showPing = State.PingDisplayEnabled == true
-			if not showFPS and not showPing then
-				UIState.PerformanceIsland.Visible = false
-				UIState.LastPerformanceIslandMode = "Hidden"
-				return
-			end
-			UIState.PerformanceIsland.Visible = true
-			local mode
-			local targetWidth = 58
-			local targetHeight = 140
-			local fpsWidth = GetPerformanceTextWidth(UIState.FPSValueLabel, 9)
-			local pingWidth = GetPerformanceTextWidth(UIState.PingValueLabel, 8)
-			local verticalPadding = 26
-			local gap = 16
-			if showFPS and showPing then
-				mode = "Both"
-				targetWidth = 58
-				targetHeight = math.max(140, fpsWidth + pingWidth + verticalPadding + gap)
-				UIState.FPSValueLabel.Size = UDim2.new(0, 20, 0, fpsWidth + 4)
-				UIState.FPSValueLabel.Position = UDim2.new(0.5, -10, 0, 8)
-				UIState.PingValueLabel.Size = UDim2.new(0, 20, 0, pingWidth + 4)
-				UIState.PingValueLabel.Position = UDim2.new(0.5, -10, 1, -(pingWidth + 12))
-				UIState.FPSValueLabel.Visible = true
-				UIState.PingValueLabel.Visible = true
-			elseif showFPS then
-				mode = "FPS"
-				targetWidth = 58
-				targetHeight = math.max(83, fpsWidth + verticalPadding)
-				UIState.FPSValueLabel.Size = UDim2.new(0, 20, 0, fpsWidth + 4)
-				UIState.FPSValueLabel.Position = UDim2.new(0.5, -10, 0.5, -(fpsWidth * 0.5) - 2)
-				UIState.FPSValueLabel.Visible = true
-				UIState.PingValueLabel.Visible = false
-			else
-				mode = "Ping"
-				targetWidth = 58
-				targetHeight = math.max(83, pingWidth + verticalPadding)
-				UIState.PingValueLabel.Size = UDim2.new(0, 20, 0, pingWidth + 4)
-				UIState.PingValueLabel.Position = UDim2.new(0.5, -10, 0.5, -(pingWidth * 0.5) - 2)
-				UIState.PingValueLabel.Visible = true
-				UIState.FPSValueLabel.Visible = false
-			end
-			local sizeKey = mode .. ":" .. tostring(targetWidth) .. ":" .. tostring(targetHeight)
-			if UIState.LastPerformanceIslandMode == sizeKey then return end
-			UIState.LastPerformanceIslandMode = sizeKey
-			if UIState.PerformanceIslandTween then
-				pcall(function() UIState.PerformanceIslandTween:Cancel() end)
-				UIState.PerformanceIslandTween = nil
-			end
-			local tweenInfo = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-			UIState.PerformanceIslandTween = TweenService:Create(UIState.PerformanceIsland, tweenInfo, {
-				Size = UDim2.new(0, targetWidth, 0, targetHeight),
-				Position = UDim2.new(0, 2, 0.5, -(targetHeight * 0.5) - 25.5)
-			})
-			UIState.PerformanceIslandTween:Play()
-		end
+            local capsule = Instance.new("Frame")
+            capsule.Name = "PerformanceIsland"
+            capsule.Position = UDim2.new(0, 40, 0, 10)
+            capsule.Size = UDim2.new(0, 0, 0, config.CapsuleHeight)
+            capsule.BackgroundColor3 = config.Colors.CapsuleDark
+            capsule.BackgroundTransparency = 0
+            capsule.BorderSizePixel = 0
+            capsule.ClipsDescendants = true
+            capsule.Visible = true
+            capsule.ZIndex = 127
+            capsule.Parent = root
+            local capsuleCorner = Instance.new("UICorner")
+            capsuleCorner.CornerRadius = UDim.new(1, 0)
+            capsuleCorner.Parent = capsule
+            local capsuleGradient = Instance.new("UIGradient")
+            capsuleGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, config.Colors.CapsuleDark),
+                ColorSequenceKeypoint.new(1, config.Colors.CapsulePurple),
+            })
+            capsuleGradient.Rotation = 0
+            capsuleGradient.Parent = capsule
+            local capsuleStroke = Instance.new("UIStroke")
+            capsuleStroke.Thickness = 1.25
+            capsuleStroke.Transparency = 0.12
+            capsuleStroke.Color = config.Colors.Lilac
+            capsuleStroke.Parent = capsule
+            local capsuleStrokeGradient = Instance.new("UIGradient")
+            capsuleStrokeGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, config.Colors.Lilac),
+                ColorSequenceKeypoint.new(0.35, config.Colors.White),
+                ColorSequenceKeypoint.new(0.68, config.Colors.MoonBlue),
+                ColorSequenceKeypoint.new(1, config.Colors.Silver),
+            })
+            capsuleStrokeGradient.Parent = capsuleStroke
+            UIState.CapsuleStrokeGradient = capsuleStrokeGradient
+            UIState.PerformanceIsland = capsule
+
+            local timerLabel = Instance.new("TextLabel")
+            timerLabel.Name = "RoundTimer"
+            timerLabel.Position = UDim2.new(0, 47, 0, 4)
+            timerLabel.Size = UDim2.new(0, 65, 0, 52)
+            timerLabel.BackgroundTransparency = 1
+            timerLabel.Text = "3:00"
+            timerLabel.TextColor3 = config.Colors.TimerEnded
+            timerLabel.TextStrokeColor3 = config.Colors.TimerActive
+            timerLabel.TextStrokeTransparency = 1
+            timerLabel.Font = config.TimerFont
+            timerLabel.TextSize = 20
+            timerLabel.TextXAlignment = Enum.TextXAlignment.Center
+            timerLabel.TextYAlignment = Enum.TextYAlignment.Center
+            timerLabel.ZIndex = 129
+            timerLabel.Visible = false
+            timerLabel.Parent = capsule
+            UIState.RoundTimerLabel = timerLabel
+
+            local separator = Instance.new("Frame")
+            separator.Name = "MetricsSeparator"
+            separator.Position = UDim2.new(0, 117, 0, 13)
+            separator.Size = UDim2.new(0, 1, 0, 34)
+            separator.BackgroundColor3 = config.Colors.Lilac
+            separator.BackgroundTransparency = 0.28
+            separator.BorderSizePixel = 0
+            separator.ZIndex = 129
+            separator.Visible = false
+            separator.Parent = capsule
+            local separatorGradient = Instance.new("UIGradient")
+            separatorGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, config.Colors.MoonBlue),
+                ColorSequenceKeypoint.new(0.5, config.Colors.Lilac),
+                ColorSequenceKeypoint.new(1, config.Colors.White),
+            })
+            separatorGradient.Rotation = 90
+            separatorGradient.Parent = separator
+            UIState.MetricsSeparator = separator
+
+            local function makeMetricLabel(name, text, y)
+                local label = Instance.new("TextLabel")
+                label.Name = name
+                label.Position = UDim2.new(0, 128, 0, y)
+                label.Size = UDim2.new(0, 100, 0, 20)
+                label.BackgroundTransparency = 1
+                label.Text = text
+                label.TextColor3 = config.Colors.White
+                label.Font = Enum.Font.GothamMedium
+                label.TextSize = 12
+                label.TextXAlignment = Enum.TextXAlignment.Left
+                label.TextYAlignment = Enum.TextYAlignment.Center
+                label.ZIndex = 129
+                label.Visible = false
+                label.Parent = capsule
+                local gradient = Instance.new("UIGradient")
+                gradient.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, config.Colors.White),
+                    ColorSequenceKeypoint.new(0.5, config.Colors.Silver),
+                    ColorSequenceKeypoint.new(1, config.Colors.Lilac),
+                })
+                gradient.Offset = Vector2.new(-1, 0)
+                gradient.Parent = label
+                return label, gradient
+            end
+
+            UIState.FPSValueLabel, UIState.FPSGradient = makeMetricLabel("FPSValue", "★N/D FPS", 9)
+            UIState.PingValueLabel, UIState.PingGradient = makeMetricLabel("PingValue", "★N/D ms", 31)
+
+            local statusLabel = Instance.new("TextLabel")
+            statusLabel.Name = "RoundStatus"
+            statusLabel.Position = UDim2.new(0, 231, 0, 0)
+            statusLabel.Size = UDim2.new(0, 68, 1, 0)
+            statusLabel.BackgroundTransparency = 1
+            statusLabel.Text = "N/D"
+            statusLabel.TextColor3 = config.Colors.Silver
+            statusLabel.Font = Enum.Font.GothamBold
+            statusLabel.TextSize = 12
+            statusLabel.TextXAlignment = Enum.TextXAlignment.Center
+            statusLabel.TextYAlignment = Enum.TextYAlignment.Center
+            statusLabel.ZIndex = 129
+            statusLabel.Visible = false
+            statusLabel.Parent = capsule
+            UIState.RoundStatusLabel = statusLabel
+
+            local moveButton = Instance.new("TextButton")
+            moveButton.Name = "MoveIslandButton"
+            moveButton.Position = UDim2.new(0, 310, 0, 11)
+            moveButton.Size = UDim2.new(0, 38, 0, 38)
+            moveButton.BackgroundColor3 = config.Colors.DarkButton
+            moveButton.BackgroundTransparency = 0.08
+            moveButton.BorderSizePixel = 0
+            moveButton.Text = "✥"
+            moveButton.TextColor3 = config.Colors.White
+            moveButton.Font = Enum.Font.GothamBold
+            moveButton.TextSize = 21
+            moveButton.AutoButtonColor = false
+            moveButton.Active = true
+            moveButton.ZIndex = 132
+            moveButton.Visible = false
+            moveButton.Parent = capsule
+            local moveCorner = Instance.new("UICorner")
+            moveCorner.CornerRadius = UDim.new(1, 0)
+            moveCorner.Parent = moveButton
+            local moveStroke = Instance.new("UIStroke")
+            moveStroke.Thickness = 1.25
+            moveStroke.Transparency = 0.08
+            moveStroke.Color = config.Colors.Lilac
+            moveStroke.Parent = moveButton
+            local moveStrokeGradient = Instance.new("UIGradient")
+            moveStrokeGradient.Color = capsuleStrokeGradient.Color
+            moveStrokeGradient.Parent = moveStroke
+            UIState.MoveButton = moveButton
+            UIState.IslandContentLabels = {timerLabel, separator, UIState.FPSValueLabel, UIState.PingValueLabel, statusLabel, moveButton}
+            UIState.IslandExpanded = false
+
+            local function GetDynamicIslandSafeInsets()
+                local leftInset, topInset, rightInset, bottomInset = 0, 0, 0, 0
+                pcall(function()
+                    local topLeftInset, bottomRightInset = GuiService:GetGuiInset()
+                    leftInset, topInset = topLeftInset.X, topLeftInset.Y
+                    rightInset, bottomInset = bottomRightInset.X, bottomRightInset.Y
+                end)
+                return leftInset, topInset, rightInset, bottomInset
+            end
+
+            local function UpdateDynamicIslandScaleAndBounds()
+                local camera = Workspace.CurrentCamera
+                local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+                local targetScale = math.clamp(viewport.X / 440, 0.76, 1)
+                scale.Scale = targetScale
+                local rootWidth = config.RootWidth * targetScale
+                local rootHeight = config.RootHeight * targetScale
+                local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
+                local minX = config.ScreenMargin + leftInset
+                local minY = config.ScreenMargin + topInset
+                local maxX = math.max(minX, viewport.X - rootWidth - config.ScreenMargin - rightInset)
+                local maxY = math.max(minY, viewport.Y - rootHeight - config.ScreenMargin - bottomInset)
+                local currentPos = root.Position
+                local x = currentPos.X.Offset
+                local y = currentPos.Y.Offset
+                if not UIState.DynamicIslandPositionInitialized then
+                    x = (viewport.X - rootWidth) * 0.5
+                    y = minY
+                    UIState.DynamicIslandPositionInitialized = true
+                end
+                x = math.clamp(x, minX, maxX)
+                y = math.clamp(y, minY, maxY)
+                root.Position = UDim2.fromOffset(math.floor(x), math.floor(y))
+                return viewport, targetScale
+            end
+            UIState.UpdateDynamicIslandScaleAndBounds = UpdateDynamicIslandScaleAndBounds
+            UIState.ClampDynamicIslandPosition = function(x, y)
+                local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+                local currentScale = scale.Scale
+                local width = config.RootWidth * currentScale
+                local height = config.RootHeight * currentScale
+                local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
+                local minX = config.ScreenMargin + leftInset
+                local minY = config.ScreenMargin + topInset
+                local maxX = math.max(minX, viewport.X - width - config.ScreenMargin - rightInset)
+                local maxY = math.max(minY, viewport.Y - height - config.ScreenMargin - bottomInset)
+                return math.clamp(x, minX, maxX), math.clamp(y, minY, maxY)
+            end
+            UpdateDynamicIslandScaleAndBounds()
+            return capsule
+        end
+
+        UIState.PerformanceIsland = CreatePerformanceIsland()
+
+        local function UpdatePerformanceIslandLayout()
+            -- Compatibility shim for existing callers; metrics are permanently part of the island.
+            if not UIState.PerformanceIsland.Visible then UIState.PerformanceIsland.Visible = true end
+            if UIState.IslandExpanded then
+                for _, item in ipairs(UIState.IslandContentLabels) do
+                    if item and item.Parent and not item.Visible then item.Visible = true end
+                end
+            end
+        end
+
+        local function AnimateOpening()
+            if not UIState.DynamicIslandRoot or not UIState.DynamicIslandRoot.Parent then return end
+            if UIState.OpeningTween then pcall(function() UIState.OpeningTween:Cancel() end) end
+            if UIState.GlowTween then pcall(function() UIState.GlowTween:Cancel() end) end
+            UIState.IslandExpanded = false
+            UIState.PerformanceIsland.Size = UDim2.new(0, 0, 0, DYNAMIC_ISLAND_CONFIG.CapsuleHeight)
+            UIState.IslandGlow.Size = UDim2.new(0, 0, 0, DYNAMIC_ISLAND_CONFIG.CapsuleHeight + 4)
+            for _, item in ipairs(UIState.IslandContentLabels) do
+                if item and item.Parent then
+                    item.Visible = false
+                    if item:IsA("TextLabel") or item:IsA("TextButton") then
+                        item.TextTransparency = 1
+                    end
+                end
+            end
+            UIState.PerformanceIsland.Visible = true
+            UIState.IslandGlow.Visible = true
+            local info = TweenInfo.new(DYNAMIC_ISLAND_CONFIG.OpenDuration, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+            UIState.OpeningTween = TweenService:Create(UIState.PerformanceIsland, info, {
+                Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.CapsuleWidth, 0, DYNAMIC_ISLAND_CONFIG.CapsuleHeight),
+            })
+            UIState.GlowTween = TweenService:Create(UIState.IslandGlow, info, {
+                Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.CapsuleWidth, 0, DYNAMIC_ISLAND_CONFIG.CapsuleHeight + 4),
+            })
+            UIState.OpeningTween:Play()
+            UIState.GlowTween:Play()
+            UIState.OpeningTween.Completed:Connect(function(playbackState)
+                if playbackState ~= Enum.PlaybackState.Completed or not UIState.DynamicIslandRoot.Parent then return end
+                UIState.IslandExpanded = true
+                for _, item in ipairs(UIState.IslandContentLabels) do
+                    if item and item.Parent then
+                        item.Visible = true
+                        if item:IsA("TextLabel") or item:IsA("TextButton") then
+                            item.TextTransparency = 1
+                            local fade = TweenService:Create(item, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {TextTransparency = 0})
+                            fade:Play()
+                        end
+                    end
+                end
+                UIState.RoundTimerLabel.TextStrokeTransparency = 0.58
+                UpdatePerformanceIslandLayout()
+            end)
+        end
+        UIState.AnimateOpening = AnimateOpening
+
+        local function UpdateRoundTimerVisual(text, active, status)
+            if not UIState.RoundTimerLabel or not UIState.RoundTimerLabel.Parent then return end
+            local timerLabel = UIState.RoundTimerLabel
+            local config = DYNAMIC_ISLAND_CONFIG
+            local timerColor = active and config.Colors.TimerActive or config.Colors.TimerEnded
+            timerLabel.Text = tostring(text or "3:00")
+            timerLabel.TextColor3 = timerColor
+            timerLabel.TextStrokeColor3 = timerColor
+            timerLabel.TextStrokeTransparency = active and 0.58 or 1
+            if UIState.RoundStatusLabel and UIState.RoundStatusLabel.Parent then
+                UIState.RoundStatusLabel.Text = tostring(status or "N/D")
+                UIState.RoundStatusLabel.TextColor3 = active and config.Colors.TimerActive or config.Colors.Silver
+            end
+        end
+        UIState.UpdateRoundTimerVisual = UpdateRoundTimerVisual
 
 		local PerformanceOriginals = setmetatable({}, {__mode = "k"})
 		local Lighting = game:GetService("Lighting")
@@ -16778,38 +17025,58 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				end
 				return
 			end
-			local now = tick()
-			if State.FPSCounterEnabled then
-				if type(deltaTime) == "number" and deltaTime > 0 then UIState.FPSSampleElapsed += deltaTime end
-				UIState.FPSSampleFrames += 1
-				if UIState.FPSSampleElapsed >= 0.12 then
-					local measuredFPS = UIState.FPSSampleFrames / math.max(UIState.FPSSampleElapsed, 0.001)
-					measuredFPS = math.clamp(measuredFPS, 1, 1000)
-					UIState.FPSSmoothedValue = UIState.FPSSmoothedValue + ((measuredFPS - UIState.FPSSmoothedValue) * 0.28)
-					if now - UIState.FPSLastDisplayUpdate >= 0.16 then
-						UIState.FPSDisplayValue = math.floor(UIState.FPSSmoothedValue + 0.5)
-						UIState.FPSDisplayValue = math.clamp(UIState.FPSDisplayValue, 1, 1000)
-						UIState.FPSValueLabel.Text = tostring(UIState.FPSDisplayValue)
-						UIState.FPSLastDisplayUpdate = now
-					end
-					UIState.FPSSampleElapsed = 0
-					UIState.FPSSampleFrames = 0
-				end
-			else
-				UIState.FPSSampleElapsed = 0
-				UIState.FPSSampleFrames = 0
-				UIState.FPSDisplayValue = 60
-			end
-			if State.PingDisplayEnabled and now - UIState.FPSLastPingSample >= 0.20 then
-				UIState.FPSLastPingSample = now
-				local pingMs
-				local ok, pingSeconds = pcall(function() return LocalPlayer:GetNetworkPing() end)
-				if ok and type(pingSeconds) == "number" and pingSeconds >= 0 then pingMs = pingSeconds * 1000
-				else pingMs = GetPlayerPing() end
-				if type(pingMs) == "number" and pingMs >= 0 then
-					UIState.PingValueLabel.Text = string.format("%d ms", math.floor(pingMs + 0.5))
-				end
-			end
+            local now = tick()
+            if not UIState.LastIslandViewportUpdate or now - UIState.LastIslandViewportUpdate >= 0.5 then
+                UIState.LastIslandViewportUpdate = now
+                pcall(UIState.UpdateDynamicIslandScaleAndBounds)
+            end
+            if type(deltaTime) == "number" and deltaTime > 0 and deltaTime < 1 then
+                UIState.FPSSampleElapsed += deltaTime
+            end
+            UIState.FPSSampleFrames += 1
+            if UIState.FPSSampleElapsed >= 0.12 then
+                local measuredFPS = UIState.FPSSampleFrames / math.max(UIState.FPSSampleElapsed, 0.001)
+                measuredFPS = math.clamp(measuredFPS, 1, 1000)
+                UIState.FPSSmoothedValue = UIState.FPSSmoothedValue + ((measuredFPS - UIState.FPSSmoothedValue) * 0.28)
+                if now - UIState.FPSLastDisplayUpdate >= DYNAMIC_ISLAND_CONFIG.FPSUpdateInterval then
+                    UIState.FPSDisplayValue = math.clamp(math.floor(UIState.FPSSmoothedValue + 0.5), 1, 1000)
+                    UIState.FPSValueLabel.Text = "★" .. tostring(UIState.FPSDisplayValue) .. " FPS"
+                    UIState.FPSLastDisplayUpdate = now
+                end
+                UIState.FPSSampleElapsed = 0
+                UIState.FPSSampleFrames = 0
+            end
+
+            if now - UIState.FPSLastPingSample >= DYNAMIC_ISLAND_CONFIG.PingUpdateInterval then
+                UIState.FPSLastPingSample = now
+                local pingMs = nil
+                local statsOK, statItem = pcall(function()
+                    return Stats.Network.ServerStatsItem["Data Ping"]
+                end)
+                if statsOK and statItem then
+                    local stringOK, valueString = pcall(function() return statItem:GetValueString() end)
+                    if stringOK and type(valueString) == "string" then
+                        local numeric = valueString:match("([%d%.]+)")
+                        pingMs = tonumber(numeric)
+                    end
+                    if not pingMs then
+                        local valueOK, value = pcall(function() return statItem:GetValue() end)
+                        if valueOK and type(value) == "number" and value >= 0 then pingMs = value end
+                    end
+                end
+                if not pingMs then
+                    local pingOK, pingSeconds = pcall(function() return LocalPlayer:GetNetworkPing() end)
+                    if pingOK and type(pingSeconds) == "number" and pingSeconds >= 0 then
+                        pingMs = pingSeconds * 1000
+                    end
+                end
+                if type(pingMs) == "number" and pingMs >= 0 and pingMs == pingMs then
+                    UIState.PingValueLabel.Text = "★" .. tostring(math.floor(pingMs + 0.5)) .. " ms"
+                else
+                    UIState.PingValueLabel.Text = "★N/D ms"
+                end
+            end
+
 			UpdatePerformanceIslandLayout()
 			local sweep = ((now * 0.25) % 2) - 1
 			UIState.FPSGradient.Offset = Vector2.new(sweep, 0)
@@ -17344,31 +17611,11 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		-- ROUND TIMER
 		-- ====================================================================
 
-		local TimerTextLabel = Instance.new("TextLabel")
-		TimerTextLabel.Size = UDim2.new(0, 260, 0, 40)
-		TimerTextLabel.Position = UDim2.new(0.5, -130, 0, -10)
-		TimerTextLabel.BackgroundTransparency = 1
-		TimerTextLabel.Font = Enum.Font.GothamMedium
-		TimerTextLabel.TextStrokeTransparency = 0
-		TimerTextLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-		TimerTextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-		TimerTextLabel.TextSize = 20
-		TimerTextLabel.Text = ""
-		TimerTextLabel.Visible = false
-		TimerTextLabel.ZIndex = 100
-		TimerTextLabel.Parent = ScreenGui
+        local ROUND_DURATION = DYNAMIC_ISLAND_CONFIG.RoundDuration
+        local MIN_TIMER_VALUE = 0
+        local MAX_TIMER_VALUE = 720
 
-		local function GetTimerColor(timeLeft)
-			if timeLeft <= 30 then return Color3.fromRGB(255, 50, 50)
-			elseif timeLeft <= 75 then return Color3.fromRGB(255, 140, 0):Lerp(Color3.fromRGB(255, 50, 50), (75 - timeLeft) / 45)
-			elseif timeLeft <= 120 then return Color3.fromRGB(255, 230, 0):Lerp(Color3.fromRGB(255, 140, 0), (120 - timeLeft) / 45)
-			else return Color3.fromRGB(0, 160, 70):Lerp(Color3.fromRGB(255, 230, 0), (180 - timeLeft) / 60) end
-		end
-		local ROUND_DURATION = 180
-		local MIN_TIMER_VALUE = 1
-		local MAX_TIMER_VALUE = 720
-
-		local function ParseTimerText(raw)
+        local function ParseTimerText(raw)
 			if raw == nil then return nil end
 			raw = tostring(raw):lower()
 			raw = raw:gsub("%s+", "")
@@ -17394,9 +17641,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		end
 
 		local function FormatTimerText(seconds)
-			seconds = math.max(0, math.floor(tonumber(seconds) or 0))
-			return string.format("%dm %ds", math.floor(seconds / 60), seconds % 60)
-		end
+            seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+            return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+        end
 
 		local mm2TimerCache = nil
 		local mm2TimerCacheScore = -math.huge
@@ -17534,142 +17781,189 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		end
 
 		local timerState = {
-			phase = "Idle", roundStartTime = nil, remaining = nil,
-			observedDuration = nil, lastObservedRemaining = nil, lastObservedAt = nil,
-			ended = true, waitingTeleportArmed = false,
-			waitingHiddenAfterNaturalTeleport = false, lastMapLoadingAt = 0,
-			lastRootPosition = nil, lastRootSampleAt = 0,
-		}
-		_G.Celestial.RoundTimerState = timerState
+            phase = "Idle", roundStartTime = nil, remaining = ROUND_DURATION,
+            observedDuration = nil, lastObservedRemaining = nil, lastObservedAt = nil,
+            ended = true, noRolesSince = nil, rolesClearConfirmed = false,
+            lastEndSignalScan = 0, lastEndSignal = false, lastEndReason = nil,
+            roundGeneration = 0,
+        }
+        _G.Celestial.RoundTimerState = timerState
 
-		task.spawn(function()
-			local prevHasRoles = false
-			while task.wait(0.1) do
-				pcall(function()
-					if not State.ShowTimerActive then
-						TimerTextLabel.Visible = false
-						timerState.waitingTeleportArmed = false
-						timerState.waitingHiddenAfterNaturalTeleport = false
-						return
-					end
-					if _G.Celestial.GameMode == "DUELS" then
-						TimerTextLabel.Visible = false
-						timerState.waitingTeleportArmed = false
-						timerState.waitingHiddenAfterNaturalTeleport = false
-						return
-					end
-					local now = tick()
-					local mapLoadingNow = IsMapLoading()
-					if mapLoadingNow then timerState.lastMapLoadingAt = now end
-					local waitingForTurnVisible = (TimerTextLabel.Visible and TimerTextLabel.Text == "Waiting for your turn...")
-					if waitingForTurnVisible then timerState.waitingTeleportArmed = true end
-					local root = GetRoot()
-					if root and root.Parent then
-						local previousPosition = timerState.lastRootPosition
-						local previousAt = timerState.lastRootSampleAt or 0
-						timerState.lastRootPosition = root.Position
-						timerState.lastRootSampleAt = now
-						if timerState.waitingTeleportArmed
-							and timerState.lastMapLoadingAt > 0
-							and (now - timerState.lastMapLoadingAt) <= 4.0
-							and previousPosition and previousAt > 0 and (now - previousAt) <= 0.35
-							and not State.FlingActive and not _G.Celestial.FlingSessionActive then
-							local displacement = (root.Position - previousPosition).Magnitude
-							if displacement >= 35 then
-								timerState.waitingHiddenAfterNaturalTeleport = true
-								timerState.waitingTeleportArmed = false
-								TimerTextLabel.Visible = false
-							end
-						end
-					end
-					local hasRoles = (State.MurdererName ~= "" or State.SheriffName ~= "")
-					if hasRoles and not prevHasRoles then
-						timerState.waitingHiddenAfterNaturalTeleport = false
-						timerState.waitingTeleportArmed = false
-						timerState.phase = "Round"
-						timerState.roundStartTime = tick()
-						timerState.remaining = nil
-						timerState.observedDuration = nil
-						timerState.lastObservedRemaining = nil
-						timerState.lastObservedAt = nil
-						timerState.ended = false
-					end
-					if not hasRoles and prevHasRoles then
-						timerState.waitingTeleportArmed = false
-						timerState.waitingHiddenAfterNaturalTeleport = false
-						timerState.lastRootPosition = nil
-						timerState.phase = "Idle"
-						timerState.roundStartTime = nil
-						timerState.remaining = nil
-						timerState.observedDuration = nil
-						timerState.lastObservedRemaining = nil
-						timerState.lastObservedAt = nil
-						timerState.ended = true
-					end
-					prevHasRoles = hasRoles
-					if timerState.phase == "Round" then
-						local label, value = FindMM2TimerLabel()
-						if value then
-							if not timerState.observedDuration then timerState.observedDuration = value end
-							timerState.remaining = value
-							timerState.lastObservedRemaining = value
-							timerState.lastObservedAt = tick()
-							timerState.ended = value <= 0
-							TimerTextLabel.Visible = true
-							TimerTextLabel.Text = FormatTimerText(value)
-							TimerTextLabel.TextColor3 = GetTimerColor(value)
-						elseif timerState.lastObservedRemaining and timerState.lastObservedAt then
-							local elapsedSinceObserved = tick() - timerState.lastObservedAt
-							local remaining = math.max(0, timerState.lastObservedRemaining - math.floor(elapsedSinceObserved))
-							timerState.remaining = remaining
-							timerState.ended = remaining <= 0
-							if remaining > 0 then
-								TimerTextLabel.Visible = true
-								TimerTextLabel.Text = FormatTimerText(remaining)
-								TimerTextLabel.TextColor3 = GetTimerColor(remaining)
-							else TimerTextLabel.Visible = false end
-						elseif timerState.roundStartTime and timerState.observedDuration then
-							local elapsed = tick() - timerState.roundStartTime
-							local remaining = math.max(0, timerState.observedDuration - math.floor(elapsed))
-							timerState.remaining = remaining
-							timerState.ended = remaining <= 0
-							if remaining > 0 then
-								TimerTextLabel.Visible = true
-								TimerTextLabel.Text = FormatTimerText(remaining)
-								TimerTextLabel.TextColor3 = GetTimerColor(remaining)
-							else TimerTextLabel.Visible = false end
-						elseif timerState.roundStartTime then
-							local elapsed = tick() - timerState.roundStartTime
-							local remaining = math.max(0, ROUND_DURATION - math.floor(elapsed))
-							timerState.remaining = remaining
-							timerState.ended = remaining <= 0
-							if remaining > 0 then
-								TimerTextLabel.Visible = true
-								TimerTextLabel.Text = FormatTimerText(remaining)
-								TimerTextLabel.TextColor3 = GetTimerColor(remaining)
-							else TimerTextLabel.Visible = false end
-						else TimerTextLabel.Visible = false end
-					else
-						if timerState.waitingHiddenAfterNaturalTeleport then
-							TimerTextLabel.Visible = false
-						elseif IsMapLoading() then
-							TimerTextLabel.Position = UDim2.new(0.5, -130, 0, -10)
-							TimerTextLabel.Visible = true
-							TimerTextLabel.Text = "Loading Map..."
-							TimerTextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-						elseif #Players:GetPlayers() > 1 then
-							TimerTextLabel.Position = UDim2.new(0.5, -130, 0, -10)
-							TimerTextLabel.Visible = true
-							TimerTextLabel.Text = "Waiting for your turn..."
-							TimerTextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-						else TimerTextLabel.Visible = false end
-					end
-				end)
-			end
-		end)
+        local function DetectRoundEndSignal()
+            local now = tick()
+            if now - timerState.lastEndSignalScan < 0.35 then return timerState.lastEndSignal end
+            timerState.lastEndSignalScan = now
+            local signal = false
+            if IsMapLoading() then
+                signal = true
+                timerState.lastEndReason = "MapTransition"
+            end
 
-		-- ====================================================================
-		-- TARGET MODAL
+            local murdererName = tostring(State.MurdererName or "")
+            if not signal and murdererName ~= "" then
+                local murderer = Players:FindFirstChild(murdererName)
+                local character = murderer and murderer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health <= 0 then
+                    signal = true
+                    timerState.lastEndReason = "MurdererEliminated"
+                elseif humanoid and humanoid.Health > 0 then
+                    -- Only confirm a murderer victory when health is readable for every survivor.
+                    local survivorCount, aliveSurvivors, allSurvivorHealthKnown = 0, 0, true
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if player.Name ~= murdererName then
+                            survivorCount += 1
+                            local playerCharacter = player.Character
+                            local playerHumanoid = playerCharacter and playerCharacter:FindFirstChildOfClass("Humanoid")
+                            if not playerHumanoid then
+                                allSurvivorHealthKnown = false
+                            elseif playerHumanoid.Health > 0 then
+                                aliveSurvivors += 1
+                            end
+                        end
+                    end
+                    if survivorCount > 0 and allSurvivorHealthKnown and aliveSurvivors == 0 then
+                        signal = true
+                        timerState.lastEndReason = "SurvivorsEliminated"
+                    end
+                end
+            end
+
+            if not signal then
+                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
+                if mainGui then
+                    local phrases = {
+                        "murderer wins", "murderer won", "murderer was killed", "murderer has been killed",
+                        "sheriff wins", "sheriff won", "innocents win", "innocents won",
+                        "survivors win", "survivors won", "round over", "round ended", "game over",
+                        "victory", "defeat", "you win", "you lose", "intermission",
+                    }
+                    local ok, descendants = pcall(function() return mainGui:GetDescendants() end)
+                    if ok and descendants then
+                        for _, obj in ipairs(descendants) do
+                            if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+                                local normalized = string.lower(tostring(obj.Text or "")):gsub("%s+", " ")
+                                for _, phrase in ipairs(phrases) do
+                                    if normalized:find(phrase, 1, true) then
+                                        signal = true
+                                        timerState.lastEndReason = "RoundResultText"
+                                        break
+                                    end
+                                end
+                            end
+                            if signal then break end
+                        end
+                    end
+                end
+            end
+            timerState.lastEndSignal = signal
+            return signal
+        end
+
+        local function HandleNewRound(now, observedValue)
+            now = now or tick()
+            timerState.phase = "Round"
+            timerState.roundStartTime = now
+            timerState.remaining = tonumber(observedValue) or ROUND_DURATION
+            timerState.observedDuration = tonumber(observedValue)
+            timerState.lastObservedRemaining = tonumber(observedValue)
+            timerState.lastObservedAt = tonumber(observedValue) and now or nil
+            timerState.ended = false
+            timerState.noRolesSince = nil
+            timerState.rolesClearConfirmed = false
+            timerState.lastEndSignal = false
+            timerState.lastEndReason = nil
+            timerState.roundGeneration += 1
+            UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining), true, "ACTIVE")
+        end
+
+        local function HandleRoundEnd(reason)
+            if timerState.phase ~= "Round" then return end
+            timerState.phase = "Ended"
+            timerState.ended = true
+            timerState.lastEndReason = reason or timerState.lastEndReason or "ConfirmedRoundEnd"
+            if timerState.remaining == nil then
+                timerState.remaining = math.max(0, ROUND_DURATION - math.floor(tick() - (timerState.roundStartTime or tick())))
+            end
+            if reason == "RolesUnavailable" then timerState.rolesClearConfirmed = true end
+            UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining), false, "ENDED")
+        end
+
+        local function UpdateRoundTimer()
+            local now = tick()
+            local mode = tostring(_G.Celestial.GameMode or "UNKNOWN")
+            if mode == "DUELS" or mode == "SPIDER" then
+                if timerState.phase == "Round" then HandleRoundEnd("ModeUnavailable") end
+                UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or ROUND_DURATION), false, "N/D")
+                return
+            end
+
+            local hasRoles = tostring(State.MurdererName or "") ~= "" or tostring(State.SheriffName or "") ~= ""
+            local observedValue = nil
+            if hasRoles or timerState.phase == "Round" then
+                local _, value = FindMM2TimerLabel()
+                observedValue = value
+            end
+            local endSignal = timerState.phase == "Round" and DetectRoundEndSignal()
+
+            if hasRoles then
+                timerState.noRolesSince = nil
+                if timerState.phase == "Idle" then
+                    HandleNewRound(now, observedValue)
+                elseif timerState.phase == "Ended" then
+                    local timerReset = type(observedValue) == "number"
+                        and type(timerState.lastObservedRemaining) == "number"
+                        and observedValue >= ROUND_DURATION - 3
+                        and observedValue > timerState.lastObservedRemaining + 15
+                    if timerState.rolesClearConfirmed or timerReset then
+                        HandleNewRound(now, observedValue)
+                    end
+                end
+            elseif timerState.phase == "Round" then
+                timerState.noRolesSince = timerState.noRolesSince or now
+                if now - timerState.noRolesSince >= 0.75 then
+                    HandleRoundEnd("RolesUnavailable")
+                end
+            elseif timerState.phase == "Ended" then
+                timerState.noRolesSince = timerState.noRolesSince or now
+                if now - timerState.noRolesSince >= 0.75 then timerState.rolesClearConfirmed = true end
+            end
+
+            if timerState.phase == "Round" then
+                if endSignal then
+                    HandleRoundEnd(timerState.lastEndReason or "RoundResultSignal")
+                else
+                    local remaining
+                    if type(observedValue) == "number" and observedValue >= 0 then
+                        remaining = observedValue
+                        timerState.lastObservedRemaining = observedValue
+                        timerState.lastObservedAt = now
+                        if not timerState.observedDuration then timerState.observedDuration = math.max(observedValue, ROUND_DURATION) end
+                    elseif type(timerState.lastObservedRemaining) == "number" and timerState.lastObservedAt then
+                        remaining = math.max(0, timerState.lastObservedRemaining - math.floor(now - timerState.lastObservedAt))
+                    else
+                        remaining = math.max(0, ROUND_DURATION - math.floor(now - (timerState.roundStartTime or now)))
+                    end
+                    timerState.remaining = math.max(0, math.floor(remaining or 0))
+                    timerState.ended = false -- 0:00 alone is not a confirmed round-end signal.
+                    UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining), true, "ACTIVE")
+                end
+            elseif timerState.phase == "Ended" then
+                UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or 0), false, "ENDED")
+            else
+                UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or ROUND_DURATION), false, "N/D")
+            end
+        end
+
+        task.spawn(function()
+            while task.wait(0.1) do
+                if not ScreenGui.Parent then return end
+                pcall(UpdateRoundTimer)
+            end
+        end)
+
+        -- TARGET MODAL
 		-- ====================================================================
 
 		local TargetModal = Instance.new("Frame")
@@ -17918,18 +18212,29 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		ContainerHolder.ClipsDescendants = true
 		ContainerHolder.Parent = MainFrame
 
-		local MinimzedBar = Instance.new("ImageButton")
-		MinimzedBar.Name = "CelestialBubble"
-		MinimzedBar.Size = UDim2.new(0, 82.39, 0, 82.39)
-		MinimzedBar.Position = UDim2.new(0.92, -38, 0.5, -38)
-		MinimzedBar.BackgroundTransparency = 1
-		MinimzedBar.BorderSizePixel = 0
-		MinimzedBar.Image = "rbxassetid://118869628234830"
-		MinimzedBar.ImageTransparency = 0
-		MinimzedBar.ScaleType = Enum.ScaleType.Fit
-		MinimzedBar.Visible = true
-		MinimzedBar.ZIndex = 50
-		MinimzedBar.Parent = ScreenGui
+        local MinimzedBar = Instance.new("ImageLabel")
+        MinimzedBar.Name = "CelestialBubble"
+        MinimzedBar.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize)
+        MinimzedBar.Position = UDim2.new(0, 0, 0, 0)
+        MinimzedBar.BackgroundTransparency = 1
+        MinimzedBar.BorderSizePixel = 0
+        MinimzedBar.Image = BUBBLE_IMAGE_ID
+        MinimzedBar.ImageTransparency = 0
+        MinimzedBar.ScaleType = Enum.ScaleType.Fit
+        MinimzedBar.Visible = true
+        MinimzedBar.ZIndex = 130
+        MinimzedBar.Parent = UIState.DynamicIslandRoot
+
+        local MinimizedBubbleInteraction = Instance.new("TextButton")
+        MinimizedBubbleInteraction.Name = "CelestialBubbleInteraction"
+        MinimizedBubbleInteraction.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize)
+        MinimizedBubbleInteraction.Position = UDim2.new(0, 0, 0, 0)
+        MinimizedBubbleInteraction.BackgroundTransparency = 1
+        MinimizedBubbleInteraction.BorderSizePixel = 0
+        MinimizedBubbleInteraction.Text = ""
+        MinimizedBubbleInteraction.AutoButtonColor = false
+        MinimizedBubbleInteraction.ZIndex = 131
+        MinimizedBubbleInteraction.Parent = UIState.DynamicIslandRoot
 
 		local ResizeWidthButton = Instance.new("TextButton")
 		ResizeWidthButton.Name = "ResizeDownTouchZone"
@@ -18007,45 +18312,74 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			elseif State.WindowMode == "Minimized100" then UpdateWindowState("Minimized90") end
 		end)
 
-		local minDragging, minDragStart, minStartPos, hasMovedBubble, activeBubbleTouchId = nil, nil, nil, false, nil
-		MinimzedBar.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-				if not minDragging then
-					minDragging = true
-					activeBubbleTouchId = input
-					minDragStart = input.Position
-					minStartPos = MinimzedBar.Position
-					hasMovedBubble = false
-				end
-			end
-		end)
-		UserInputService.InputChanged:Connect(function(input)
-			if minDragging and input == activeBubbleTouchId then
-				if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
-					local delta = input.Position - minDragStart
-					if delta.Magnitude > 6 then hasMovedBubble = true end
-					MinimzedBar.Position = UDim2.new(
-						minStartPos.X.Scale, minStartPos.X.Offset + delta.X,
-						minStartPos.Y.Scale, minStartPos.Y.Offset + delta.Y
-					)
-				end
-			end
-		end)
-		UserInputService.InputEnded:Connect(function(input)
-			if minDragging and input == activeBubbleTouchId then
-				if not hasMovedBubble then
-					if State.WindowMode == "Minimized100" then
-						UpdateWindowState(State.LastPre100Mode or "Normal")
-					else
-						State.LastPre100Mode = State.WindowMode
-						UpdateWindowState("Minimized100")
-					end
-				end
-				minDragging = false
-				activeBubbleTouchId = nil
-			end
-		end)
+        local dynamicIslandConnections = {}
+        local function KeepDynamicIslandConnection(connection)
+            if connection then table.insert(dynamicIslandConnections, connection) end
+            return connection
+        end
+        local islandDragging = false
+        local islandDragStart = nil
+        local islandStartPos = nil
+        local activeIslandInput = nil
+        local activeIslandInputType = nil
 
+        KeepDynamicIslandConnection(UIState.MoveButton.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Touch
+                and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+            if islandDragging then return end
+            islandDragging = true
+            activeIslandInput = input
+            activeIslandInputType = input.UserInputType
+            islandDragStart = input.Position
+            islandStartPos = UIState.DynamicIslandRoot.Position
+        end))
+
+        KeepDynamicIslandConnection(UserInputService.InputChanged:Connect(function(input)
+            if not islandDragging or not islandDragStart or not islandStartPos then return end
+            local isMouseMove = activeIslandInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseMovement
+            local isActiveTouch = activeIslandInputType == Enum.UserInputType.Touch and input == activeIslandInput
+            if not isMouseMove and not isActiveTouch then return end
+            local delta = input.Position - islandDragStart
+            local targetX = islandStartPos.X.Offset + delta.X
+            local targetY = islandStartPos.Y.Offset + delta.Y
+            local clampedX, clampedY = UIState.ClampDynamicIslandPosition(targetX, targetY)
+            UIState.DynamicIslandRoot.Position = UDim2.fromOffset(math.floor(clampedX), math.floor(clampedY))
+        end))
+
+        KeepDynamicIslandConnection(UserInputService.InputEnded:Connect(function(input)
+            local isMouseRelease = activeIslandInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1
+            local isTouchRelease = activeIslandInputType == Enum.UserInputType.Touch and input == activeIslandInput
+            if islandDragging and (isMouseRelease or isTouchRelease) then
+                islandDragging = false
+                islandDragStart = nil
+                islandStartPos = nil
+                activeIslandInput = nil
+                activeIslandInputType = nil
+            end
+        end))
+
+        KeepDynamicIslandConnection(MinimizedBubbleInteraction.Activated:Connect(function()
+            -- Preserve the bubble's existing tap-to-minimize/restore behavior.
+            if State.WindowMode == "Minimized100" then
+                UpdateWindowState(State.LastPre100Mode or "Normal")
+            else
+                State.LastPre100Mode = State.WindowMode
+                UpdateWindowState("Minimized100")
+            end
+        end))
+
+        KeepDynamicIslandConnection(ScreenGui.Destroying:Connect(function()
+            for _, connection in ipairs(dynamicIslandConnections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            table.clear(dynamicIslandConnections)
+            if UIState.OpeningTween then pcall(function() UIState.OpeningTween:Cancel() end) end
+            if UIState.GlowTween then pcall(function() UIState.GlowTween:Cancel() end) end
+        end))
+
+        UIState.AnimateOpening()
 		local frameDragging, frameDragStart, frameStartPos, activeFrameTouchId = nil, nil, nil, nil
 		DragHeader.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -18599,7 +18933,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			crosshairAssetPadding.PaddingRight = UDim.new(0, 7)
 			crosshairAssetPadding.Parent = crosshairAssetBox
 
-			AddCategoryHeader(secCrosshair, "Preset Crosshairs  •  scroll horizontally")
+			local randomCrosshairHeader = AddCategoryHeader(secCrosshair, "Random")
+			randomCrosshairHeader.Text = "Random"
 			local crosshairPresetScroller = Instance.new("ScrollingFrame")
 			crosshairPresetScroller.Name = "PresetCrosshairsScroller"
 			crosshairPresetScroller.Size = UDim2.new(1, -8, 0, 72)
@@ -18632,6 +18967,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			crosshairPresetLayout.Parent = crosshairPresetScroller
 
 			local crosshairPresetStrokes = {}
+            local crosshairCategoryStrokes = {}
 			local function RefreshCrosshairPresetSelection()
 				local selectedId = tostring(State.CrosshairAssetId or ""):gsub("%s+", "")
 				for index, assetId in ipairs(_G.Celestial.CrosshairAPI.PresetIds) do
@@ -18643,6 +18979,16 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 						stroke.Transparency = selected and 0 or 0.1
 					end
 				end
+                for _, strokeByAssetId in pairs(crosshairCategoryStrokes) do
+                    for assetId, stroke in pairs(strokeByAssetId) do
+                        if stroke then
+                            local selected = selectedId == assetId
+                            stroke.Color = selected and Color3.fromRGB(205, 190, 255) or Color3.fromRGB(92, 92, 108)
+                            stroke.Thickness = selected and 2 or 1
+                            stroke.Transparency = selected and 0 or 0.1
+                        end
+                    end
+                end
 			end
 
 			for index, assetId in ipairs(_G.Celestial.CrosshairAPI.PresetIds) do
@@ -18674,6 +19020,112 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				end)
 			end
 
+            local crosshairCategories = {
+                {
+                    Name = "Minecraft Coloured Hearts",
+                    IDs = {"118630928453442", "84872401090269", "127993745058201", "122498038141145", "117764114698527", "97635154193987", "74599698233087"},
+                },
+                {
+                    Name = "Coloured Stars Cursors",
+                    IDs = {"113162542267451", "115572496471253", "120214809748828", "80453425982073", "119252286542731", "134657924686365", "112017729385342"},
+                },
+                {
+                    Name = "Kuromi Faces Cursors",
+                    IDs = {"73177112266263", "104342294591674", "88100804173485", "103469267669924", "85702338407913", "114886066306668", "77912336580727"},
+                },
+                {
+                    Name = "Kuromi Full Body Cursors",
+                    IDs = {"82205142985756", "70709330796835", "72904844847542", "94436963596995", "86106254607350", "103432242284058", "128194433209275"},
+                },
+                {
+                    Name = "Melody Faces Cursors",
+                    IDs = {"90935322552233", "90896925329654", "140144731818506", "131095001762036", "95286805730527", "84622593314607", "94167238645027"},
+                },
+            }
+
+            local function CreateCrosshairCategory(category, categoryIndex)
+                local categoryHeader = AddCategoryHeader(secCrosshair, category.Name)
+                categoryHeader.Text = category.Name
+
+                local swipeHint = Instance.new("TextLabel")
+                swipeHint.Name = "SwipeHint" .. tostring(categoryIndex)
+                swipeHint.Size = UDim2.new(1, -8, 0, 17)
+                swipeHint.BackgroundTransparency = 1
+                swipeHint.Text = "Swipe horizontally"
+                swipeHint.TextColor3 = Color3.fromRGB(155, 155, 175)
+                swipeHint.Font = Enum.Font.Gotham
+                swipeHint.TextSize = 10
+                swipeHint.TextXAlignment = Enum.TextXAlignment.Left
+                swipeHint.Parent = secCrosshair
+
+                local scroller = Instance.new("ScrollingFrame")
+                scroller.Name = "CrosshairCategoryScroller" .. tostring(categoryIndex)
+                scroller.Size = UDim2.new(1, -8, 0, 72)
+                scroller.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+                scroller.BackgroundTransparency = 0.3
+                scroller.BorderSizePixel = 0
+                scroller.Active = true
+                scroller.ScrollingEnabled = true
+                scroller.ScrollingDirection = Enum.ScrollingDirection.X
+                scroller.AutomaticCanvasSize = Enum.AutomaticSize.X
+                scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+                scroller.ScrollBarThickness = 3
+                scroller.ScrollBarImageColor3 = Color3.fromRGB(200, 150, 255)
+                scroller.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+                scroller.Parent = secCrosshair
+                local scrollerCorner = Instance.new("UICorner")
+                scrollerCorner.CornerRadius = UDim.new(0, 8)
+                scrollerCorner.Parent = scroller
+                local scrollerPadding = Instance.new("UIPadding")
+                scrollerPadding.PaddingLeft = UDim.new(0, 6)
+                scrollerPadding.PaddingRight = UDim.new(0, 6)
+                scrollerPadding.PaddingTop = UDim.new(0, 5)
+                scrollerPadding.PaddingBottom = UDim.new(0, 5)
+                scrollerPadding.Parent = scroller
+                local scrollerLayout = Instance.new("UIListLayout")
+                scrollerLayout.FillDirection = Enum.FillDirection.Horizontal
+                scrollerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+                scrollerLayout.Padding = UDim.new(0, 7)
+                scrollerLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+                scrollerLayout.Parent = scroller
+                crosshairCategoryStrokes[category.Name] = {}
+
+                for index, assetId in ipairs(category.IDs) do
+                    local presetButton = Instance.new("ImageButton")
+                    presetButton.Name = "Category" .. tostring(categoryIndex) .. "Crosshair" .. tostring(index)
+                    presetButton.Size = UDim2.new(0, 54, 0, 54)
+                    presetButton.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+                    presetButton.BackgroundTransparency = 0.1
+                    presetButton.BorderSizePixel = 0
+                    presetButton.AutoButtonColor = true
+                    presetButton.Image = "rbxassetid://" .. assetId
+                    presetButton.ScaleType = Enum.ScaleType.Fit
+                    presetButton.LayoutOrder = index
+                    presetButton.Parent = scroller
+                    local buttonCorner = Instance.new("UICorner")
+                    buttonCorner.CornerRadius = UDim.new(0, 7)
+                    buttonCorner.Parent = presetButton
+                    local buttonStroke = Instance.new("UIStroke")
+                    buttonStroke.Color = Color3.fromRGB(92, 92, 108)
+                    buttonStroke.Thickness = 1
+                    buttonStroke.Transparency = 0.1
+                    buttonStroke.Parent = presetButton
+                    crosshairCategoryStrokes[category.Name][assetId] = buttonStroke
+
+                    presetButton.Activated:Connect(function()
+                        State.CrosshairAssetId = assetId
+                        crosshairAssetBox.Text = assetId
+                        RefreshCrosshairPresetSelection()
+                        _G.Celestial.CrosshairAPI.ApplyAll()
+                    end)
+                end
+            end
+
+            for categoryIndex, category in ipairs(crosshairCategories) do
+                CreateCrosshairCategory(category, categoryIndex)
+            end
+            RefreshCrosshairPresetSelection()
+
 			local function RefreshCrosshairSection(exposedCount)
 				RefreshCrosshairEnableToggle()
 				RefreshCrosshairPresetSelection()
@@ -18689,6 +19141,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			crosshairAssetBox.FocusLost:Connect(function()
 				local raw = tostring(crosshairAssetBox.Text or ""):gsub("%s+", "")
 				State.CrosshairAssetId = raw:match("^%d+$") and raw or ""
+                RefreshCrosshairPresetSelection()
 				_G.Celestial.CrosshairAPI.ApplyAll()
 			end)
 
@@ -19750,7 +20203,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			end
 			local function TP_showError()
 				if not TPErrorLabel then return end
-				if State.FPSCounterEnabled ~= true and State.PingDisplayEnabled ~= true then return end
 				TPState.ErrorToken = TPState.ErrorToken + 1
 				local token = TPState.ErrorToken
 				TPErrorLabel.Visible = true
@@ -20419,14 +20871,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
 		local secFPS = CreateSection("FPS")
 		AddTabButton("FPS", secFPS, 72329844163469)
-		AddToggleToSection(secFPS, "FPS Counter", State.FPSCounterEnabled, function(v)
-			State.FPSCounterEnabled = v
-			UpdatePerformanceIslandLayout()
-		end)
-		AddToggleToSection(secFPS, "Ping Display", State.PingDisplayEnabled, function(v)
-			State.PingDisplayEnabled = v
-			UpdatePerformanceIslandLayout()
-		end)
 		AddToggleToSection(secFPS, "FPS Boost", State.FPSBoostActive, function(v)
 			State.FPSBoostActive = v
 			if v then ApplyAllPerformanceOptimizations()
@@ -20518,7 +20962,6 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				HandleTrapPowerChange()
 			end
 		end, Color3.fromRGB(180, 60, 60))
-		AddToggleToSection(secVisuals, "Show Round Timer", State.ShowTimerActive, function(v) State.ShowTimerActive = v end)
 
 		-- ====================================================================
 		-- MISC TAB
