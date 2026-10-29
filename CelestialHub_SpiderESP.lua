@@ -18302,6 +18302,20 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             if roundUiSignals.result then return false end
             if hasRoles then return true end
 
+            -- A role weapon in the local player's Character/Backpack is direct evidence
+            -- that this client has been assigned to an active round, even if their root
+            -- position still resolves to the lobby or the timer UI has not replicated yet.
+            local localInventoryHasWeapon = false
+            pcall(function()
+                local hasKnife, hasGun = CheckPlayerInventory(LocalPlayer)
+                localInventoryHasWeapon = hasKnife == true or hasGun == true
+            end)
+            if localInventoryHasWeapon then
+                timerEvidence.worldActive = true
+                timerEvidence.checkedAt = now
+                return true
+            end
+
             if now - timerEvidence.checkedAt >= 0.45 then
                 local hasRoleWeapon = false
                 pcall(function()
