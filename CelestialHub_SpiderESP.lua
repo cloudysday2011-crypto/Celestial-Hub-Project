@@ -18039,6 +18039,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		-- ====================================================================
 		-- ROUND TIMER
 		-- ====================================================================
+		do
 
         local ROUND_DURATION = DYNAMIC_ISLAND_CONFIG.RoundDuration
         local MIN_TIMER_VALUE = 0
@@ -18157,7 +18158,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				if parsed and (now - mm2TimerLastDeepScanAt) < 0.5 then
 					mm2TimerLastSample = parsed
 					mm2TimerLastSampleAt = now
-					return mm2TimerCache, parsed
+					return mm2TimerCache, parsed, mm2TimerCacheScore
 				elseif not parsed then
 					mm2TimerCache = nil
 					mm2TimerCacheScore = -math.huge
@@ -18188,7 +18189,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				mm2TimerCacheScore = bestScore
 				mm2TimerLastSample = bestParsed
 				mm2TimerLastSampleAt = now
-				return bestObj, bestParsed
+				return bestObj, bestParsed, bestScore
 			end
 			return nil, nil
 		end
@@ -18211,18 +18212,138 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             RefreshRoundUiSignals()
             return roundUiSignals.transition == true
         end
-        local function IsLobbyWaitingState()
-            RefreshRoundUiSignals()
-            if roundUiSignals.lobby then return true end
+        local function IsPlayerInLobbyZone()
             local ok, inLobby = pcall(function()
                 return _G.Celestial.IsPlayerWithinMM2LobbyZone
                     and _G.Celestial.IsPlayerWithinMM2LobbyZone() == true
             end)
             return ok and inLobby == true
         end
+        local function IsLobbyWaitingState()
+            RefreshRoundUiSignals()
+            return roundUiSignals.lobby == true or IsPlayerInLobbyZone()
+        end
         local function HasRoundResultText()
             RefreshRoundUiSignals()
             return roundUiSignals.result == true
+        end
+
+        -- Global round evidence is deliberately separate from the local player's lobby
+        -- position. The cache limits inventory/world scans while timer text is sampled
+        -- independently so a late-loaded client can recover an already-running round.
+        local timerEvidence = {
+            checkedAt = 0,
+            worldActive = false,
+            timerObject = nil,
+            timerValue = nil,
+            timerDecreaseCount = 0,
+            timerSampleAt = 0,
+        }
+
+        local function ResetTimerTrend()
+            timerEvidence.timerObject = nil
+            timerEvidence.timerValue = nil
+            timerEvidence.timerDecreaseCount = 0
+            timerEvidence.timerSampleAt = 0
+        end
+
+        local function SampleTimerTrend(obj, value, now)
+            if not obj or type(value) ~= "number" then
+                if timerEvidence.timerSampleAt > 0 and now - timerEvidence.timerSampleAt > 0.9 then
+                    ResetTimerTrend()
+                end
+                return
+            end
+            if timerEvidence.timerObject ~= obj then
+                timerEvidence.timerObject = obj
+                timerEvidence.timerValue = value
+                timerEvidence.timerDecreaseCount = 0
+                timerEvidence.timerSampleAt = now
+                return
+            end
+            local previous = timerEvidence.timerValue
+            if type(previous) == "number" then
+                if value < previous then
+                    timerEvidence.timerDecreaseCount = math.min(4, timerEvidence.timerDecreaseCount + 1)
+                elseif value > previous + 15 then
+                    -- A large upward jump is more consistent with a countdown reset/new round.
+                    timerEvidence.timerDecreaseCount = 0
+                end
+            end
+            timerEvidence.timerValue = value
+            timerEvidence.timerSampleAt = now
+        end
+
+        local function TimerLooksRoundScoped(obj, score)
+            if not obj then return false end
+            local path = ""
+            pcall(function() path = string.lower(obj:GetFullName()) end)
+            local hasRoundWord = path:find("round", 1, true) ~= nil
+                or path:find("match", 1, true) ~= nil
+                or (path:find("game", 1, true) ~= nil
+                    and (path:find("timer", 1, true) ~= nil or path:find("time", 1, true) ~= nil))
+            local looksLobbySpecific = path:find("lobby", 1, true) ~= nil
+                or path:find("intermission", 1, true) ~= nil
+                or path:find("waitingroom", 1, true) ~= nil
+                or path:find("mapvote", 1, true) ~= nil
+            if looksLobbySpecific and not hasRoundWord then return false end
+            if hasRoundWord then return true end
+            -- A generic "TimerLabel" is not enough by itself; it may be a lobby
+            -- countdown. Anonymous timers need a real downward trend below.
+            return false
+        end
+
+        local function HasGlobalRoundEvidence(hasRoles, timerObj, observedValue, timerScore, playerLobby, now)
+            now = now or tick()
+            SampleTimerTrend(timerObj, observedValue, now)
+            RefreshRoundUiSignals()
+
+            -- A visible round-result signal is terminal evidence, not a new active round.
+            if roundUiSignals.result then return false end
+            if hasRoles then return true end
+
+            if now - timerEvidence.checkedAt >= 0.45 then
+                local hasRoleWeapon = false
+                pcall(function()
+                    hasRoleWeapon = ResetDiag and ResetDiag.HasAssignedPlayerWeapon
+                        and ResetDiag.HasAssignedPlayerWeapon() == true
+                end)
+                local hasRoundCoins = false
+                pcall(function()
+                    local coinContainer = Workspace:FindFirstChild("CoinContainer")
+                    hasRoundCoins = coinContainer ~= nil and #coinContainer:GetChildren() > 0
+                end)
+                local mapPhase = "UNKNOWN"
+                pcall(function()
+                    if ResetDiag and ResetDiag.DetectWorldPhase then
+                        mapPhase = ResetDiag.DetectWorldPhase()
+                    end
+                end)
+                timerEvidence.worldActive = hasRoleWeapon or hasRoundCoins
+                    or (mapPhase == "MAP" and not playerLobby)
+                timerEvidence.checkedAt = now
+            end
+            if timerEvidence.worldActive then return true end
+
+            -- An explicitly named round timer is accepted after it demonstrably ticks
+            -- down. An anonymous candidate needs multiple decreases, a strong discovery
+            -- score, and no lobby/intermission ancestry or lobby-state UI signal.
+            if TimerLooksRoundScoped(timerObj, timerScore)
+                and timerEvidence.timerDecreaseCount >= 1 then
+                return true
+            end
+            local timerPath = ""
+            pcall(function() timerPath = string.lower(timerObj and timerObj:GetFullName() or "") end)
+            local timerIsLobbyScoped = timerPath:find("lobby", 1, true) ~= nil
+                or timerPath:find("intermission", 1, true) ~= nil
+                or timerPath:find("waitingroom", 1, true) ~= nil
+                or timerPath:find("mapvote", 1, true) ~= nil
+            if not roundUiSignals.lobby and not timerIsLobbyScoped
+                and timerEvidence.timerDecreaseCount >= 2
+                and (tonumber(timerScore) or 0) >= 55 then
+                return true
+            end
+            return false
         end
 
 		local timerState = {
@@ -18234,15 +18355,18 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             awaitingFreshStart = false,
             sawRoleClearAfterLobby = false,
             lobbyHoldUntil = 0,
+            globalEvidenceLostSince = nil,
         }
         _G.Celestial.RoundTimerState = timerState
 
-        local function DetectRoundEndSignal()
+        local function DetectRoundEndSignal(globalRoundActive)
             local now = tick()
             if now - timerState.lastEndSignalScan < 0.35 then return timerState.lastEndSignal end
             timerState.lastEndSignalScan = now
             local signal = false
-            if IsMapLoading() then
+            -- A generic lobby/loading UI phrase is ambiguous when independent global
+            -- signals still prove that the round is running (e.g. players have role tools).
+            if IsMapLoading() and not globalRoundActive then
                 signal = true
                 timerState.lastEndReason = "MapTransition"
             end
@@ -18315,6 +18439,12 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
         end
 
         local function ResetTimerForLobby(now)
+            if timerState.phase == "Idle" and timerState.remaining == nil then
+                timerState.ended = true
+                timerState.globalEvidenceLostSince = nil
+                UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
+                return
+            end
             if timerState.phase == "Round" then
                 HandleRoundEnd("LobbyTransition")
             end
@@ -18333,6 +18463,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             timerState.sawRoleClearAfterLobby = tostring(State.MurdererName or "") == ""
                 and tostring(State.SheriffName or "") == ""
             timerState.lobbyHoldUntil = (now or tick()) + 0.8
+            timerState.globalEvidenceLostSince = nil
+            ResetTimerTrend()
             UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
         end
 
@@ -18344,16 +18476,44 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 timerState.remaining = nil
                 timerState.ended = true
                 timerState.awaitingFreshStart = true
+                timerState.globalEvidenceLostSince = nil
                 UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
                 return
             end
 
-            local hasRoles = tostring(State.MurdererName or "") ~= "" or tostring(State.SheriffName or "") ~= ""
-            if IsLobbyWaitingState() then
-                ResetTimerForLobby(now)
-                return
+            local hasRoles = tostring(State.MurdererName or "") ~= ""
+                or tostring(State.SheriffName or "") ~= ""
+            -- Always inspect the current GUI timer, including during startup in the lobby.
+            local timerObj, observedValue, timerScore = FindMM2TimerLabel()
+            local playerLobbyZone = IsPlayerInLobbyZone()
+            local playerLobby = IsLobbyWaitingState()
+            local globalRoundActive = HasGlobalRoundEvidence(
+                hasRoles, timerObj, observedValue, timerScore, playerLobby, now)
+
+            local endSignal = timerState.phase == "Round" and DetectRoundEndSignal(globalRoundActive)
+            if endSignal then
+                HandleRoundEnd(timerState.lastEndReason or "RoundResultSignal")
             end
-            if now < (timerState.lobbyHoldUntil or 0) then
+
+            if playerLobbyZone and not globalRoundActive then
+                if timerState.phase == "Round" and not endSignal
+                    and not roundUiSignals.result and not roundUiSignals.transition then
+                    -- Lobby position alone cannot end a round: allow time for global role,
+                    -- map, coin-container, and timer evidence to arrive or recover.
+                    timerState.globalEvidenceLostSince = timerState.globalEvidenceLostSince or now
+                    if now - timerState.globalEvidenceLostSince >= 2.5 then
+                        ResetTimerForLobby(now)
+                        return
+                    end
+                else
+                    ResetTimerForLobby(now)
+                    return
+                end
+            else
+                timerState.globalEvidenceLostSince = nil
+            end
+
+            if now < (timerState.lobbyHoldUntil or 0) and not globalRoundActive then
                 if not hasRoles then timerState.sawRoleClearAfterLobby = true end
                 UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
                 return
@@ -18362,16 +18522,11 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 timerState.sawRoleClearAfterLobby = true
             end
 
-            local observedValue = nil
-            if hasRoles or timerState.phase == "Round" or timerState.phase == "Ended" then
-                local _, value = FindMM2TimerLabel()
-                observedValue = value
-            end
-            local endSignal = timerState.phase == "Round" and DetectRoundEndSignal()
-
-            if hasRoles then
+            local hasRoundEvidence = hasRoles or globalRoundActive
+            if hasRoundEvidence then
                 timerState.noRolesSince = nil
-                if timerState.phase == "Idle" and (not timerState.awaitingFreshStart or timerState.sawRoleClearAfterLobby) then
+                if timerState.phase == "Idle"
+                    and (not timerState.awaitingFreshStart or timerState.sawRoleClearAfterLobby or globalRoundActive) then
                     HandleNewRound(now, observedValue)
                     timerState.awaitingFreshStart = false
                     timerState.sawRoleClearAfterLobby = false
@@ -18380,16 +18535,22 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                         and observedValue >= ROUND_DURATION - 3
                         and (type(timerState.lastObservedRemaining) ~= "number"
                             or observedValue > timerState.lastObservedRemaining + 15)
-                    if timerState.rolesClearConfirmed or timerReset then
+                    if (hasRoles and timerState.rolesClearConfirmed) or timerReset then
                         HandleNewRound(now, observedValue)
                         timerState.awaitingFreshStart = false
                         timerState.sawRoleClearAfterLobby = false
                     end
                 end
             elseif timerState.phase == "Round" then
-                timerState.noRolesSince = timerState.noRolesSince or now
-                if now - timerState.noRolesSince >= 0.75 then
-                    HandleRoundEnd("RolesUnavailable")
+                if playerLobbyZone then
+                    -- Missing local roles while physically in the lobby is ambiguous;
+                    -- only the independent global-evidence grace period may reset it.
+                    timerState.noRolesSince = nil
+                else
+                    timerState.noRolesSince = timerState.noRolesSince or now
+                    if now - timerState.noRolesSince >= 0.75 then
+                        HandleRoundEnd("RolesUnavailable")
+                    end
                 end
             elseif timerState.phase == "Ended" then
                 timerState.noRolesSince = timerState.noRolesSince or now
@@ -18398,14 +18559,17 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             if timerState.phase == "Round" then
                 if endSignal then
-                    HandleRoundEnd(timerState.lastEndReason or "RoundResultSignal")
+                    -- HandleRoundEnd already froze the remaining value and visual state.
+                    UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or 0), false, "ENDED")
                 else
                     local remaining
                     if type(observedValue) == "number" and observedValue >= 0 then
                         remaining = observedValue
                         timerState.lastObservedRemaining = observedValue
                         timerState.lastObservedAt = now
-                        if not timerState.observedDuration then timerState.observedDuration = math.max(observedValue, ROUND_DURATION) end
+                        if not timerState.observedDuration then
+                            timerState.observedDuration = math.max(observedValue, ROUND_DURATION)
+                        end
                     elseif type(timerState.lastObservedRemaining) == "number" and timerState.lastObservedAt then
                         remaining = math.max(0, timerState.lastObservedRemaining - math.floor(now - timerState.lastObservedAt))
                     else
@@ -18428,6 +18592,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 pcall(UpdateRoundTimer)
             end
         end)
+        end -- ROUND TIMER SCOPE
 
         -- TARGET MODAL
 		-- ====================================================================
