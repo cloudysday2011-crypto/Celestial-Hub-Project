@@ -46,11 +46,12 @@ local GuiService = game:GetService("GuiService")
 -- Replace BUBBLE_IMAGE_ID with your own logo asset ID when desired.
 local BUBBLE_IMAGE_ID = "rbxassetid://118869628234830"
 local DYNAMIC_ISLAND_CONFIG = {
-    BubbleSize = 80,
-    CapsuleWidth = 360,
-    CapsuleHeight = 60,
-    RootWidth = 400,
-    RootHeight = 80,
+    -- Compact proportions: bubble remains circular and the capsule fits its full content.
+    BubbleSize = 62,
+    CapsuleWidth = 270,
+    CapsuleHeight = 48,
+    RootWidth = 306,
+    RootHeight = 66,
     RoundDuration = 180,
     OpenDuration = 0.9,
     FPSUpdateInterval = 0.16,
@@ -16526,6 +16527,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
         local function CreatePerformanceIsland()
             local config = DYNAMIC_ISLAND_CONFIG
+            local bubbleY = math.floor((config.RootHeight - config.BubbleSize) * 0.5)
+            local capsuleX = math.floor(config.BubbleSize * 0.5)
+            local capsuleY = math.floor((config.RootHeight - config.CapsuleHeight) * 0.5)
             local root = Instance.new("Frame")
             root.Name = "DynamicIslandRoot"
             root.Size = UDim2.new(0, config.RootWidth, 0, config.RootHeight)
@@ -16547,7 +16551,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local glow = Instance.new("Frame")
             glow.Name = "IslandGlow"
-            glow.Position = UDim2.new(0, 40, 0, 8)
+            glow.Position = UDim2.fromOffset(capsuleX, capsuleY - 2)
             glow.Size = UDim2.new(0, 0, 0, config.CapsuleHeight + 4)
             glow.BackgroundColor3 = config.Colors.MoonBlue
             glow.BackgroundTransparency = 0.82
@@ -16561,7 +16565,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local bubbleGlow = Instance.new("Frame")
             bubbleGlow.Name = "BubbleGlow"
-            bubbleGlow.Position = UDim2.new(0, -2, 0, -2)
+            bubbleGlow.Position = UDim2.fromOffset(-2, bubbleY - 2)
             bubbleGlow.Size = UDim2.new(0, config.BubbleSize + 4, 0, config.BubbleSize + 4)
             bubbleGlow.BackgroundColor3 = config.Colors.MoonBlue
             bubbleGlow.BackgroundTransparency = 0.82
@@ -16574,7 +16578,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local bubbleBack = Instance.new("Frame")
             bubbleBack.Name = "BubbleGradientBase"
-            bubbleBack.Position = UDim2.new(0, 0, 0, 0)
+            bubbleBack.Position = UDim2.fromOffset(0, bubbleY)
             bubbleBack.Size = UDim2.new(0, config.BubbleSize, 0, config.BubbleSize)
             bubbleBack.BackgroundColor3 = config.Colors.CapsuleDark
             bubbleBack.BorderSizePixel = 0
@@ -16603,7 +16607,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local capsule = Instance.new("Frame")
             capsule.Name = "PerformanceIsland"
-            capsule.Position = UDim2.new(0, 40, 0, 10)
+            capsule.Position = UDim2.fromOffset(capsuleX, capsuleY)
             capsule.Size = UDim2.new(0, 0, 0, config.CapsuleHeight)
             capsule.BackgroundColor3 = config.Colors.CapsuleDark
             capsule.BackgroundTransparency = 0
@@ -16640,15 +16644,15 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local timerLabel = Instance.new("TextLabel")
             timerLabel.Name = "RoundTimer"
-            timerLabel.Position = UDim2.new(0, 47, 0, 4)
-            timerLabel.Size = UDim2.new(0, 65, 0, 52)
+            timerLabel.Position = UDim2.fromOffset(36, 3)
+            timerLabel.Size = UDim2.new(0, 52, 0, 42)
             timerLabel.BackgroundTransparency = 1
             timerLabel.Text = "3:00"
             timerLabel.TextColor3 = config.Colors.TimerEnded
             timerLabel.TextStrokeColor3 = config.Colors.TimerActive
             timerLabel.TextStrokeTransparency = 1
             timerLabel.Font = config.TimerFont
-            timerLabel.TextSize = 20
+            timerLabel.TextSize = 17
             timerLabel.TextXAlignment = Enum.TextXAlignment.Center
             timerLabel.TextYAlignment = Enum.TextYAlignment.Center
             timerLabel.ZIndex = 129
@@ -16658,8 +16662,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local separator = Instance.new("Frame")
             separator.Name = "MetricsSeparator"
-            separator.Position = UDim2.new(0, 117, 0, 13)
-            separator.Size = UDim2.new(0, 1, 0, 34)
+            separator.Position = UDim2.fromOffset(94, 11)
+            separator.Size = UDim2.new(0, 1, 0, 26)
             separator.BackgroundColor3 = config.Colors.Lilac
             separator.BackgroundTransparency = 0.28
             separator.BorderSizePixel = 0
@@ -16679,13 +16683,13 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             local function makeMetricLabel(name, text, y)
                 local label = Instance.new("TextLabel")
                 label.Name = name
-                label.Position = UDim2.new(0, 128, 0, y)
-                label.Size = UDim2.new(0, 100, 0, 20)
+                label.Position = UDim2.new(0, 101, 0, y)
+                label.Size = UDim2.new(0, 76, 0, 17)
                 label.BackgroundTransparency = 1
                 label.Text = text
                 label.TextColor3 = config.Colors.White
                 label.Font = Enum.Font.GothamMedium
-                label.TextSize = 12
+                label.TextSize = 10
                 label.TextXAlignment = Enum.TextXAlignment.Left
                 label.TextYAlignment = Enum.TextYAlignment.Center
                 label.ZIndex = 129
@@ -16702,18 +16706,18 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 return label, gradient
             end
 
-            UIState.FPSValueLabel, UIState.FPSGradient = makeMetricLabel("FPSValue", "★N/D FPS", 9)
-            UIState.PingValueLabel, UIState.PingGradient = makeMetricLabel("PingValue", "★N/D ms", 31)
+            UIState.FPSValueLabel, UIState.FPSGradient = makeMetricLabel("FPSValue", "★N/D FPS", 6)
+            UIState.PingValueLabel, UIState.PingGradient = makeMetricLabel("PingValue", "★N/D ms", 25)
 
             local statusLabel = Instance.new("TextLabel")
             statusLabel.Name = "RoundStatus"
-            statusLabel.Position = UDim2.new(0, 231, 0, 0)
-            statusLabel.Size = UDim2.new(0, 68, 1, 0)
+            statusLabel.Position = UDim2.new(0, 182, 0, 0)
+            statusLabel.Size = UDim2.new(0, 40, 1, 0)
             statusLabel.BackgroundTransparency = 1
             statusLabel.Text = "N/D"
             statusLabel.TextColor3 = config.Colors.Silver
             statusLabel.Font = Enum.Font.GothamBold
-            statusLabel.TextSize = 12
+            statusLabel.TextSize = 10
             statusLabel.TextXAlignment = Enum.TextXAlignment.Center
             statusLabel.TextYAlignment = Enum.TextYAlignment.Center
             statusLabel.ZIndex = 129
@@ -16723,15 +16727,15 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local moveButton = Instance.new("TextButton")
             moveButton.Name = "MoveIslandButton"
-            moveButton.Position = UDim2.new(0, 310, 0, 11)
-            moveButton.Size = UDim2.new(0, 38, 0, 38)
+            moveButton.Position = UDim2.fromOffset(229, 8)
+            moveButton.Size = UDim2.new(0, 32, 0, 32)
             moveButton.BackgroundColor3 = config.Colors.DarkButton
             moveButton.BackgroundTransparency = 0.08
             moveButton.BorderSizePixel = 0
             moveButton.Text = "✥"
             moveButton.TextColor3 = config.Colors.White
             moveButton.Font = Enum.Font.GothamBold
-            moveButton.TextSize = 21
+            moveButton.TextSize = 18
             moveButton.AutoButtonColor = false
             moveButton.Active = true
             moveButton.ZIndex = 132
@@ -16762,23 +16766,34 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 return leftInset, topInset, rightInset, bottomInset
             end
 
+            local function GetDynamicIslandAvailableArea(viewport)
+                local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
+                -- ScreenGui's normal inset already offsets its coordinate origin. Keep positions
+                -- relative to that origin, but subtract the insets from the available dimensions.
+                local availableWidth = math.max(1, viewport.X - leftInset - rightInset)
+                local availableHeight = math.max(1, viewport.Y - topInset - bottomInset)
+                return availableWidth, availableHeight
+            end
+
             local function UpdateDynamicIslandScaleAndBounds()
                 local camera = Workspace.CurrentCamera
                 local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
-                local targetScale = math.clamp(viewport.X / 440, 0.76, 1)
+                local availableWidth, availableHeight = GetDynamicIslandAvailableArea(viewport)
+                local maxWidthScale = (availableWidth - config.ScreenMargin * 2) / config.RootWidth
+                local maxHeightScale = (availableHeight - config.ScreenMargin * 2) / config.RootHeight
+                local targetScale = math.max(0.25, math.min(1, maxWidthScale, maxHeightScale))
                 scale.Scale = targetScale
                 local rootWidth = config.RootWidth * targetScale
                 local rootHeight = config.RootHeight * targetScale
-                local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
-                local minX = config.ScreenMargin + leftInset
-                local minY = config.ScreenMargin + topInset
-                local maxX = math.max(minX, viewport.X - rootWidth - config.ScreenMargin - rightInset)
-                local maxY = math.max(minY, viewport.Y - rootHeight - config.ScreenMargin - bottomInset)
+                local minX = config.ScreenMargin
+                local minY = config.ScreenMargin
+                local maxX = math.max(minX, availableWidth - rootWidth - config.ScreenMargin)
+                local maxY = math.max(minY, availableHeight - rootHeight - config.ScreenMargin)
                 local currentPos = root.Position
                 local x = currentPos.X.Offset
                 local y = currentPos.Y.Offset
                 if not UIState.DynamicIslandPositionInitialized then
-                    x = (viewport.X - rootWidth) * 0.5
+                    x = (availableWidth - rootWidth) * 0.5
                     y = minY
                     UIState.DynamicIslandPositionInitialized = true
                 end
@@ -16791,13 +16806,15 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             UIState.ClampDynamicIslandPosition = function(x, y)
                 local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
                 local currentScale = scale.Scale
-                local width = config.RootWidth * currentScale
-                local height = config.RootHeight * currentScale
-                local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
-                local minX = config.ScreenMargin + leftInset
-                local minY = config.ScreenMargin + topInset
-                local maxX = math.max(minX, viewport.X - width - config.ScreenMargin - rightInset)
-                local maxY = math.max(minY, viewport.Y - height - config.ScreenMargin - bottomInset)
+                -- Prefer actual rendered bounds so clamping follows viewport/UIScale changes.
+                local actualSize = root.AbsoluteSize
+                local width = actualSize.X > 0 and actualSize.X or config.RootWidth * currentScale
+                local height = actualSize.Y > 0 and actualSize.Y or config.RootHeight * currentScale
+                local availableWidth, availableHeight = GetDynamicIslandAvailableArea(viewport)
+                local minX = config.ScreenMargin
+                local minY = config.ScreenMargin
+                local maxX = math.max(minX, availableWidth - width - config.ScreenMargin)
+                local maxY = math.max(minY, availableHeight - height - config.ScreenMargin)
                 return math.clamp(x, minX, maxX), math.clamp(y, minY, maxY)
             end
             UpdateDynamicIslandScaleAndBounds()
@@ -18212,10 +18229,11 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 		ContainerHolder.ClipsDescendants = true
 		ContainerHolder.Parent = MainFrame
 
+        local islandBubbleY = math.floor((DYNAMIC_ISLAND_CONFIG.RootHeight - DYNAMIC_ISLAND_CONFIG.BubbleSize) * 0.5)
         local MinimzedBar = Instance.new("ImageLabel")
         MinimzedBar.Name = "CelestialBubble"
         MinimzedBar.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize)
-        MinimzedBar.Position = UDim2.new(0, 0, 0, 0)
+        MinimzedBar.Position = UDim2.fromOffset(0, islandBubbleY)
         MinimzedBar.BackgroundTransparency = 1
         MinimzedBar.BorderSizePixel = 0
         MinimzedBar.Image = BUBBLE_IMAGE_ID
@@ -18228,7 +18246,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
         local MinimizedBubbleInteraction = Instance.new("TextButton")
         MinimizedBubbleInteraction.Name = "CelestialBubbleInteraction"
         MinimizedBubbleInteraction.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize)
-        MinimizedBubbleInteraction.Position = UDim2.new(0, 0, 0, 0)
+        MinimizedBubbleInteraction.Position = UDim2.fromOffset(0, islandBubbleY)
         MinimizedBubbleInteraction.BackgroundTransparency = 1
         MinimizedBubbleInteraction.BorderSizePixel = 0
         MinimizedBubbleInteraction.Text = ""
@@ -18343,6 +18361,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             local delta = input.Position - islandDragStart
             local targetX = islandStartPos.X.Offset + delta.X
             local targetY = islandStartPos.Y.Offset + delta.Y
+            -- Clamp the shared root (bubble + capsule + all contents) using the current viewport.
             local clampedX, clampedY = UIState.ClampDynamicIslandPosition(targetX, targetY)
             UIState.DynamicIslandRoot.Position = UDim2.fromOffset(math.floor(clampedX), math.floor(clampedY))
         end))
