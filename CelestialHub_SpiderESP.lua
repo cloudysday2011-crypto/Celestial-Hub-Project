@@ -48,6 +48,8 @@ local BUBBLE_IMAGE_ID = "rbxassetid://118869628234830"
 local DYNAMIC_ISLAND_CONFIG = {
     -- Compact proportions: bubble remains circular and the capsule fits its full content.
     BubbleSize = 62,
+    BubbleImageOverscan = 6,
+    MoveButtonImageId = "rbxassetid://139657659422267",
     CapsuleWidth = 270,
     CapsuleHeight = 48,
     RootWidth = 306,
@@ -2132,7 +2134,12 @@ local AntiFlingQuantum = {
 	PlayerIsolation = {Active = false, Until = 0, Character = nil, Parts = {}, Threats = {}, LastReason = ""},
 	-- QMA protects the local assembly; it deliberately does not rewrite player collision groups.
 	CollisionGroupsReady = false,
-	PersistentSeparation = {Active = false, OriginalGroups = {}},
+	PersistentSeparation = {
+		Active = false, OriginalGroups = {}, Constraints = {},
+		CharacterPartCache = setmetatable({}, {__mode = "k"}),
+		LastRosterSnapshot = {}, LastRosterCount = 0, TopologyDirty = true,
+		FolderCharacter = nil,
+	},
 	ActiveModeGuard = {Character = nil, LastVelocity = Vector3.zero, LastCorrection = 0},
 	LastPassThroughCheck = 0,
 	FlingAttemptEvidence = {},
@@ -2517,10 +2524,13 @@ function AntiFlingQuantum.IsLegitimateAerialContext(player, character, humanoid,
 		return true
 	end
 	if (history.JumpGraceUntil or 0) > now then return true end
-	if character and now - (history.LastAerialDeviceScan or 0) >= 0.50 then
-		history.LastAerialDeviceScan = now
+	local backpack = player and player:FindFirstChild("Backpack")
+	local aerialCacheMatches = history.AerialDeviceCharacter == character
+		and history.AerialDeviceBackpack == backpack
+		and now < (history.AerialDeviceCacheUntil or 0)
+	if character and not aerialCacheMatches then
 		local foundAerialDevice = false
-		local containers = {character, player:FindFirstChild("Backpack")}
+		local containers = {character, backpack}
 		for _, container in ipairs(containers) do
 			if container then
 				for _, obj in ipairs(container:GetDescendants()) do
@@ -2535,8 +2545,14 @@ function AntiFlingQuantum.IsLegitimateAerialContext(player, character, humanoid,
 			end
 			if foundAerialDevice then break end
 		end
+		history.LastAerialDeviceScan = now
+		history.AerialDeviceCharacter = character
+		history.AerialDeviceBackpack = backpack
+		history.AerialDeviceFound = foundAerialDevice
+		history.AerialDeviceCacheUntil = now + (foundAerialDevice and 1.50 or 0.65)
 		if foundAerialDevice then history.AerialDeviceUntil = now + 1.50 end
 	end
+	if (history.AerialDeviceCacheUntil or 0) > now and history.AerialDeviceFound then return true end
 	if (history.AerialDeviceUntil or 0) > now then return true end
 	return movementState == "Freefall" and (now - (history.LastJumpAt or 0)) <= 1.15
 end
@@ -3048,13 +3064,61 @@ function AntiFlingQuantum.SetupQMAIsolationGroups()
 	return true
 end
 
+function AntiFlingQuantum.DisconnectPartCacheEntry(entry)
+	if not entry then return end
+	for _, connection in pairs(entry.Connections or {}) do
+		if connection then pcall(function() connection:Disconnect() end) end
+	end
+	entry.Connections = {}
+end
+
 function AntiFlingQuantum.ClearPlayerPassThrough()
 	local psep = AntiFlingQuantum.PersistentSeparation
+	if not psep then return end
+	local cache = psep.CharacterPartCache
+	local hasCache = cache and next(cache) ~= nil
+	if not psep.Active and not AntiFlingQuantum.QMAPassThroughFolder and not hasCache then return end
 	if AntiFlingQuantum.QMAPassThroughFolder then
 		pcall(function() AntiFlingQuantum.QMAPassThroughFolder:Destroy() end)
 		AntiFlingQuantum.QMAPassThroughFolder = nil
 	end
-	if psep then psep.OriginalGroups = {}; psep.Active = false; psep.Constraints = {} end
+	for _, entry in pairs(cache or {}) do AntiFlingQuantum.DisconnectPartCacheEntry(entry) end
+	psep.CharacterPartCache = setmetatable({}, {__mode = "k"})
+	psep.LastRosterSnapshot = {}
+	psep.LastRosterCount = 0
+	psep.FolderCharacter = nil
+	psep.Constraints = {}
+	psep.OriginalGroups = {}
+	psep.TopologyDirty = true
+	psep.Active = false
+end
+
+function AntiFlingQuantum.GetCachedCharacterParts(character)
+	local psep = AntiFlingQuantum.PersistentSeparation
+	if not character or not character.Parent then return {} end
+	if not psep.CharacterPartCache then psep.CharacterPartCache = setmetatable({}, {__mode = "k"}) end
+	local entry = psep.CharacterPartCache[character]
+	if not entry then
+		entry = {Character = character, Parts = {}, Dirty = true, Connections = {}}
+		psep.CharacterPartCache[character] = entry
+		entry.Connections.Added = character.DescendantAdded:Connect(function(obj)
+			if obj:IsA("BasePart") then entry.Dirty = true; psep.TopologyDirty = true end
+		end)
+		entry.Connections.Removing = character.DescendantRemoving:Connect(function(obj)
+			if obj:IsA("BasePart") then entry.Dirty = true; psep.TopologyDirty = true end
+		end)
+	end
+	if entry.Dirty then
+		table.clear(entry.Parts)
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") and not AntiFlingQuantum.IsInsideTool(part) then
+				table.insert(entry.Parts, part)
+			end
+		end
+		entry.Dirty = false
+		psep.TopologyDirty = true
+	end
+	return entry.Parts
 end
 
 function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
@@ -3066,34 +3130,87 @@ function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
 		AntiFlingQuantum.ClearPlayerPassThrough()
 		return
 	end
-	if not AntiFlingQuantum.QMAPassThroughFolder or not AntiFlingQuantum.QMAPassThroughFolder.Parent then
+
+	-- Only compare the lightweight player/character snapshot on each check. Rebuild it when
+	-- the roster changes, and use it to disconnect caches for departed/replaced characters.
+	local currentCount, rosterChanged = 0, false
+	for _, other in ipairs(allPlayers) do
+		if other and other.Parent == Players then
+			local character = other.Character
+			currentCount += 1
+			local slot = currentCount * 2
+			if psep.LastRosterSnapshot[slot - 1] ~= other or psep.LastRosterSnapshot[slot] ~= character then
+				rosterChanged = true
+			end
+		end
+	end
+	if currentCount ~= (psep.LastRosterCount or 0) then rosterChanged = true end
+	if rosterChanged then
+		table.clear(psep.LastRosterSnapshot)
+		currentCount = 0
+		for _, other in ipairs(allPlayers) do
+			if other and other.Parent == Players then
+				currentCount += 1
+				local slot = currentCount * 2
+				psep.LastRosterSnapshot[slot - 1] = other
+				psep.LastRosterSnapshot[slot] = other.Character
+			end
+		end
+		psep.LastRosterCount = currentCount
+		psep.TopologyDirty = true
+		for character, entry in pairs(psep.CharacterPartCache or {}) do
+			local stillPresent = false
+			for index = 2, psep.LastRosterCount * 2, 2 do
+				if psep.LastRosterSnapshot[index] == character then stillPresent = true; break end
+			end
+			if not stillPresent then
+				AntiFlingQuantum.DisconnectPartCacheEntry(entry)
+				psep.CharacterPartCache[character] = nil
+			end
+		end
+	end
+
+	if psep.FolderCharacter ~= localCharacter or not AntiFlingQuantum.QMAPassThroughFolder
+		or not AntiFlingQuantum.QMAPassThroughFolder.Parent then
+		if AntiFlingQuantum.QMAPassThroughFolder then
+			pcall(function() AntiFlingQuantum.QMAPassThroughFolder:Destroy() end)
+		end
 		AntiFlingQuantum.QMAPassThroughFolder = Instance.new("Folder")
 		AntiFlingQuantum.QMAPassThroughFolder.Name = "QMA_PlayerOnlySeparation"
 		AntiFlingQuantum.QMAPassThroughFolder.Parent = localCharacter
+		psep.FolderCharacter = localCharacter
 		psep.Constraints = {}
+		psep.TopologyDirty = true
 	end
+
+	-- Unchanged roster + unchanged part topology means every desired constraint is still valid;
+	-- skip the former full N×part-pair traversal on this 0.25 s fast-tick.
+	if not psep.TopologyDirty then
+		psep.Active = true
+		return true
+	end
+
+	local localParts = AntiFlingQuantum.GetCachedCharacterParts(localCharacter)
 	local wanted = {}
 	for _, other in ipairs(allPlayers) do
-		local otherCharacter = other ~= LocalPlayer and other.Character
+		local otherCharacter = other ~= LocalPlayer and other and other.Parent == Players and other.Character
 		if otherCharacter and otherCharacter.Parent then
-			local localParts, otherParts = {}, {}
-			for _, part in ipairs(localCharacter:GetDescendants()) do
-				if part:IsA("BasePart") and not AntiFlingQuantum.IsInsideTool(part) then table.insert(localParts, part) end
-			end
-			for _, part in ipairs(otherCharacter:GetDescendants()) do
-				if part:IsA("BasePart") and not AntiFlingQuantum.IsInsideTool(part) then table.insert(otherParts, part) end
-			end
+			local otherParts = AntiFlingQuantum.GetCachedCharacterParts(otherCharacter)
 			for _, a in ipairs(localParts) do
-				for _, b in ipairs(otherParts) do
-					local key = AntiFlingQuantum.QMAPartKey(a) .. "|" .. AntiFlingQuantum.QMAPartKey(b)
-					wanted[key] = true
-					if not psep.Constraints[key] then
-						local constraint = Instance.new("NoCollisionConstraint")
-						constraint.Name = "QMA_PlayerPair"
-						constraint.Part0 = a
-						constraint.Part1 = b
-						constraint.Parent = AntiFlingQuantum.QMAPassThroughFolder
-						psep.Constraints[key] = constraint
+				if a and a.Parent then
+					for _, b in ipairs(otherParts) do
+						if b and b.Parent then
+							local key = AntiFlingQuantum.QMAPartKey(a) .. "|" .. AntiFlingQuantum.QMAPartKey(b)
+							wanted[key] = true
+							if not psep.Constraints[key] then
+								local constraint = Instance.new("NoCollisionConstraint")
+								constraint.Name = "QMA_PlayerPair"
+								constraint.Part0 = a
+								constraint.Part1 = b
+								constraint.Parent = AntiFlingQuantum.QMAPassThroughFolder
+								psep.Constraints[key] = constraint
+							end
+						end
 					end
 				end
 			end
@@ -3105,7 +3222,9 @@ function AntiFlingQuantum.EnsurePlayerPassThrough(allPlayers, now)
 			psep.Constraints[key] = nil
 		end
 	end
+	psep.TopologyDirty = false
 	psep.Active = true
+	return true
 end
 
 _G.Celestial.ClearQMPlayerPassThrough = AntiFlingQuantum.ClearPlayerPassThrough
@@ -3327,26 +3446,194 @@ local QMAScheduler = {
 	ProcessedThisCycle = {},
 	CycleSerial = 0,
 	RosterRevision = -1,
+	PriorityCursor = 1,
+	PriorityLastScan = setmetatable({}, {__mode = "k"}),
+	LastAnyScan = setmetatable({}, {__mode = "k"}),
+	PriorityScores = setmetatable({}, {__mode = "k"}),
+	PriorityTargets = {},
+	PriorityTargetSet = setmetatable({}, {__mode = "k"}),
+	NextPriorityScanTime = 0,
+	SharedDataCache = nil,
+	SharedDataCacheAt = 0,
 }
+
+function QMAScheduler.GetPriorityScore(player, now)
+	if not player or player == LocalPlayer or not player.Parent then return -math.huge end
+	now = now or tick()
+	local history = AntiFlingQuantum.PlayerHistory[player]
+	local threat = AntiFlingQuantum.ThreatStates[player]
+	local suspicious = AntiFlingQuantum.SuspiciousPlayers[player]
+	local dangerous = AntiFlingQuantum.DangerousPlayers[player]
+	local otiDangerous = OTI and OTI.DangerousPlayers and OTI.DangerousPlayers[player]
+	local otiSuspicious = OTI and OTI.SuspiciousPlayers and OTI.SuspiciousPlayers[player]
+	local otiPlayer = OTI and OTI.PlayerOTI and OTI.PlayerOTI[player]
+	local otiSignalFresh = otiPlayer and now - (tonumber(otiPlayer.LastSeen) or 0) <= 1.5
+	local base = 0
+	if dangerous then
+		local dangerousLastSeen = tonumber(dangerous.LastSeen)
+		if dangerousLastSeen and now - dangerousLastSeen <= 1.5 then
+			base = 100
+		elseif not dangerousLastSeen then
+			-- Legacy records receive a short observation grace, not permanent critical priority.
+			base = 82
+		end
+	end
+	if otiDangerous and otiSignalFresh then base = math.max(base, 90)
+	elseif otiSuspicious and otiSignalFresh then base = math.max(base, 68) end
+	if threat and threat.Valid then
+		if threat.State == "Critical" then base = math.max(base, 96)
+		elseif threat.State == "Threat" then base = math.max(base, 78)
+		elseif threat.State == "Suspicious" then base = math.max(base, 54) end
+	end
+	if suspicious then base = math.max(base, 52 + math.clamp(tonumber(suspicious.Confidence) or 0, 0, 100) * 0.08) end
+	if history then
+		if history.DangerHoldUntil and history.DangerHoldUntil > now then base = math.max(base, 82) end
+		if history.SpeedCritical or history.ExtremeSpinConfirmed or history.TeleportDetected then base = math.max(base, 72) end
+		if history.SpeedAnomaly or history.SustainedSpin or history.Orbiting or history.Flying then base = math.max(base, 58) end
+		if history.RelocationUntil and history.RelocationUntil > now and not (threat and threat.State == "Critical") then
+			base = math.min(base, 32) -- legitimate synchronized relocation should not monopolize QMA.
+		end
+		local lastObserved = tonumber(history.LastObservedAt) or 0
+		local age = lastObserved > 0 and math.max(0, now - lastObserved) or 4
+		if base > 0 and age > 1.5 then base = math.max(0, base - math.min(55, (age - 1.5) * 12)) end
+		base += math.min(4, age * 0.6) -- older samples get a small fairness boost.
+	end
+	return base
+end
+
+function QMAScheduler.RefreshPriorityCandidate(player, now)
+	if not player or player == LocalPlayer or player.Parent ~= Players then return 0 end
+	local score = QMAScheduler.GetPriorityScore(player, now)
+	QMAScheduler.PriorityScores[player] = score
+	local isCandidate = score >= 45
+	local wasCandidate = QMAScheduler.PriorityTargetSet[player] == true
+	if isCandidate and not wasCandidate then
+		QMAScheduler.PriorityTargetSet[player] = true
+		table.insert(QMAScheduler.PriorityTargets, player)
+	elseif not isCandidate and wasCandidate then
+		QMAScheduler.PriorityTargetSet[player] = nil
+		for i = #QMAScheduler.PriorityTargets, 1, -1 do
+			if QMAScheduler.PriorityTargets[i] == player then
+				table.remove(QMAScheduler.PriorityTargets, i)
+				if i < QMAScheduler.PriorityCursor then QMAScheduler.PriorityCursor -= 1 end
+				break
+			end
+		end
+		if QMAScheduler.PriorityCursor > #QMAScheduler.PriorityTargets then QMAScheduler.PriorityCursor = 1 end
+	end
+	return score
+end
+
+function QMAScheduler.GetNextPriorityPlayer(now)
+	now = now or tick()
+	local targets = QMAScheduler.PriorityTargets
+	local count = #targets
+	if count == 0 then return nil, 0, 0.25 end
+	local topScore = 0
+	-- Prune expired/stale candidates in-place. Quiet players are not visited here; their
+	-- routine queue scan updates the score and can promote them immediately when needed.
+	local index = 1
+	while index <= #targets do
+		local player = targets[index]
+		if not player or player.Parent ~= Players then
+			if player then QMAScheduler.PriorityTargetSet[player] = nil; QMAScheduler.PriorityScores[player] = nil end
+			table.remove(targets, index)
+			if index < QMAScheduler.PriorityCursor then QMAScheduler.PriorityCursor -= 1 end
+		else
+			local score = QMAScheduler.GetPriorityScore(player, now)
+			QMAScheduler.PriorityScores[player] = score
+			if score < 45 then
+				QMAScheduler.PriorityTargetSet[player] = nil
+				table.remove(targets, index)
+				if index < QMAScheduler.PriorityCursor then QMAScheduler.PriorityCursor -= 1 end
+			else
+				topScore = math.max(topScore, score)
+				index += 1
+			end
+		end
+	end
+	count = #targets
+	if count == 0 then QMAScheduler.PriorityCursor = 1; return nil, topScore, 0.25 end
+	if topScore < 45 then return nil, topScore, 0.25 end
+	if QMAScheduler.PriorityCursor > count then QMAScheduler.PriorityCursor = 1 end
+	local threshold = topScore >= 88 and math.max(70, topScore - 22)
+		or topScore >= 65 and math.max(52, topScore - 16) or 45
+	local selected, selectedScore, selectedDueRatio, selectedIndex = nil, -math.huge, -math.huge, nil
+	local nextWait = 0.25
+	for offset = 0, count - 1 do
+		local targetIndex = ((QMAScheduler.PriorityCursor + offset - 1) % count) + 1
+		local player = targets[targetIndex]
+		if player and player.Parent == Players then
+			local score = QMAScheduler.PriorityScores[player] or QMAScheduler.GetPriorityScore(player, now)
+			if score >= threshold then
+				local interval = score >= 88 and 0.15 or score >= 65 and 0.28 or 0.48
+				local lastScan = math.max(QMAScheduler.PriorityLastScan[player] or 0, QMAScheduler.LastAnyScan[player] or 0)
+				local elapsed = now - lastScan
+				local waitRemaining = interval - elapsed
+				if waitRemaining <= 0 then
+					local dueRatio = elapsed / interval
+					if dueRatio > selectedDueRatio or (dueRatio == selectedDueRatio and score > selectedScore) then
+						selected, selectedScore, selectedDueRatio, selectedIndex = player, score, dueRatio, targetIndex
+					end
+				elseif waitRemaining < nextWait then
+					nextWait = waitRemaining
+				end
+			end
+		end
+	end
+	if selected then
+		QMAScheduler.PriorityLastScan[selected] = now
+		QMAScheduler.PriorityCursor = (selectedIndex % count) + 1
+		return selected, selectedScore, selectedScore >= 88 and 0.075 or selectedScore >= 65 and 0.12 or 0.18
+	end
+	return nil, topScore, math.clamp(nextWait, 0.04, 0.20)
+end
 
 function QMAScheduler.RebuildQueue(allPlayers)
 	table.clear(QMAScheduler.Queue)
 	table.clear(QMAScheduler.RosterSet)
 	table.clear(QMAScheduler.ProcessedThisCycle)
-	-- Snapshot the real, current roster once. Deduplicate by Player instance so
-	-- each server player occupies exactly one queue slot in this scan cycle.
+	table.clear(QMAScheduler.PriorityTargets)
+	table.clear(QMAScheduler.PriorityTargetSet)
+	-- Snapshot the current roster once, deduplicate by Player identity, then calculate each
+	-- priority score once. Routine scans still cover everyone; only elevated candidates enter
+	-- the faster adaptive lane.
+	local sortNow = tick()
 	for _, plr in ipairs(allPlayers) do
-		if plr and not QMAScheduler.RosterSet[plr] then
+		if plr and plr.Parent == Players and not QMAScheduler.RosterSet[plr] then
 			QMAScheduler.RosterSet[plr] = true
 			table.insert(QMAScheduler.Queue, plr)
+			local score = QMAScheduler.GetPriorityScore(plr, sortNow)
+			QMAScheduler.PriorityScores[plr] = score
+			if score >= 45 then
+				QMAScheduler.PriorityTargetSet[plr] = true
+				table.insert(QMAScheduler.PriorityTargets, plr)
+			end
 		end
 	end
+	table.sort(QMAScheduler.Queue, function(a, b)
+		local scoreA = QMAScheduler.PriorityScores[a] or 0
+		local scoreB = QMAScheduler.PriorityScores[b] or 0
+		if scoreA == scoreB then
+			local historyA = AntiFlingQuantum.PlayerHistory[a]
+			local historyB = AntiFlingQuantum.PlayerHistory[b]
+			return (historyA and tonumber(historyA.LastObservedAt) or 0) < (historyB and tonumber(historyB.LastObservedAt) or 0)
+		end
+		return scoreA > scoreB
+	end)
 	local N = #QMAScheduler.Queue
+	local highestPriority = N > 0 and (QMAScheduler.PriorityScores[QMAScheduler.Queue[1]] or 0) or 0
 	if N > 0 then
 		QMAScheduler.BatchSize = math.max(1, math.ceil(N / 6))
-		local cycleTime = math.max(0.55 * N, 1.0)
+		-- Quiet rounds use a modestly slower heavy-analysis cycle; suspicious/critical
+		-- evidence shortens the cycle immediately and the priority lane checks hot targets more often.
+		local cycleFactor = highestPriority >= 88 and 0.32
+			or highestPriority >= 65 and 0.42
+			or highestPriority >= 45 and 0.50 or 0.60
+		local minimumCycle = highestPriority >= 65 and 0.65 or 1.0
+		local cycleTime = math.max(cycleFactor * N, minimumCycle)
 		local numBatches = math.ceil(N / QMAScheduler.BatchSize)
-		QMAScheduler.TimePerBatch = cycleTime / numBatches
+		QMAScheduler.TimePerBatch = cycleTime / math.max(1, numBatches)
 	else
 		QMAScheduler.BatchSize = 1
 		QMAScheduler.TimePerBatch = 1.0
@@ -3358,6 +3645,9 @@ function QMAScheduler.RebuildQueue(allPlayers)
 	QMAScheduler.RosterInitialized = true
 	QMAScheduler.CycleComplete = false
 	QMAScheduler.CycleSerial += 1
+	QMAScheduler.SharedDataCache = nil
+	QMAScheduler.SharedDataCacheAt = 0
+	if QMAScheduler.PriorityCursor > math.max(1, #QMAScheduler.PriorityTargets) then QMAScheduler.PriorityCursor = 1 end
 end
 
 function QMAScheduler.HasRosterChanged(allPlayers)
@@ -3370,6 +3660,9 @@ function QMAScheduler.HasRosterChanged(allPlayers)
 end
 
 function QMAScheduler.GetSharedData(allPlayers, now)
+	if QMAScheduler.SharedDataCache and now - (QMAScheduler.SharedDataCacheAt or 0) < 0.35 then
+		return QMAScheduler.SharedDataCache
+	end
 	local shared = {
 		Now = now,
 		GlobalPhysicsNoise = false,
@@ -3409,6 +3702,8 @@ function QMAScheduler.GetSharedData(allPlayers, now)
 		shared.MedianPeerSpeed = 16
 	end
 	
+	QMAScheduler.SharedDataCache = shared
+	QMAScheduler.SharedDataCacheAt = now
 	return shared
 end
 
@@ -3807,8 +4102,11 @@ local function OTI_Tick()
 end
 
 OTI.Connection = RunService.Heartbeat:Connect(function()
+	if not State.OTIActive then return end
 	local now = tick()
-	if now - OTI.LastScan < OTI.ScanInterval then return end
+	local hasActiveThreat = (OTI.ThreatCount or 0) > 0 or next(OTI.DangerousPlayers) ~= nil
+	local adaptiveScanInterval = hasActiveThreat and 0.09 or 0.18
+	if now - OTI.LastScan < adaptiveScanInterval then return end
 	OTI.LastScan = now
 	local otiT0 = tick()
 	pcall(OTI_Tick)
@@ -3849,6 +4147,91 @@ AntiFlingQuantum.LocalCharacterConnection =
 		end)
 	end)
 
+function QMAScheduler.ProcessPlayer(player, myRoot, now, allPlayers, shared)
+	if not player or player == LocalPlayer or player.Parent ~= Players or not player.Character or not myRoot then return false end
+	QMAScheduler.LastAnyScan[player] = now
+	local analysis = AnalyzePlayer(player, myRoot, now, State.AntiFlingScanInterval or 0.08, allPlayers, shared)
+	if not analysis or not analysis.Valid then
+		QMAScheduler.RefreshPriorityCandidate(player, now)
+		return false
+	end
+	local history = GetHistory(player)
+	local closeRisk = analysis.Distance <= math.max(14, GetQuantumThreatDistance())
+	local multiEvidence = (analysis.IndependentEvidenceCount or 0) >= 2
+	local extremeSpinRisk = analysis.ExtremeSpinConfirmed and analysis.Distance <= 20
+	local hardCollisionRisk = (closeRisk and multiEvidence) or extremeSpinRisk or (closeRisk and analysis.SpeedCritical and analysis.SustainedSpin)
+	if hardCollisionRisk then
+		history.DangerHoldUntil = math.max(history.DangerHoldUntil or 0, now + AntiFlingQuantum.GetDangerIsolationHold())
+	end
+	local flungByMeUntil = AntiFlingQuantum.RecentlyFlungByMe[player]
+	local isFlungByMe = flungByMeUntil and now < flungByMeUntil
+	if isFlungByMe or analysis.RelocationGrace then
+		history.SustainedSpin = false
+		history.Orbiting = false
+		analysis.State = "Normal"
+		analysis.Confidence = 0
+	end
+	if not isFlungByMe and not analysis.RelocationGrace and (analysis.SustainedSpin or analysis.Orbiting or analysis.State == "Critical") then
+		local detectedFlinger, dist = DetectFlingerVictimPair(player, allPlayers, now)
+		if detectedFlinger and dist <= AntiFlingQuantum.GetFlingerPairDistance() then
+			local fr = GetRoot(detectedFlinger)
+			local fs = fr and SafeMagnitude(fr.AssemblyLinearVelocity) or 0
+			local fa = fr and SafeMagnitude(fr.AssemblyAngularVelocity) or 0
+			local culpritHistory = GetHistory(detectedFlinger)
+			local observedFlingerSpeed = culpritHistory.ObservedHorizontalSpeed or 0
+			local speedEvidence = culpritHistory.SpeedAnomaly or culpritHistory.SpeedCritical or culpritHistory.TeleportSuspected
+			local po = OTI.PlayerOTI[detectedFlinger]
+			local otiScore = po and po.ObjectScore or 0
+			if fs >= 100 or fa >= 500 or otiScore >= 85 or (speedEvidence and observedFlingerSpeed >= AntiFlingQuantum.GetFlingerSpeedThreshold() * 1.5) then
+				local confidence = math.max(82, analysis.Confidence or 0, otiScore)
+				AntiFlingQuantum.DangerousPlayers[detectedFlinger] = {Reason=otiScore >= 72 and "QMA + OTI correlation" or "Abnormal physics near flung player", Confidence=confidence, Source="QMA", LastSeen=now}
+				AntiFlingQuantum.ThreatStates[detectedFlinger] = {Valid=true,State="Critical",Confidence=confidence,Source="QMA-Flinger"}
+				GetHistory(detectedFlinger).LastCriticalTime = now
+			end
+		end
+	end
+	local existingThreat = AntiFlingQuantum.ThreatStates[player]
+	if existingThreat and (existingThreat.State == "Critical" or existingThreat.State == "Threat")
+		and analysis.State ~= "Critical" and analysis.State ~= "Threat" and not analysis.RelocationGrace then
+		local lastThreatAt = tonumber(history.LastThreatTime) or 0
+		local lastCriticalAt = tonumber(history.LastCriticalTime) or 0
+		local hardHold = (tonumber(history.DangerHoldUntil) or 0) > now
+		local preserveCritical = existingThreat.State == "Critical" and (hardHold or now - lastCriticalAt <= 0.35)
+		local preserveThreat = existingThreat.State == "Threat" and (hardHold or now - lastThreatAt <= 0.55)
+		if preserveCritical or preserveThreat then
+			analysis.State = existingThreat.State
+			analysis.Confidence = math.max(analysis.Confidence or 0, existingThreat.Confidence or 0)
+		end
+	end
+	AntiFlingQuantum.ThreatStates[player] = analysis
+	if not isFlungByMe and not analysis.RelocationGrace then
+		if analysis.State == "Suspicious" or analysis.SustainedSpin or analysis.Orbiting or analysis.Flying
+			or analysis.SpeedAnomaly or analysis.ExtremeSpinConfirmed or analysis.TeleportDetected then
+			AntiFlingQuantum.SuspiciousPlayers[player] = {
+				Reason=analysis.TeleportDetected and "Impossible Relocation"
+						or analysis.SpeedCritical and "Extreme Speed"
+						or analysis.SpeedAnomaly and "Sustained Speed Anomaly"
+						or analysis.Hovering and "Hover/Fly Pattern"
+						or analysis.SustainedSpin and "Abnormal Spin"
+						or analysis.Orbiting and "Orbit Pattern"
+						or analysis.Flying and "Extreme Air Physics"
+						or analysis.Escalating and "Escalating Physics"
+						or "Suspicious Physics",
+				Confidence=analysis.Confidence, Speed=math.floor(analysis.ObservedHorizontalSpeed or 0),
+				PeerSpeed=math.floor(analysis.PeerSpeedBaseline or 0), SpeedRatio=analysis.SpeedRatio or 1,
+			}
+		else
+			AntiFlingQuantum.SuspiciousPlayers[player] = nil
+		end
+		if analysis.State == "Threat" or analysis.State == "Critical" then
+			history.LastProtectedTime = now
+			if analysis.State == "Critical" then history.LastCriticalTime = now end
+		end
+	end
+	QMAScheduler.RefreshPriorityCandidate(player, now)
+	return true
+end
+
 AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 	local now = tick()
 	
@@ -3866,9 +4249,8 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 	
 	if now >= QMAScheduler.NextBatchTime then
 		if QMAScheduler.CycleComplete then
-			-- Begin a fresh pass over the current roster, not an N-by-N pass.
-			QMAScheduler.CycleComplete = false
-			table.clear(QMAScheduler.ProcessedThisCycle)
+			-- Re-rank once per cycle so recent threats move forward without scanning/sorting every Heartbeat.
+			QMAScheduler.RebuildQueue(allPlayers)
 			_G.Celestial.BeginRealPlayerScanCycle(allPlayers)
 		end
 		local processed = 0
@@ -3892,88 +4274,7 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 					-- Defensive guard against duplicate queue entries; don't count them.
 					continue
 				end
-				if player and player ~= LocalPlayer and player.Parent and player.Character then
-					local analysis = AnalyzePlayer(player, myRoot, now, State.AntiFlingScanInterval or 0.08, allPlayers, shared)
-					if analysis.Valid then
-						local history = GetHistory(player)
-						
-						local closeRisk = analysis.Distance <= math.max(14, GetQuantumThreatDistance())
-						local multiEvidence = (analysis.IndependentEvidenceCount or 0) >= 2
-						local extremeSpinRisk = analysis.ExtremeSpinConfirmed and analysis.Distance <= 20
-						local hardCollisionRisk = (closeRisk and multiEvidence) or extremeSpinRisk or (closeRisk and analysis.SpeedCritical and analysis.SustainedSpin)
-						
-						if hardCollisionRisk then
-							history.DangerHoldUntil = math.max(history.DangerHoldUntil or 0, now + AntiFlingQuantum.GetDangerIsolationHold())
-						end
-						
-						local flungByMeUntil = AntiFlingQuantum.RecentlyFlungByMe[player]
-						local isFlungByMe = flungByMeUntil and now < flungByMeUntil
-						
-						if isFlungByMe or analysis.RelocationGrace then
-							history.SustainedSpin = false
-							history.Orbiting = false
-							analysis.State = "Normal"
-							analysis.Confidence = 0
-						end
-
-						if not isFlungByMe and not analysis.RelocationGrace and (analysis.SustainedSpin or analysis.Orbiting or analysis.State == "Critical") then
-							local detectedFlinger, dist = DetectFlingerVictimPair(player, allPlayers, now)
-							if detectedFlinger and dist <= AntiFlingQuantum.GetFlingerPairDistance() then
-								local fr = GetRoot(detectedFlinger)
-								local fs = fr and SafeMagnitude(fr.AssemblyLinearVelocity) or 0
-								local fa = fr and SafeMagnitude(fr.AssemblyAngularVelocity) or 0
-								local culpritHistory = GetHistory(detectedFlinger)
-								local observedFlingerSpeed = culpritHistory.ObservedHorizontalSpeed or 0
-								local speedEvidence = culpritHistory.SpeedAnomaly or culpritHistory.SpeedCritical or culpritHistory.TeleportSuspected
-								local po = OTI.PlayerOTI[detectedFlinger]
-								local otiScore = po and po.ObjectScore or 0
-								if fs >= 100 or fa >= 500 or otiScore >= 85 or (speedEvidence and observedFlingerSpeed >= AntiFlingQuantum.GetFlingerSpeedThreshold() * 1.5) then
-									local confidence = math.max(82, analysis.Confidence or 0, otiScore)
-									AntiFlingQuantum.DangerousPlayers[detectedFlinger] = {Reason=otiScore >= 72 and "QMA + OTI correlation" or "Abnormal physics near flung player", Confidence=confidence, Source="QMA"}
-									AntiFlingQuantum.ThreatStates[detectedFlinger] = {Valid=true,State="Critical",Confidence=confidence,Source="QMA-Flinger"}
-									GetHistory(detectedFlinger).LastCriticalTime = now
-								end
-							end
-						end
-
-						local existingThreat = AntiFlingQuantum.ThreatStates[player]
-						if existingThreat and (existingThreat.State == "Critical" or existingThreat.State == "Threat")
-							and analysis.State ~= "Critical" and analysis.State ~= "Threat" and not analysis.RelocationGrace then
-							analysis.State = existingThreat.State
-							analysis.Confidence = math.max(analysis.Confidence or 0, existingThreat.Confidence or 0)
-						end
-						
-						AntiFlingQuantum.ThreatStates[player] = analysis
-
-						if not isFlungByMe and not analysis.RelocationGrace then
-							if analysis.State == "Suspicious" or analysis.SustainedSpin or analysis.Orbiting or analysis.Flying
-								or analysis.SpeedAnomaly or analysis.ExtremeSpinConfirmed or analysis.TeleportDetected then
-								AntiFlingQuantum.SuspiciousPlayers[player] = {
-									Reason=analysis.TeleportDetected and "Impossible Relocation"
-										or analysis.SpeedCritical and "Extreme Speed"
-										or analysis.SpeedAnomaly and "Sustained Speed Anomaly"
-										or analysis.Hovering and "Hover/Fly Pattern"
-										or analysis.SustainedSpin and "Abnormal Spin"
-										or analysis.Orbiting and "Orbit Pattern"
-										or analysis.Flying and "Extreme Air Physics"
-										or analysis.Escalating and "Escalating Physics"
-										or "Suspicious Physics",
-									Confidence=analysis.Confidence, Speed=math.floor(analysis.ObservedHorizontalSpeed or 0),
-									PeerSpeed=math.floor(analysis.PeerSpeedBaseline or 0), SpeedRatio=analysis.SpeedRatio or 1
-								}
-							else
-								AntiFlingQuantum.SuspiciousPlayers[player] = nil
-							end
-							
-							if analysis.State == "Threat" or analysis.State == "Critical" then
-								history.LastProtectedTime = now
-								if analysis.State == "Critical" then
-									history.LastCriticalTime = now
-								end
-							end
-						end
-					end
-				end
+				QMAScheduler.ProcessPlayer(player, myRoot, now, allPlayers, shared)
 			end
 		end
 		
@@ -3983,6 +4284,20 @@ AntiFlingQuantum.Connection = RunService.Heartbeat:Connect(function()
 		end
 		
 		QMAScheduler.NextBatchTime = now + QMAScheduler.TimePerBatch
+	end
+
+	if now >= (QMAScheduler.NextPriorityScanTime or 0) then
+		local priorityPlayer, priorityScore, nextPriorityDelay = QMAScheduler.GetNextPriorityPlayer(now)
+		if priorityPlayer then
+			local priorityRoot = GetRoot()
+			if priorityRoot then
+				local shared = QMAScheduler.GetSharedData(allPlayers, now)
+				pcall(QMAScheduler.ProcessPlayer, priorityPlayer, priorityRoot, now, allPlayers, shared)
+			end
+			QMAScheduler.NextPriorityScanTime = now + (nextPriorityDelay or 0.10)
+		else
+			QMAScheduler.NextPriorityScanTime = now + (nextPriorityDelay or 0.20)
+		end
 	end
 end)
 
@@ -4477,86 +4792,160 @@ end
 
 -- Estado de ronda independiente del nombre de rol cacheado. El resultado se cachea brevemente
 -- porque tanto el detector de poderes como el renderizador consultan este estado a alta frecuencia.
+-- Shared, event-maintained lobby detector. Workspace is indexed once at initialization;
+-- later zone additions/removals update the weak-key cache instead of doing recursive searches
+-- every time a high-frequency subsystem asks whether the player is in the lobby.
+local MM2LobbyDetector = {
+    ZoneNames = {
+        lobby = true, lobby3d = true, lobbyarea = true, mainlobby = true,
+        lobbymap = true, lobbyspawn = true, waitingroom = true, waitingroomspawn = true,
+    },
+    Zones = setmetatable({}, {__mode = "k"}),
+    ZonePresence = {checkedAt = 0, value = false},
+    UI = {checkedAt = 0, transition = false, lobby = false, result = false},
+    LobbyPhrases = {
+        "loading map", "choosing map", "map vote", "voting for", "intermission",
+        "waiting for players", "waiting for more players", "esperando jugadores", "votando",
+    },
+    ResultPhrases = {
+        "murderer wins", "murderer won", "murderer was killed", "murderer has been killed",
+        "sheriff wins", "sheriff won", "innocents win", "innocents won",
+        "survivors win", "survivors won", "round over", "round ended", "game over",
+        "victory", "defeat", "you win", "you lose", "hero wins", "fin de la ronda",
+        "ronda terminada", "partida terminada",
+    },
+}
+
+function MM2LobbyDetector:IsZoneCandidate(obj)
+    if not obj then return false end
+    if not (obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Folder")) then return false end
+    return self.ZoneNames[string.lower(tostring(obj.Name or ""))] == true
+end
+
+function MM2LobbyDetector:RegisterZone(obj)
+    if self:IsZoneCandidate(obj) then self.Zones[obj] = true end
+end
+
+function MM2LobbyDetector:RefreshUI(force)
+    local now = tick()
+    if not force and now - (self.UI.checkedAt or 0) < 0.45 then return self.UI end
+    local ui = self.UI
+    ui.checkedAt = now
+    ui.transition, ui.lobby, ui.result = false, false, false
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then return ui end
+    local ok, descendants = pcall(function() return playerGui:GetDescendants() end)
+    if not ok or not descendants then return ui end
+    local inspected = 0
+    for _, obj in ipairs(descendants) do
+        inspected += 1
+        if inspected > 1400 then break end
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+            local txt = string.lower(tostring(obj.Text or "")):gsub("%s+", " ")
+            for _, phrase in ipairs(self.LobbyPhrases) do
+                if string.find(txt, phrase, 1, true) then
+                    ui.lobby, ui.transition = true, true
+                    break
+                end
+            end
+            for _, phrase in ipairs(self.ResultPhrases) do
+                if string.find(txt, phrase, 1, true) then
+                    ui.result = true
+                    break
+                end
+            end
+            if ui.lobby and ui.result then break end
+        end
+    end
+    return ui
+end
+
+function MM2LobbyDetector:IsPlayerInZone()
+    if _G.Celestial.GameMode ~= "MM2" then return false end
+    local now = tick()
+    if now - (self.ZonePresence.checkedAt or 0) < 0.15 then
+        return self.ZonePresence.value == true
+    end
+    local found = false
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then
+        for zone in pairs(self.Zones) do
+            if not zone or not zone.Parent then
+                self.Zones[zone] = nil
+            else
+                local inside = false
+                pcall(function() inside = root:IsDescendantOf(zone) end)
+                if not inside and zone:IsA("BasePart") then
+                    local ok, localPosition = pcall(function() return zone.CFrame:PointToObjectSpace(root.Position) end)
+                    if ok then
+                        local half = zone.Size * 0.5
+                        inside = math.abs(localPosition.X) <= half.X + 8
+                            and math.abs(localPosition.Y) <= half.Y + 10
+                            and math.abs(localPosition.Z) <= half.Z + 8
+                    end
+                elseif not inside and zone:IsA("Model") then
+                    local ok, cf, size = pcall(function() return zone:GetBoundingBox() end)
+                    if ok and cf and size and size.X <= 240 and size.Y <= 140 and size.Z <= 240 then
+                        local localPosition = cf:PointToObjectSpace(root.Position)
+                        inside = math.abs(localPosition.X) <= size.X * 0.5 + 8
+                            and math.abs(localPosition.Y) <= size.Y * 0.5 + 10
+                            and math.abs(localPosition.Z) <= size.Z * 0.5 + 8
+                    end
+                end
+                if inside then found = true; break end
+            end
+        end
+    end
+    self.ZonePresence.checkedAt = now
+    self.ZonePresence.value = found
+    return found
+end
+
+-- Replace old listeners on script reload so this optimization cannot accumulate connections.
+for _, key in ipairs({"MM2LobbyZoneAddedConnection", "MM2LobbyZoneRemovingConnection"}) do
+    local previous = _G.Celestial[key]
+    if previous then pcall(function() previous:Disconnect() end) end
+    _G.Celestial[key] = nil
+end
+pcall(function()
+    for _, obj in ipairs(Workspace:GetDescendants()) do MM2LobbyDetector:RegisterZone(obj) end
+end)
+_G.Celestial.MM2LobbyZoneAddedConnection = Workspace.DescendantAdded:Connect(function(obj)
+    MM2LobbyDetector:RegisterZone(obj)
+end)
+_G.Celestial.MM2LobbyZoneRemovingConnection = Workspace.DescendantRemoving:Connect(function(obj)
+    MM2LobbyDetector.Zones[obj] = nil
+    MM2LobbyDetector.ZonePresence.checkedAt = 0
+end)
+_G.Celestial.MM2LobbyDetector = MM2LobbyDetector
+_G.Celestial.GetMM2RoundUISignals = function(force) return MM2LobbyDetector:RefreshUI(force) end
+_G.Celestial.IsPlayerWithinMM2LobbyZone = function() return MM2LobbyDetector:IsPlayerInZone() end
+
 _G.Celestial.MM2LobbyPhaseCache = {checkedAt = 0, value = false}
 _G.Celestial.IsMM2LobbyPhaseConfirmed = function()
-	if _G.Celestial.GameMode ~= "MM2" then return false end
-	local now = tick()
-	local cache = _G.Celestial.MM2LobbyPhaseCache
-	if cache and now - (tonumber(cache.checkedAt) or 0) < 0.25 then return cache.value == true end
-	if not cache then
-		cache = {checkedAt = 0, value = false}
-		_G.Celestial.MM2LobbyPhaseCache = cache
-	end
-
-	local confirmed = false
-	local roundState = _G.Celestial.RoundTimerState
-	-- Un temporizador en 0:00 no confirma por sí solo el fin de la ronda.
-	-- El estado terminal solo se acepta cuando el detector de ronda lo ha confirmado.
-	if roundState and (roundState.phase == "Ended"
-		or (roundState.phase == "Round" and roundState.ended == true)) then
-		confirmed = true
-	end
-
-	local character = LocalPlayer.Character
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if not confirmed and root then
-		for _, name in ipairs({"Lobby", "Lobby3D", "LobbyArea", "MainLobby", "LobbyMap", "LobbySpawn", "WaitingRoom", "WaitingRoomSpawn"}) do
-			local zone = Workspace:FindFirstChild(name, true)
-			if zone then
-				local inside = root:IsDescendantOf(zone)
-				if not inside and zone:IsA("BasePart") then
-					local ok, localPosition = pcall(function() return zone.CFrame:PointToObjectSpace(root.Position) end)
-					if ok then
-						local half = zone.Size * 0.5
-						inside = math.abs(localPosition.X) <= half.X + 8
-							and math.abs(localPosition.Y) <= half.Y + 10
-							and math.abs(localPosition.Z) <= half.Z + 8
-					end
-				elseif not inside and zone:IsA("Model") then
-					local ok, cf, size = pcall(function() return zone:GetBoundingBox() end)
-					if ok and cf and size and size.X <= 240 and size.Y <= 140 and size.Z <= 240 then
-						local localPosition = cf:PointToObjectSpace(root.Position)
-						inside = math.abs(localPosition.X) <= size.X * 0.5 + 8
-							and math.abs(localPosition.Y) <= size.Y * 0.5 + 10
-							and math.abs(localPosition.Z) <= size.Z * 0.5 + 8
-					end
-				end
-				if inside then confirmed = true; break end
-			end
-		end
-	end
-
-	-- El texto visible de fin de ronda/intermission sirve como segunda señal cuando el mapa
-	-- no expone un contenedor de Lobby fácil de reconocer.
-	if not confirmed then
-		local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-		if playerGui then
-			local ok, descendants = pcall(function() return playerGui:GetDescendants() end)
-			if ok and descendants then
-				for index, obj in ipairs(descendants) do
-					if index > 1400 then break end
-					if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
-						local text = string.lower(tostring(obj.Text or ""))
-						if text:find("intermission", 1, true) or text:find("waiting for players", 1, true)
-							or text:find("waiting for more players", 1, true)
-							or text:find("round over", 1, true) or text:find("game over", 1, true)
-							or text:find("murderer wins", 1, true) or text:find("innocents win", 1, true)
-							or text:find("hero wins", 1, true) or text:find("sheriff wins", 1, true)
-							or text:find("voting for", 1, true) or text:find("esperando jugadores", 1, true)
-							or text:find("fin de la ronda", 1, true) or text:find("ronda terminada", 1, true)
-							or text:find("partida terminada", 1, true) then
-							confirmed = true
-							break
-						end
-					end
-				end
-			end
-		end
-	end
-
-	cache.checkedAt = now
-	cache.value = confirmed
-	return confirmed
+    if _G.Celestial.GameMode ~= "MM2" then return false end
+    local now = tick()
+    local cache = _G.Celestial.MM2LobbyPhaseCache
+    if cache and now - (tonumber(cache.checkedAt) or 0) < 0.25 then return cache.value == true end
+    if not cache then
+        cache = {checkedAt = 0, value = false}
+        _G.Celestial.MM2LobbyPhaseCache = cache
+    end
+    local confirmed = false
+    local roundState = _G.Celestial.RoundTimerState
+    -- An explicit terminal round state remains a confirmed transition for existing consumers.
+    if roundState and (roundState.phase == "Ended"
+        or (roundState.phase == "Round" and roundState.ended == true)) then
+        confirmed = true
+    end
+    if not confirmed then confirmed = MM2LobbyDetector:IsPlayerInZone() end
+    if not confirmed then
+        local signals = MM2LobbyDetector:RefreshUI()
+        confirmed = signals.lobby == true or signals.result == true
+    end
+    cache.checkedAt, cache.value = now, confirmed
+    return confirmed
 end
 
 local function IsPowerCurrentlyActive(plr, powerName)
@@ -16707,7 +17096,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             end
 
             UIState.FPSValueLabel, UIState.FPSGradient = makeMetricLabel("FPSValue", "★N/D FPS", 6)
-            UIState.PingValueLabel, UIState.PingGradient = makeMetricLabel("PingValue", "★N/D ms", 25)
+            UIState.PingValueLabel, UIState.PingGradient = makeMetricLabel("PingValue", "★N/A", 25)
 
             local statusLabel = Instance.new("TextLabel")
             statusLabel.Name = "RoundStatus"
@@ -16732,10 +17121,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             moveButton.BackgroundColor3 = config.Colors.DarkButton
             moveButton.BackgroundTransparency = 0.08
             moveButton.BorderSizePixel = 0
-            moveButton.Text = "✥"
-            moveButton.TextColor3 = config.Colors.White
-            moveButton.Font = Enum.Font.GothamBold
-            moveButton.TextSize = 18
+            moveButton.Text = ""
             moveButton.AutoButtonColor = false
             moveButton.Active = true
             moveButton.ZIndex = 132
@@ -16744,6 +17130,22 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             local moveCorner = Instance.new("UICorner")
             moveCorner.CornerRadius = UDim.new(1, 0)
             moveCorner.Parent = moveButton
+            local moveImage = Instance.new("ImageLabel")
+            moveImage.Name = "MoveControlImage"
+            moveImage.Position = UDim2.fromScale(0, 0)
+            moveImage.Size = UDim2.fromScale(1, 1)
+            moveImage.BackgroundTransparency = 1
+            moveImage.BorderSizePixel = 0
+            moveImage.Image = config.MoveButtonImageId
+            moveImage.ScaleType = Enum.ScaleType.Fit
+            moveImage.Active = false
+            moveImage.Selectable = false
+            moveImage.ZIndex = moveButton.ZIndex + 1
+            moveImage.Parent = moveButton
+            local moveImageCorner = Instance.new("UICorner")
+            moveImageCorner.CornerRadius = UDim.new(1, 0)
+            moveImageCorner.Parent = moveImage
+            UIState.MoveButtonImage = moveImage
             local moveStroke = Instance.new("UIStroke")
             moveStroke.Thickness = 1.25
             moveStroke.Transparency = 0.08
@@ -16768,11 +17170,22 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             local function GetDynamicIslandAvailableArea(viewport)
                 local leftInset, topInset, rightInset, bottomInset = GetDynamicIslandSafeInsets()
-                -- ScreenGui's normal inset already offsets its coordinate origin. Keep positions
-                -- relative to that origin, but subtract the insets from the available dimensions.
                 local availableWidth = math.max(1, viewport.X - leftInset - rightInset)
                 local availableHeight = math.max(1, viewport.Y - topInset - bottomInset)
-                return availableWidth, availableHeight
+                return availableWidth, availableHeight, leftInset, topInset, rightInset, bottomInset
+            end
+
+            local function GetDynamicIslandLegalOffsets(viewport, width, height)
+                local _, _, leftInset, topInset, rightInset, bottomInset = GetDynamicIslandAvailableArea(viewport)
+                -- root.Position offsets are relative to the ScreenGui origin. With IgnoreGuiInset
+                -- disabled, that origin is already shifted by leftInset/topInset; subtract those
+                -- values here so the rendered root can still reach the true safe-area edges.
+                local margin = config.ScreenMargin
+                local minX = margin - leftInset
+                local minY = margin - topInset
+                local maxX = math.max(minX, viewport.X - rightInset - margin - width - leftInset)
+                local maxY = math.max(minY, viewport.Y - bottomInset - margin - height - topInset)
+                return minX, minY, maxX, maxY
             end
 
             local function UpdateDynamicIslandScaleAndBounds()
@@ -16785,10 +17198,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 scale.Scale = targetScale
                 local rootWidth = config.RootWidth * targetScale
                 local rootHeight = config.RootHeight * targetScale
-                local minX = config.ScreenMargin
-                local minY = config.ScreenMargin
-                local maxX = math.max(minX, availableWidth - rootWidth - config.ScreenMargin)
-                local maxY = math.max(minY, availableHeight - rootHeight - config.ScreenMargin)
+                local minX, minY, maxX, maxY = GetDynamicIslandLegalOffsets(viewport, rootWidth, rootHeight)
                 local currentPos = root.Position
                 local x = currentPos.X.Offset
                 local y = currentPos.Y.Offset
@@ -16806,15 +17216,10 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             UIState.ClampDynamicIslandPosition = function(x, y)
                 local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
                 local currentScale = scale.Scale
-                -- Prefer actual rendered bounds so clamping follows viewport/UIScale changes.
                 local actualSize = root.AbsoluteSize
                 local width = actualSize.X > 0 and actualSize.X or config.RootWidth * currentScale
                 local height = actualSize.Y > 0 and actualSize.Y or config.RootHeight * currentScale
-                local availableWidth, availableHeight = GetDynamicIslandAvailableArea(viewport)
-                local minX = config.ScreenMargin
-                local minY = config.ScreenMargin
-                local maxX = math.max(minX, availableWidth - width - config.ScreenMargin)
-                local maxY = math.max(minY, availableHeight - height - config.ScreenMargin)
+                local minX, minY, maxX, maxY = GetDynamicIslandLegalOffsets(viewport, width, height)
                 return math.clamp(x, minX, maxX), math.clamp(y, minY, maxY)
             end
             UpdateDynamicIslandScaleAndBounds()
@@ -17073,24 +17478,31 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 if statsOK and statItem then
                     local stringOK, valueString = pcall(function() return statItem:GetValueString() end)
                     if stringOK and type(valueString) == "string" then
-                        local numeric = valueString:match("([%d%.]+)")
-                        pingMs = tonumber(numeric)
-                    end
-                    if not pingMs then
-                        local valueOK, value = pcall(function() return statItem:GetValue() end)
-                        if valueOK and type(value) == "number" and value >= 0 then pingMs = value end
+                        local normalized = string.lower(valueString):gsub(",", "")
+                        local numericToken = normalized:match("(%d+%.?%d*)")
+                        local numeric = numericToken and tonumber(numericToken) or nil
+                        if numeric and numeric >= 0 and numeric < 100000 then
+                            if normalized:find("ms", 1, true) then
+                                pingMs = numeric -- Explicit millisecond unit; no conversion.
+                            elseif normalized:find("second", 1, true)
+                                or normalized:match("%s*s%s*$") then
+                                pingMs = numeric * 1000 -- Explicit seconds; convert exactly once.
+                            end -- Unitless/unknown strings are not trusted as milliseconds.
+                        end
                     end
                 end
                 if not pingMs then
+                    -- Roblox documents GetNetworkPing() in seconds; convert only this fallback.
                     local pingOK, pingSeconds = pcall(function() return LocalPlayer:GetNetworkPing() end)
-                    if pingOK and type(pingSeconds) == "number" and pingSeconds >= 0 then
+                    if pingOK and type(pingSeconds) == "number" and pingSeconds >= 0
+                        and pingSeconds < math.huge and pingSeconds == pingSeconds then
                         pingMs = pingSeconds * 1000
                     end
                 end
-                if type(pingMs) == "number" and pingMs >= 0 and pingMs == pingMs then
+                if type(pingMs) == "number" and pingMs >= 0 and pingMs < 100000 and pingMs == pingMs then
                     UIState.PingValueLabel.Text = "★" .. tostring(math.floor(pingMs + 0.5)) .. " ms"
                 else
-                    UIState.PingValueLabel.Text = "★N/D ms"
+                    UIState.PingValueLabel.Text = "★N/A"
                 end
             end
 
@@ -17736,6 +18148,10 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
 		local function FindMM2TimerLabel()
 			local now = tick()
+			if (not mm2TimerCache or not mm2TimerCache.Parent or not mm2TimerCache.Visible)
+				and mm2TimerLastDeepScanAt > 0 and now - mm2TimerLastDeepScanAt < 0.70 then
+				return nil, nil
+			end
 			if mm2TimerCache and mm2TimerCache.Parent and mm2TimerCache.Visible then
 				local parsed = ParseTimerText(mm2TimerCache.Text)
 				if parsed and (now - mm2TimerLastDeepScanAt) < 0.5 then
@@ -17777,25 +18193,37 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			return nil, nil
 		end
 
-		local loadingLabelCache = nil
-		local function IsMapLoading()
-			if loadingLabelCache and loadingLabelCache.Parent and loadingLabelCache.Visible then return true end
-			loadingLabelCache = nil
-			local pg = LocalPlayer:FindFirstChild("PlayerGui")
-			if not pg then return false end
-			local mainGui = pg:FindFirstChild("MainGUI")
-			if not mainGui then return false end
-			for _, obj in ipairs(mainGui:GetDescendants()) do
-				if obj:IsA("TextLabel") and obj.Visible then
-					local t = string.lower(tostring(obj.Text or ""))
-					if t:find("loading map") or t:find("choosing map") or t:find("map vote") or t:find("voting") then
-						loadingLabelCache = obj
-						return true
-					end
-				end
-			end
-			return false
-		end
+        local roundUiSignals = {scannedAt = 0, transition = false, lobby = false, result = false}
+        local function RefreshRoundUiSignals()
+            local now = tick()
+            local signals = _G.Celestial.GetMM2RoundUISignals and _G.Celestial.GetMM2RoundUISignals()
+            if type(signals) == "table" then
+                roundUiSignals.scannedAt = tonumber(signals.checkedAt) or now
+                roundUiSignals.transition = signals.transition == true
+                roundUiSignals.lobby = signals.lobby == true
+                roundUiSignals.result = signals.result == true
+                return
+            end
+            roundUiSignals.scannedAt = now
+            roundUiSignals.transition, roundUiSignals.lobby, roundUiSignals.result = false, false, false
+        end
+        local function IsMapLoading()
+            RefreshRoundUiSignals()
+            return roundUiSignals.transition == true
+        end
+        local function IsLobbyWaitingState()
+            RefreshRoundUiSignals()
+            if roundUiSignals.lobby then return true end
+            local ok, inLobby = pcall(function()
+                return _G.Celestial.IsPlayerWithinMM2LobbyZone
+                    and _G.Celestial.IsPlayerWithinMM2LobbyZone() == true
+            end)
+            return ok and inLobby == true
+        end
+        local function HasRoundResultText()
+            RefreshRoundUiSignals()
+            return roundUiSignals.result == true
+        end
 
 		local timerState = {
             phase = "Idle", roundStartTime = nil, remaining = ROUND_DURATION,
@@ -17803,6 +18231,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             ended = true, noRolesSince = nil, rolesClearConfirmed = false,
             lastEndSignalScan = 0, lastEndSignal = false, lastEndReason = nil,
             roundGeneration = 0,
+            awaitingFreshStart = false,
+            sawRoleClearAfterLobby = false,
+            lobbyHoldUntil = 0,
         }
         _G.Celestial.RoundTimerState = timerState
 
@@ -17846,33 +18277,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
                 end
             end
 
-            if not signal then
-                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-                local mainGui = playerGui and playerGui:FindFirstChild("MainGUI")
-                if mainGui then
-                    local phrases = {
-                        "murderer wins", "murderer won", "murderer was killed", "murderer has been killed",
-                        "sheriff wins", "sheriff won", "innocents win", "innocents won",
-                        "survivors win", "survivors won", "round over", "round ended", "game over",
-                        "victory", "defeat", "you win", "you lose", "intermission",
-                    }
-                    local ok, descendants = pcall(function() return mainGui:GetDescendants() end)
-                    if ok and descendants then
-                        for _, obj in ipairs(descendants) do
-                            if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
-                                local normalized = string.lower(tostring(obj.Text or "")):gsub("%s+", " ")
-                                for _, phrase in ipairs(phrases) do
-                                    if normalized:find(phrase, 1, true) then
-                                        signal = true
-                                        timerState.lastEndReason = "RoundResultText"
-                                        break
-                                    end
-                                end
-                            end
-                            if signal then break end
-                        end
-                    end
-                end
+            if not signal and HasRoundResultText() then
+                signal = true
+                timerState.lastEndReason = "RoundResultText"
             end
             timerState.lastEndSignal = signal
             return signal
@@ -17907,18 +18314,56 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining), false, "ENDED")
         end
 
+        local function ResetTimerForLobby(now)
+            if timerState.phase == "Round" then
+                HandleRoundEnd("LobbyTransition")
+            end
+            timerState.phase = "Idle"
+            timerState.remaining = nil
+            timerState.roundStartTime = nil
+            timerState.observedDuration = nil
+            timerState.lastObservedRemaining = nil
+            timerState.lastObservedAt = nil
+            timerState.ended = true
+            timerState.noRolesSince = nil
+            timerState.rolesClearConfirmed = false
+            timerState.lastEndSignal = false
+            timerState.lastEndReason = "LobbyTransition"
+            timerState.awaitingFreshStart = true
+            timerState.sawRoleClearAfterLobby = tostring(State.MurdererName or "") == ""
+                and tostring(State.SheriffName or "") == ""
+            timerState.lobbyHoldUntil = (now or tick()) + 0.8
+            UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
+        end
+
         local function UpdateRoundTimer()
             local now = tick()
             local mode = tostring(_G.Celestial.GameMode or "UNKNOWN")
             if mode == "DUELS" or mode == "SPIDER" then
-                if timerState.phase == "Round" then HandleRoundEnd("ModeUnavailable") end
-                UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or ROUND_DURATION), false, "N/D")
+                timerState.phase = "Idle"
+                timerState.remaining = nil
+                timerState.ended = true
+                timerState.awaitingFreshStart = true
+                UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
                 return
             end
 
             local hasRoles = tostring(State.MurdererName or "") ~= "" or tostring(State.SheriffName or "") ~= ""
+            if IsLobbyWaitingState() then
+                ResetTimerForLobby(now)
+                return
+            end
+            if now < (timerState.lobbyHoldUntil or 0) then
+                if not hasRoles then timerState.sawRoleClearAfterLobby = true end
+                UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
+                return
+            end
+            if timerState.awaitingFreshStart and not hasRoles then
+                timerState.sawRoleClearAfterLobby = true
+            end
+
             local observedValue = nil
-            if hasRoles or timerState.phase == "Round" then
+            if hasRoles or timerState.phase == "Round" or timerState.phase == "Ended" then
                 local _, value = FindMM2TimerLabel()
                 observedValue = value
             end
@@ -17926,15 +18371,19 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 
             if hasRoles then
                 timerState.noRolesSince = nil
-                if timerState.phase == "Idle" then
+                if timerState.phase == "Idle" and (not timerState.awaitingFreshStart or timerState.sawRoleClearAfterLobby) then
                     HandleNewRound(now, observedValue)
+                    timerState.awaitingFreshStart = false
+                    timerState.sawRoleClearAfterLobby = false
                 elseif timerState.phase == "Ended" then
                     local timerReset = type(observedValue) == "number"
-                        and type(timerState.lastObservedRemaining) == "number"
                         and observedValue >= ROUND_DURATION - 3
-                        and observedValue > timerState.lastObservedRemaining + 15
+                        and (type(timerState.lastObservedRemaining) ~= "number"
+                            or observedValue > timerState.lastObservedRemaining + 15)
                     if timerState.rolesClearConfirmed or timerReset then
                         HandleNewRound(now, observedValue)
+                        timerState.awaitingFreshStart = false
+                        timerState.sawRoleClearAfterLobby = false
                     end
                 end
             elseif timerState.phase == "Round" then
@@ -17969,7 +18418,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
             elseif timerState.phase == "Ended" then
                 UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or 0), false, "ENDED")
             else
-                UIState.UpdateRoundTimerVisual(FormatTimerText(timerState.remaining or ROUND_DURATION), false, "N/D")
+                UIState.UpdateRoundTimerVisual("N/A", false, "N/D")
             end
         end
 
@@ -18232,8 +18681,9 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
         local islandBubbleY = math.floor((DYNAMIC_ISLAND_CONFIG.RootHeight - DYNAMIC_ISLAND_CONFIG.BubbleSize) * 0.5)
         local MinimzedBar = Instance.new("ImageLabel")
         MinimzedBar.Name = "CelestialBubble"
-        MinimzedBar.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize)
-        MinimzedBar.Position = UDim2.fromOffset(0, islandBubbleY)
+        local bubbleImageOverscan = DYNAMIC_ISLAND_CONFIG.BubbleImageOverscan or 0
+        MinimzedBar.Size = UDim2.new(0, DYNAMIC_ISLAND_CONFIG.BubbleSize + bubbleImageOverscan, 0, DYNAMIC_ISLAND_CONFIG.BubbleSize + bubbleImageOverscan)
+        MinimzedBar.Position = UDim2.fromOffset(-bubbleImageOverscan * 0.5, islandBubbleY - bubbleImageOverscan * 0.5)
         MinimzedBar.BackgroundTransparency = 1
         MinimzedBar.BorderSizePixel = 0
         MinimzedBar.Image = BUBBLE_IMAGE_ID
