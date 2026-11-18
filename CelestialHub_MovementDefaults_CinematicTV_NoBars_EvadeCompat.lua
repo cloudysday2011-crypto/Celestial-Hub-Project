@@ -10510,6 +10510,9 @@ _G.Celestial.ConnectionRoleScanner =
 					and detector.GhostESPPlayer
 					and detector.GhostESPPlayer.Parent == Players
 					and detector.GhostESPPlayer
+				if not ghostLockedMurderer and _G.Celestial.GhostESP then
+					ghostLockedMurderer = _G.Celestial.GhostESP.GetHeldPlayer()
+				end
 				local confirmedMurder = foundMurder ~= "" and foundMurder
 					or (ghostLockedMurderer and ghostLockedMurderer.Name or "")
 				if confirmedMurder ~= "" then
@@ -10595,7 +10598,10 @@ _G.Celestial.ConnectionRoleScanner =
 					local isSuppressed = (_G.Celestial.HitboxSuppressedPlayer == plr)
 					local isUnwantedMM2Role = State.ESPSheriffMurderOnly == true and _G.Celestial.GameMode == "MM2"
 						and plr.Name ~= State.MurdererName and plr.Name ~= State.SheriffName and plr.Name ~= State.HeroName
-					if isUnwantedMM2Role then
+					local ghostOwned = _G.Celestial.GhostESP ~= nil and _G.Celestial.GhostESP.GetHeldPlayer() == plr
+					if ghostOwned then
+						-- El ESP Ghost (gris, persistente) controla este Highlight mientras el Murder este invisible.
+					elseif isUnwantedMM2Role then
 						if hl then pcall(function() hl.Enabled = false; hl.Adornee = nil end) end
 					elseif isSuppressed then
 						if hl then hl.Enabled = false end
@@ -11198,6 +11204,101 @@ do
 	end)
 end
 
+-- ====================================================================
+-- GHOST ESP: Murder invisible -> marcador GRIS + rastreo persistente
+-- Todo vive en _G.Celestial.GhostESP (sin locals nuevos: limite de 200 locals del chunk).
+-- La deteccion ya no depende solo del detector de poderes: mira directamente la
+-- transparencia / presencia del personaje del Murder y retiene la identidad mientras dure Ghost.
+-- ====================================================================
+_G.Celestial.GhostESP = {
+	Color = Color3.fromRGB(170, 170, 170),
+	Player = nil, Subject = nil, HoldUntil = 0, HoldSeconds = 0.6,
+	MaxMissingSeconds = 15,
+	LastCFrame = nil, LastHealth = 0, LastSeenAt = 0,
+}
+
+function _G.Celestial.GhostESP.Reset()
+	local ge = _G.Celestial.GhostESP
+	ge.Player = nil; ge.Subject = nil; ge.HoldUntil = 0
+	ge.LastCFrame = nil; ge.LastHealth = 0; ge.LastSeenAt = 0
+end
+
+function _G.Celestial.GhostESP.DropProxy()
+	if _G.Celestial.GhostESPProxy then
+		pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
+		_G.Celestial.GhostESPProxy = nil
+	end
+end
+
+-- Murder retenido mientras Ghost siga activo (el escaner de roles tambien lo usa).
+function _G.Celestial.GhostESP.GetHeldPlayer()
+	local ge = _G.Celestial.GhostESP
+	local plr = ge.Player
+	if plr and plr.Parent == Players and tick() < ge.HoldUntil then return plr end
+	return nil
+end
+
+-- Busca el cuerpo del Murder de forma persistente: HRP -> PrimaryPart -> torso/cabeza -> pivot,
+-- y si Player.Character desaparece, lo vuelve a buscar en Workspace por nombre.
+function _G.Celestial.GhostESP.ReadCFrame(plr)
+	local char = plr.Character
+	if not char then
+		local byName = Workspace:FindFirstChild(plr.Name)
+		if byName and byName:IsA("Model") and byName:FindFirstChildOfClass("Humanoid") then char = byName end
+	end
+	if not char then return nil, nil end
+	local part = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+		or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or char:FindFirstChild("Head")
+	if part and part:IsA("BasePart") then return part.CFrame, char end
+	local ok, pivot = pcall(function() return char:GetPivot() end)
+	if ok then return pivot, char end
+	return nil, char
+end
+
+-- Devuelve: ghostActivo, cframe, personaje, enElMundo
+function _G.Celestial.GhostESP.Evaluate(plr, now)
+	local ge = _G.Celestial.GhostESP
+	local detector = _G.Celestial.PowerDetector
+	if ge.Subject ~= plr then
+		ge.Subject = plr
+		ge.LastCFrame = nil; ge.LastHealth = 0; ge.LastSeenAt = 0
+	end
+	local cf, char = ge.ReadCFrame(plr)
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then ge.LastHealth = hum.Health end
+	local inWorld = char ~= nil and char:IsDescendantOf(Workspace)
+	if inWorld and cf then ge.LastCFrame = cf; ge.LastSeenAt = now end
+	local roundActive = true
+	local roundState = _G.Celestial.RoundTimerState
+	if roundState then
+		roundActive = roundState.phase == "Round" and not roundState.ended
+			and (roundState.remaining == nil or roundState.remaining > 0)
+	end
+	local evidence = false
+	if roundActive then
+		if inWorld then
+			-- Personaje presente pero (casi) todo transparente = Ghost.
+			if hum and hum.Health > 0 and GetGhostTransparency(char) >= 0.98 then evidence = true end
+		elseif ge.LastHealth > 0 and ge.LastSeenAt > 0 and plr.Parent == Players
+			and now - ge.LastSeenAt <= ge.MaxMissingSeconds then
+			-- Vivo hace un instante y ahora no esta en el mapa: sigue marcado en su ultima posicion.
+			evidence = true
+		end
+	end
+	if detector and detector.CurrentPlayer == plr and detector.GhostActive == true then evidence = true end
+	local active = false
+	if evidence then
+		ge.Player = plr
+		ge.HoldUntil = now + ge.HoldSeconds -- histeresis: evita parpadeos de 1 frame
+		active = true
+	elseif ge.Player == plr and now < ge.HoldUntil then
+		active = true
+	elseif ge.Player == plr then
+		ge.Player = nil
+	end
+	return active, cf, char, inWorld
+end
+
 function AntiFlingQuantum.EnsureGhostESPProxy()
 	if _G.Celestial.GhostESPProxy and _G.Celestial.GhostESPProxy.Parent then
 		return _G.Celestial.GhostESPProxy
@@ -11212,7 +11313,9 @@ function AntiFlingQuantum.EnsureGhostESPProxy()
 	local proxy = Instance.new("Part")
 	proxy.Name = "GhostMarker"
 	proxy.Size = Vector3.new(2.6, 5.8, 2.0)
-	proxy.Transparency = 1
+	-- Transparency 1 hace que Highlight NO dibuje nada sobre la parte; 0.99 es invisible a simple
+	-- vista pero si deja renderizar el Highlight.
+	proxy.Transparency = 0.99
 	proxy.Anchored = true
 	proxy.CanCollide = false
 	proxy.CanTouch = false
@@ -11220,39 +11323,40 @@ function AntiFlingQuantum.EnsureGhostESPProxy()
 	proxy.CastShadow = false
 	proxy.Parent = model
 	model.PrimaryPart = proxy
+	-- Respaldo visual: un adorno de caja gris que no depende de la transparencia de la parte.
+	local box = Instance.new("BoxHandleAdornment")
+	box.Name = "GhostBox"
+	box.Adornee = proxy
+	box.Size = proxy.Size
+	box.AlwaysOnTop = true
+	box.ZIndex = 5
+	box.Transparency = 0.75
+	box.Color3 = _G.Celestial.GhostESP.Color
+	box.Parent = model
 	_G.Celestial.GhostESPProxy = model
 	return model
 end
 
 local lastGhostESPRefresh = 0
 _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
+	local GE = _G.Celestial.GhostESP
 	local now = tick()
-	if now - lastGhostESPRefresh < 0.05 then
-		-- Only the proxy transform is frame-sensitive; role resolution, lobby checks, and transparency
-		-- classification run at 20 Hz below instead of repeating all lookups on every rendered frame.
+	-- Escaneo mas denso (~40 Hz) mientras Ghost esta activo; ~20 Hz el resto del tiempo.
+	local interval = GE.GetHeldPlayer() and 0.025 or 0.05
+	if now - lastGhostESPRefresh < interval then
+		-- Entre escaneos solo se mueve el marcador (barato, cada frame).
 		local proxy = _G.Celestial.GhostESPProxy
-		if proxy and proxy.Parent then
-			local detector = _G.Celestial.PowerDetector
-			local tracked = detector and ((detector.CurrentPower == "Ghost" and detector.CurrentPlayer) or detector.GhostESPPlayer)
-			local trackedChar = tracked and tracked.Character
-			local trackedRoot = trackedChar and trackedChar:FindFirstChild("HumanoidRootPart")
-			if trackedRoot and proxy.PrimaryPart then proxy.PrimaryPart.CFrame = trackedRoot.CFrame end
+		local heldPlayer = GE.GetHeldPlayer()
+		if proxy and proxy.Parent and proxy.PrimaryPart and heldPlayer then
+			local cf, char = GE.ReadCFrame(heldPlayer)
+			if cf and char and char:IsDescendantOf(Workspace) then proxy.PrimaryPart.CFrame = cf end
 		end
 		return
 	end
 	lastGhostESPRefresh = now
-		if not State.ESPEnabled then
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
-		return
-	end
-	if _G.Celestial.GameMode ~= "MM2" then
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
+	if not State.ESPEnabled or _G.Celestial.GameMode ~= "MM2" then
+		GE.Reset()
+		GE.DropProxy()
 		return
 	end
 	local detector = _G.Celestial.PowerDetector
@@ -11264,14 +11368,13 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 			detector.GhostESPPlayer = nil
 			detector.GhostActivationAt = 0
 		end
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
+		GE.Reset()
+		GE.DropProxy()
 		return
 	end
 	local murderer = nil
 	if State.MurdererName ~= "" then murderer = Players:FindFirstChild(State.MurdererName) end
+	if not murderer then murderer = GE.GetHeldPlayer() end
 	if not murderer and detector and detector.CurrentPower == "Ghost" and detector.GhostActive == true
 		and detector.CurrentPlayer and detector.CurrentPlayer.Parent == Players then
 		murderer = detector.CurrentPlayer
@@ -11281,10 +11384,7 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 		murderer = detector.GhostESPPlayer
 	end
 	if not murderer then
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
+		GE.DropProxy()
 		return
 	end
 	if murderer == LocalPlayer then
@@ -11293,72 +11393,52 @@ _G.Celestial.ConnectionGhostESP = RunService.RenderStepped:Connect(function()
 			pcall(function() ownRoleHighlight:Destroy() end)
 			_G.Celestial.Highlights[LocalPlayer] = nil
 		end
-		if _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
+		GE.Reset()
+		GE.DropProxy()
 		return
 	end
-	local char = murderer.Character
-	local ghostActiveLatched = detector and detector.CurrentPower == "Ghost"
-		and detector.CurrentPlayer == murderer and detector.GhostActive == true
-	if not char then
-		if not ghostActiveLatched and _G.Celestial.GhostESPProxy then
-			pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-			_G.Celestial.GhostESPProxy = nil
-		end
-		return
-	end
-	local charInWorkspace = char.Parent == Workspace
-	if not charInWorkspace and not ghostActiveLatched then return end
+	local ghostActive, cf, char, inWorld = GE.Evaluate(murderer, now)
 	local hl = _G.Celestial.Highlights[murderer]
+	if not ghostActive then
+		GE.DropProxy()
+		if not char or not inWorld then return end
+		if not hl or not hl.Parent then
+			hl = Instance.new("Highlight")
+			hl.Name = murderer.Name
+			hl.Parent = _G.Celestial.ESPFolder
+			_G.Celestial.Highlights[murderer] = hl
+		end
+		hl.Enabled = true
+		hl.Adornee = char
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.FillColor = COLOR_MURDERER
+		hl.OutlineColor = COLOR_MURDERER
+		hl.FillTransparency = 0.5
+		hl.OutlineTransparency = 0.15
+		return
+	end
+	-- Murder invisible (Ghost): GRIS, sobre un marcador que sigue su posicion (o la ultima conocida).
 	if not hl or not hl.Parent then
 		hl = Instance.new("Highlight")
 		hl.Name = murderer.Name
 		hl.Parent = _G.Celestial.ESPFolder
 		_G.Celestial.Highlights[murderer] = hl
 	end
-	local ghostVisual = false
-	-- El detector de poderes decide si Ghost está activo; el renderizador solo presenta ese estado.
-	-- Así la transparencia no puede reactivar por sí sola un Ghost de la ronda anterior.
-	if detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer
-		and detector.GhostActive == true then
-		local transparency = GetGhostTransparency(char)
-		ghostVisual = transparency >= 0.98
-		detector.GhostLastTransparency = transparency
-		detector.GhostVisualActive = ghostVisual
-	end
-	local ghostActive = ghostVisual
-		or (detector and detector.CurrentPower == "Ghost" and detector.CurrentPlayer == murderer and detector.GhostActive == true)
-	local ghostAdornee = char
-	if ghostActive then
-		local proxyModel = AntiFlingQuantum.EnsureGhostESPProxy()
-		local proxyPart = proxyModel and proxyModel.PrimaryPart
-		local root = char:FindFirstChild("HumanoidRootPart")
-		local knownCFrame = detector and detector.GhostLastKnownCFrame
-		if proxyPart then
-			if root and root.Parent == Workspace then proxyPart.CFrame = root.CFrame
-			elseif knownCFrame then proxyPart.CFrame = knownCFrame end
-			if proxyPart.Parent then ghostAdornee = proxyModel end
-		end
-	elseif _G.Celestial.GhostESPProxy then
-		pcall(function() _G.Celestial.GhostESPProxy:Destroy() end)
-		_G.Celestial.GhostESPProxy = nil
+	local followCF = (inWorld and cf) or GE.LastCFrame
+	local proxyModel = followCF and AntiFlingQuantum.EnsureGhostESPProxy() or nil
+	local proxyPart = proxyModel and proxyModel.PrimaryPart
+	if proxyPart then
+		proxyPart.CFrame = followCF
+		hl.Adornee = proxyModel
+	else
+		hl.Adornee = (char and char.Parent) and char or nil
 	end
 	hl.Enabled = true
-	hl.Adornee = ghostAdornee
 	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	-- A confirmed Murder stays red across both ESP writers. Ghost only changes proxy/opacity;
-	-- a second render loop must not repeatedly repaint this same Highlight white.
-	hl.FillColor = COLOR_MURDERER
-	hl.OutlineColor = COLOR_MURDERER
-	if ghostActive then
-		hl.FillTransparency = 0.18
-		hl.OutlineTransparency = 0.02
-	else
-		hl.FillTransparency = 0.5
-		hl.OutlineTransparency = 0.15
-	end
+	hl.FillColor = GE.Color
+	hl.OutlineColor = GE.Color
+	hl.FillTransparency = 0.25
+	hl.OutlineTransparency = 0
 end)
 
 -- ====================================================================
@@ -43520,30 +43600,30 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			local PRESETS = {
 				MEDIUM = {
 					forceHigh = false, ultra = false, ultraIntensity = 1.0,
-					reflections = true, reflectionStrength = 1.55,
-					bloom = true, bloomIntensity = 0.38, bloomSize = 28, bloomThreshold = 0.90,
+					reflections = true, reflectionStrength = 1.30,
+					bloom = true, bloomIntensity = 0.30, bloomSize = 30, bloomThreshold = 0.92,
 					sunRays = false, sunRaysIntensity = 0.65, sunRaysSpread = 0.82,
-					color = true, brightness = -0.02, contrast = 0.18, saturation = 0.14, style = "balanced",
+					color = true, brightness = -0.03, contrast = 0.15, saturation = 0.11, style = "balanced",
 					atmo = true, atmoIntensity = 0.32,
 					dof = false, dofIntensity = 0.2, dofFocus = 60,
 					fireLights = false, charShadows = false,
 				},
 				HIGH = {
 					forceHigh = true, ultra = false, ultraIntensity = 1.12,
-					reflections = true, reflectionStrength = 2.35,
-					bloom = true, bloomIntensity = 0.48, bloomSize = 34, bloomThreshold = 0.86,
-					sunRays = true, sunRaysIntensity = 0.78, sunRaysSpread = 0.94,
-					color = true, brightness = -0.04, contrast = 0.28, saturation = 0.22, style = "balanced",
+					reflections = true, reflectionStrength = 1.95,
+					bloom = true, bloomIntensity = 0.36, bloomSize = 36, bloomThreshold = 0.90,
+					sunRays = true, sunRaysIntensity = 0.60, sunRaysSpread = 0.94,
+					color = true, brightness = -0.05, contrast = 0.22, saturation = 0.16, style = "balanced",
 					atmo = true, atmoIntensity = 0.45,
 					dof = false, dofIntensity = 0.2, dofFocus = 60,
 					fireLights = false, charShadows = true,
 				},
 				ULTRA = {
 					forceHigh = true, ultra = true, ultraIntensity = 1.60,
-					reflections = true, reflectionStrength = 3.0,
-					bloom = true, bloomIntensity = 0.42, bloomSize = 38, bloomThreshold = 0.94,
-					sunRays = true, sunRaysIntensity = 1.0, sunRaysSpread = 1.0,
-					color = true, brightness = -0.12, contrast = 0.34, saturation = 0.27, style = "balanced",
+					reflections = true, reflectionStrength = 2.50,
+					bloom = true, bloomIntensity = 0.32, bloomSize = 40, bloomThreshold = 0.95,
+					sunRays = true, sunRaysIntensity = 0.70, sunRaysSpread = 1.0,
+					color = true, brightness = -0.13, contrast = 0.27, saturation = 0.19, style = "balanced",
 					atmo = true, atmoIntensity = 0.68,
 					dof = false, dofIntensity = 0.25, dofFocus = 60,
 					fireLights = true, charShadows = true,
@@ -43551,12 +43631,12 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				-- Cinematic prioritizes deep shadow definition and controlled highlights over extra exposure.
 				CINEMATIC = {
 					forceHigh = true, ultra = true, ultraIntensity = 1.48,
-					reflections = true, reflectionStrength = 3.0,
-					bloom = true, bloomIntensity = 0.36, bloomSize = 36, bloomThreshold = 0.96,
-					sunRays = true, sunRaysIntensity = 1.0, sunRaysSpread = 1.0,
-					color = true, brightness = -0.16, contrast = 0.36, saturation = 0.23, style = "cinematic",
-					atmo = true, atmoIntensity = 0.62,
-					dof = false, dofIntensity = 0.16, dofFocus = 95,
+					reflections = true, reflectionStrength = 2.60,
+					bloom = true, bloomIntensity = 0.28, bloomSize = 44, bloomThreshold = 0.96,
+					sunRays = true, sunRaysIntensity = 0.65, sunRaysSpread = 1.0,
+					color = true, brightness = -0.16, contrast = 0.28, saturation = 0.17, style = "cinematic",
+					atmo = true, atmoIntensity = 0.66,
+					dof = true, dofIntensity = 0.14, dofFocus = 95,
 					fireLights = true, charShadows = true,
 				},
 			}
@@ -43579,6 +43659,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				local viewport = camera and camera.ViewportSize or Vector2.new(720, 1280)
 				if viewport.X <= 0 or viewport.Y <= 0 then return end
 				cinematicPatternViewport = viewport
+				-- Phosphor dots and scanlines were removed on request: the overlay stays empty (no black lines, no white dots).
+				if true then return end
 				local columns = math.clamp(math.floor(viewport.X / 18), 18, 48)
 				local rows = math.clamp(math.floor(viewport.Y / 18), 24, 60)
 				local total = columns * rows
@@ -43781,38 +43863,38 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				if cfg.ultra then
 					local i = math.clamp(tonumber(cfg.ultraIntensity) or 1, 0.5, 1.8)
 					if base.Brightness ~= nil then d.Brightness = base.Brightness end
-					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(116, 122, 136), 0.24 * math.min(i, 1.25)) end
-					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(142, 150, 166), 0.20 * math.min(i, 1.25)) end
+					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(116, 122, 136), 0.20 * math.min(i, 1.25)) end
+					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(142, 150, 166), 0.17 * math.min(i, 1.25)) end
 					if base.ShadowSoftness ~= nil then d.ShadowSoftness = math.clamp(math.max(base.ShadowSoftness, 0.24), 0, 0.30) end
-					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.90 end
-					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 1.0 end
+					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.86 end
+					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 0.90 end
 					if base.ExposureCompensation ~= nil then d.ExposureCompensation = base.ExposureCompensation end
 				elseif cfg.forceHigh then
 					if base.Brightness ~= nil then d.Brightness = base.Brightness end
-					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(112, 119, 133), 0.20) end
-					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(138, 147, 163), 0.17) end
+					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(112, 119, 133), 0.17) end
+					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(138, 147, 163), 0.145) end
 					if base.ShadowSoftness ~= nil then d.ShadowSoftness = math.clamp(math.max(base.ShadowSoftness, 0.23), 0, 0.30) end
-					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.92 end
-					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 1.0 end
+					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.88 end
+					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 0.92 end
 					if base.ExposureCompensation ~= nil then d.ExposureCompensation = base.ExposureCompensation end
 				else
 					-- Medium: visible shadow definition without forcing the full Ultra lighting stack.
 					if base.Brightness ~= nil then d.Brightness = base.Brightness end
-					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(108, 115, 130), 0.16) end
-					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(132, 141, 157), 0.14) end
+					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(108, 115, 130), 0.14) end
+					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(132, 141, 157), 0.12) end
 					if base.ShadowSoftness ~= nil then d.ShadowSoftness = math.clamp(math.max(base.ShadowSoftness, 0.22), 0, 0.30) end
-					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.82 end
-					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 0.98 end
+					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.80 end
+					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 0.92 end
 					if base.ExposureCompensation ~= nil then d.ExposureCompensation = base.ExposureCompensation end
 				end
 				if cfg.style == "cinematic" then
 					-- Cinematic keeps shadow detail readable with stronger ambient fill and softer shadow edges.
 					if base.Brightness ~= nil then d.Brightness = base.Brightness end
-					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(120, 126, 140), 0.24) end
-					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(146, 154, 170), 0.21) end
+					if base.Ambient ~= nil then d.Ambient = base.Ambient:Lerp(Color3.fromRGB(120, 126, 140), 0.20) end
+					if base.OutdoorAmbient ~= nil then d.OutdoorAmbient = base.OutdoorAmbient:Lerp(Color3.fromRGB(146, 154, 170), 0.18) end
 					if base.ShadowSoftness ~= nil then d.ShadowSoftness = math.clamp(math.max(base.ShadowSoftness, 0.26), 0, 0.30) end
-					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.88 end
-					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 1.0 end
+					if base.EnvironmentDiffuseScale ~= nil then d.EnvironmentDiffuseScale = 0.84 end
+					if base.EnvironmentSpecularScale ~= nil then d.EnvironmentSpecularScale = 0.90 end
 					if base.ColorShift_Top ~= nil then d.ColorShift_Top = base.ColorShift_Top:Lerp(Color3.fromRGB(255, 242, 225), 0.025) end
 					if base.ColorShift_Bottom ~= nil then d.ColorShift_Bottom = base.ColorShift_Bottom:Lerp(Color3.fromRGB(163, 174, 198), 0.05) end
 				end
@@ -44470,8 +44552,8 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				originalRange = ledgerBase(inst, "Range", originalRange)
 				local cinematic = cfg.style == "cinematic"
 				-- Keep fixture highlights defined instead of washing out the stronger shadow pass.
-				local multiplier = cinematic and 1.14 or (cfg.ultra and 1.18 or 1.12)
-				local rangeMultiplier = cinematic and 1.10 or 1.12
+				local multiplier = cinematic and 1.08 or (cfg.ultra and 1.10 or 1.08)
+				local rangeMultiplier = cinematic and 1.08 or 1.10
 				local targetBrightness = math.clamp(originalBrightness * multiplier, 0, 15)
 				local targetRange = math.clamp(originalRange * rangeMultiplier, 0, 60)
 				local entry = {brightness = originalBrightness, range = originalRange}
@@ -44789,7 +44871,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 				light.Name = "CH_Graphics_FireLight"
 				light:SetAttribute(OWNER_ATTR, true)
 				light.Color = color
-				light.Brightness = cinematic and 0.95 or 0.85
+				light.Brightness = cinematic and 0.80 or 0.72
 				light.Range = math.clamp(6 + size * 0.72, 8, cinematic and 19 or 17)
 				light.Shadows = false
 				light.Enabled = false -- enabled by the central tick only while near / visible
@@ -45325,6 +45407,7 @@ _G.Celestial.GameDetectionThread = task.spawn(function()
 			if _G.Celestial.ConnectionFly then _G.Celestial.ConnectionFly:Disconnect(); _G.Celestial.ConnectionFly = nil end
 			if _G.Celestial.ConnectionRoleScanner then _G.Celestial.ConnectionRoleScanner:Disconnect(); _G.Celestial.ConnectionRoleScanner = nil end
 			if _G.Celestial.ConnectionGhostESP then _G.Celestial.ConnectionGhostESP:Disconnect(); _G.Celestial.ConnectionGhostESP = nil end
+			if _G.Celestial.GhostESP and _G.Celestial.GhostESP.DropProxy then pcall(_G.Celestial.GhostESP.DropProxy) end
 			if _G.Celestial.ConnectionPowerDetector then _G.Celestial.ConnectionPowerDetector:Disconnect(); _G.Celestial.ConnectionPowerDetector = nil end
 			if _G.Celestial.ConnectionTrapESP then _G.Celestial.ConnectionTrapESP:Disconnect(); _G.Celestial.ConnectionTrapESP = nil end
 			if _G.Celestial.ConnectionTrapDescendant then _G.Celestial.ConnectionTrapDescendant:Disconnect(); _G.Celestial.ConnectionTrapDescendant = nil end
